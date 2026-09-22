@@ -1,46 +1,99 @@
 # Relay CLI
 
-Relay CLI runs Relay in headless mode.
+Keep local folders synced with [Relay](https://relay.md) from the command line,
+without opening Obsidian.
 
-Use it to keep local folders synced with Relay from the command line, without
-opening Obsidian. It is built for background sync on servers, developer
-machines, scripts, and AI workflows that edit Markdown files directly.
+## Install
 
-## Commands
+On Linux or macOS (x86-64 or ARM64), run:
 
-```text
-rmd login
-rmd start
-rmd init ./notes --name Notes
-rmd connect ./notes --relay <relay-guid>
-rmd status ./notes
-rmd sync-status ./notes
-rmd relays
-rmd folders
-rmd disconnect ./notes
-rmd stop
+```sh
+curl -fsSL https://raw.githubusercontent.com/No-Instructions/relay-cli/main/install.sh | bash
 ```
 
-`rmd login` prompts for an OAuth provider in an interactive terminal. In
-non-interactive shells, pass `--provider <name>` or `--token-file <path>`.
+The installer downloads its own Node.js runtime and builds Relay CLI. You don't
+need Node.js, npm, or sudo beforehand. It installs `rmd` in `~/.local/bin`; if that
+directory isn't on your `PATH`, follow the instruction printed by the installer.
+On Windows, use WSL or [build from source](#development).
+
+## Sign in
+
+```sh
+rmd login
+```
+
+Choose your sign-in provider and finish signing in through your browser.
+
+## Sync an existing folder
+
+```sh
+rmd clone
+rmd start
+```
+
+Choose your Relay and a shared folder. Relay CLI creates a local directory named
+after that folder in the current directory. `rmd start` starts background sync,
+which keeps running after you close the terminal.
+
+To choose the local directory yourself, use `rmd clone ./notes`.
+
+## Share a local folder
+
+```sh
+rmd init ./notes --name Notes
+rmd connect ./notes
+rmd start
+```
+
+Choose the Relay to share it with. Relay CLI creates a shared folder from the
+local files. If background sync is already running, you can omit `rmd start`.
+
+## Check and stop sync
+
+```sh
+rmd status ./notes
+rmd sync-status ./notes
+```
+
+Run `rmd disconnect ./notes` to stop syncing one folder, or `rmd stop` to stop
+background sync for all folders. `rmd start` resumes sync for connected folders.
+Run `rmd --help` for the command list.
+
+## Update
+
+Run the install command again, then restart background sync:
+
+```sh
+rmd stop
+rmd start
+```
+
+Updates preserve your login and synced folders. The installer keeps previous
+versions under `~/.local/share/relay-cli/versions` so running daemons can finish
+using them. Set `RMD_INSTALL_DIR` and `RMD_BIN_DIR` to absolute paths when running
+the installer to choose different locations; use the same locations for updates.
+`XDG_DATA_HOME`, when set, changes the default data location to
+`$XDG_DATA_HOME/relay-cli`.
+
+## Automation
+
+In non-interactive shells, pass `rmd login --provider <name>` or
+`rmd login --token-file <path>`. Use `rmd relays` and `rmd folders` to find IDs,
+then pass them explicitly:
+
+```sh
+rmd clone ./notes --relay <relay-guid> --folder <folder-guid>
+rmd start
+```
+
 Login and sync use the production or staging endpoints selected when the CLI
 is built. Folder metadata and saved logins are bound to that environment;
 startup rejects mismatches before refreshing credentials.
 
-To copy an existing Relay folder to this machine:
-
-```text
-rmd clone ./notes --relay <relay-guid> --folder <folder-guid>
-```
-
-When run from an interactive terminal, `rmd connect` can prompt for a Relay and
-`rmd clone` can prompt for both the Relay and remote folder. In scripts, pass the
-GUIDs explicitly.
-
 ## Headless Sync
 
-`rmd start` runs background sync for connected folders. `rmd connect` starts
-syncing one local folder. When a folder was created with `rmd init`, connect
+`rmd start` runs background sync for connected folders. `rmd connect` registers
+one local folder for sync. When a folder was created with `rmd init`, connect
 creates the remote shared folder through Relay and treats local disk as the
 source of truth. `rmd clone` connects to an existing remote folder and treats
 the server as the source of truth during first materialization.
@@ -148,7 +201,8 @@ overlay supplies integration tests and live staging tooling; these are not
 required to build or run the CLI.
 
 Public CI runs clean builds and a CLI help check with locked unit tests and no
-private harness. Require the `Public build` check before merging. Maintainers
+private harness, plus installer checks on Linux and macOS. Require the
+`Public build` check before merging. Maintainers
 run the private unit and integration workflow against the same reviewed commit
 before release. Vendored source provenance and updates are documented in
 [vendor/relay/README.md](vendor/relay/README.md).
