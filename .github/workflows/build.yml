@@ -31,13 +31,38 @@ jobs:
       - run: node bin/rmd.js --help
       - run: npm run build:staging
       - run: node bin/rmd.js --help
+  install:
+    name: Install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install and run the reviewed revision
+        shell: bash
+        env:
+          RMD_REVISION: ${{ github.sha }}
+          RMD_INSTALL_DIR: ${{ runner.temp }}/relay cli
+          RMD_BIN_DIR: ${{ runner.temp }}/relay bin
+        run: |
+          bash -n install.sh
+          bash install.sh
+          "$RMD_BIN_DIR/rmd" --help
   required:
     name: Public build
     if: always()
-    needs: build
+    needs: [build, install]
     runs-on: ubuntu-latest
     steps:
       - name: Require every build to pass
         env:
           BUILD_RESULT: ${{ needs.build.result }}
-        run: test "$BUILD_RESULT" = success
+          INSTALL_RESULT: ${{ needs.install.result }}
+        run: |
+          test "$BUILD_RESULT" = success
+          test "$INSTALL_RESULT" = success
