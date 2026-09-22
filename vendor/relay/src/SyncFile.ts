@@ -1,0 +1,979 @@
+"use strict";
+import {
+	S3File,
+	S3RemoteFile,
+	S3Folder,
+	type S3RNType,
+} from "./S3RN";
+import type { SharedFolder } from "./SharedFolder";
+import { HasLogging } from "./debug";
+import { type FileMetas, type SyncFileType } from "./SyncTypes";
+import { TFile, type Vault, type TFolder, type FileStats } from "obsidian";
+import { Observable, type Unsubscriber } from "./observable/Observable";
+import { generateHash } from "./hashing";
+import type { HasMimeType, IFile } from "./IFile";
+import { getMimeType } from "./mimetypes";
+import { flags } from "./flagManager";
+import { errorFromUnknown, formatUserFacingError } from "./UserFacingError";
+import type {
+	PlanContext,
+	SessionIntent,
+	SyncOperationContext,
+	SyncParticipant,
+} from "./background-sync/SyncParticipant";
+import {
+	createWorkRequest,
+	type WorkRequest,
+} from "./background-sync/WorkRequest";
+
+export function isSyncFile(file: IFile | undefined): file is SyncFile {
+	return !!file && file instanceof SyncFile;
+}
+
+function shortHash(hash: string | undefined | null): string | undefined | null {
+	return hash ? hash.slice(0, 12) : hash;
+}
+
+type ServerEditMarker = {
+	mtime: number;
+	size: number;
+	hash: string;
+};
+
+type UserEditMarker = {
+	mtime: number;
+	size: number;
+};
+
+export class ContentAddressedFileStore extends HasLogging {
+	private db: IDBDatabase | null = null;
+	private dbName: string;
+	private ready: Promise<void>;
+
+	constructor(appId: string) {
+		super();
+		this.setLoggers("[ContentAddressedFileStore]");
+		this.dbName = `${appId}-relay-hashes`;
+		this.ready = this.openDB();
+	}
+
+	private async openDB(): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const request = indexedDB.open(this.dbName, 1);
+
+			request.onupgradeneeded = (event) => {
+				const db = request.result;
+				if (!db.objectStoreNames.contains("files")) {
+					db.createObjectStore("files", { keyPath: "path" });
+				}
+			};
+
+			request.onsuccess = (event) => {
+				this.db = request.result;
+				resolve();
+			};
+
+			request.onerror = (event) => {
+				this.error(
+					"Error opening ContentAddressedFile database:",
+					request.error,
+				);
+				reject(request.error ?? new Error("IndexedDB request failed"));
+			};
+		});
+	}
+
+	async saveHash(
+		path: string,
+		hash: string,
+		modifiedAt: number,
+		guid?: string,
+	): Promise<void> {
+		await this.ready;
+		if (!this.db) return;
+
+		return new Promise((resolve, reject) => {
+			if (!this.db) return;
+			const transaction = this.db.transaction(["files"], "readwrite");
+			const store = transaction.objectStore("files");
+
+			// `guid` is a backward-compatible field: it turns a hash entry
+			// into a durable local record of which identity this path synced
+			// under.
+			const request = store.put(
+				guid ? { path, hash, modifiedAt, guid } : { path, hash, modifiedAt },
+			);
+
+			request.onsuccess = () => resolve();
+			request.onerror = () => {
+				this.error("Error saving hash:", request.error);
+				reject(request.error ?? new Error("IndexedDB request failed"));
+			};
+		});
+	}
+
+	/**
+	 * All stored entries, for assembling the local-record cache at startup.
+	 * Entries written before guid recording existed simply lack the field.
+	 */
+	async getAllEntries(): Promise<
+		Array<{ path: string; hash: string; modifiedAt: number; guid?: string }>
+	> {
+		await this.ready;
+		if (!this.db) return [];
+
+		return new Promise((resolve, reject) => {
+			if (!this.db) {
+				resolve([]);
+				return;
+			}
+			const transaction = this.db.transaction(["files"], "readonly");
+			const store = transaction.objectStore("files");
+
+			const request = store.getAll();
+
+			request.onsuccess = () => resolve(request.result ?? []);
+			request.onerror = () => {
+				this.error("Error listing hash entries:", request.error);
+				reject(request.error ?? new Error("IndexedDB request failed"));
+			};
+		});
+	}
+
+	async getHash(
+		path: string,
+	): Promise<{ hash: string; modifiedAt: number; guid?: string } | null> {
+		await this.ready;
+		if (!this.db) return null;
+
+		return new Promise((resolve, reject) => {
+			if (!this.db) return null;
+			const transaction = this.db.transaction(["files"], "readonly");
+			const store = transaction.objectStore("files");
+
+			const request = store.get(path);
+
+			request.onsuccess = () => {
+				const record = request.result as
+					| { hash: string; modifiedAt: number; guid?: string }
+					| undefined;
+				resolve(record ?? null);
+			};
+
+			request.onerror = () => {
+				this.error("Error retrieving hash:", request.error);
+				reject(request.error ?? new Error("IndexedDB request failed"));
+			};
+		});
+	}
+
+	async removeHash(path: string): Promise<void> {
+		await this.ready;
+		if (!this.db) return;
+
+		return new Promise((resolve, reject) => {
+			if (!this.db) return null;
+			const transaction = this.db.transaction(["files"], "readwrite");
+			const store = transaction.objectStore("files");
+
+			const request = store.delete(path);
+
+			request.onsuccess = () => resolve();
+			request.onerror = () => {
+				this.error("Error removing hash:", request.error);
+				reject(request.error ?? new Error("IndexedDB request failed"));
+			};
+		});
+	}
+
+	destroy() {
+		if (this.db) {
+			this.db.close();
+			this.db = null;
+		}
+	}
+}
+
+export interface FileCacheEntry {
+	/**
+	 * Hash of file contents
+	 */
+	hash: string;
+	/**
+	 * Last modified time of file
+	 */
+	mtime: number;
+	/**
+	 * Size of file in bytes
+	 */
+	size: number;
+}
+
+export class ContentAddressedFile extends HasLogging {
+	value: string | undefined;
+	content: ArrayBuffer | null = null;
+	_tfile: TFile | null = null;
+
+	constructor(
+		private vault: Vault,
+		public path: string,
+		private store: ContentAddressedFileStore,
+		/** Supplies the owning file's guid so saved hashes double as local records. */
+		private guidProvider?: () => string | undefined,
+	) {
+		super();
+		const tfile = this.vault.getAbstractFileByPath(path);
+		if (tfile && tfile instanceof TFile) {
+			this._tfile = tfile;
+		}
+	}
+
+	private get tfile(): TFile {
+		if (!this._tfile) {
+			const tfile = this.vault.getAbstractFileByPath(this.path);
+			if (tfile && tfile instanceof TFile) {
+				this._tfile = tfile;
+			} else {
+				throw new Error(`missing tfile: ${this.path}`);
+			}
+		}
+		return this._tfile;
+	}
+
+	private async loadHashFromStore(): Promise<string | undefined> {
+		try {
+			const storedData = await this.store.getHash(this.path);
+			const fileMtime = this.tfile.stat.mtime;
+			if (!storedData) {
+				this.debug("hash cache miss", {
+					path: this.path,
+					reason: "empty",
+					fileMtime,
+				});
+				return;
+			}
+
+			const hit = storedData.modifiedAt === fileMtime;
+			this.debug("hash cache lookup", {
+				path: this.path,
+				hit,
+				storedHash: shortHash(storedData.hash),
+				storedModifiedAt: storedData.modifiedAt,
+				fileMtime,
+			});
+			if (hit) {
+				// If the stored hash is for the same modification time, use it
+				return storedData.hash;
+			}
+		} catch (error) {
+			this.warn("Failed to load hash from store:", error);
+		}
+	}
+
+	public get modifiedAt() {
+		if (!this.tfile) {
+			throw new Error("missing tfile");
+		}
+		return this.tfile.stat.mtime;
+	}
+
+	async read(): Promise<ArrayBuffer | null> {
+		this.log("reading content from disk");
+		const mtime = this.tfile.stat.mtime;
+		const content = await this.vault.readBinary(this.tfile);
+		const hash = await generateHash(content);
+		this.debug("computed hash from disk read", {
+			path: this.path,
+			hash: shortHash(hash),
+			mtime,
+			size: content.byteLength,
+		});
+		try {
+			await this.store.saveHash(
+				this.path,
+				hash,
+				mtime,
+				this.guidProvider?.(),
+			);
+		} catch (error) {
+			this.warn("Failed to save hash to store:", error);
+		}
+		return content;
+	}
+
+	async _hash(): Promise<string> {
+		const mtime = this.tfile.stat.mtime;
+		const content = await this.vault.readBinary(this.tfile);
+		const hash = await generateHash(content);
+		this.debug("computed hash from disk", {
+			path: this.path,
+			hash: shortHash(hash),
+			mtime,
+			size: content.byteLength,
+		});
+		try {
+			await this.store.saveHash(
+				this.path,
+				hash,
+				mtime,
+				this.guidProvider?.(),
+			);
+		} catch (error) {
+			this.warn("Failed to save hash to store:", error);
+		}
+		return hash;
+	}
+
+	move(newPath: string) {
+		if (newPath === this.path) {
+			return;
+		}
+		const oldPath = this.path;
+		this.path = newPath;
+		const tfile = this.vault.getAbstractFileByPath(newPath);
+		this._tfile = tfile instanceof TFile ? tfile : null;
+		// The hash store is keyed by vault-absolute path and its rows carry
+		// durable identity evidence; a row left behind at the old path would
+		// hand this file's identity to whatever is created there next.
+		this.transferStoredRecord(oldPath, newPath).catch((error) => {
+			this.warn("Failed to transfer stored hash on move:", error);
+		});
+	}
+
+	private async transferStoredRecord(
+		oldPath: string,
+		newPath: string,
+	): Promise<void> {
+		const stored = await this.store.getHash(oldPath);
+		await this.store.removeHash(oldPath);
+		if (stored) {
+			await this.store.saveHash(
+				newPath,
+				stored.hash,
+				stored.modifiedAt,
+				stored.guid,
+			);
+		} else {
+			// Nothing to carry over; a row already at the destination belongs
+			// to whatever previously lived there and must not be inherited.
+			await this.store.removeHash(newPath);
+		}
+	}
+
+	exists() {
+		// Re-verify against the vault on every call: a cached handle can go
+		// stale when the file is deleted or moved between checks, and a stale
+		// true here makes downstream TFile getters throw mid-flow.
+		const tfile = this.vault.getAbstractFileByPath(this.path);
+		if (tfile && tfile instanceof TFile) {
+			this._tfile = tfile;
+			return true;
+		}
+		this._tfile = null;
+		return false;
+	}
+
+	async clear() {
+		this._tfile = null;
+		// Also remove from store when clearing
+		this.store.removeHash(this.path).catch((error) => {
+			this.warn("Failed to remove hash from store:", error);
+		});
+	}
+
+	async hash(): Promise<string> {
+		let hash = await this.loadHashFromStore();
+		if (hash) {
+			return hash;
+		}
+		hash = await this._hash();
+		return hash;
+	}
+
+	destroy() {
+		this.vault = null as unknown as typeof this.vault;
+		this._tfile = null;
+		// Don't destroy store as it might be shared
+	}
+}
+
+export class SyncFile
+	extends Observable<SyncFile>
+	implements TFile, IFile, HasMimeType, SyncParticipant
+{
+	private _parent: SharedFolder;
+	meta: FileMetas | undefined;
+	name: string;
+	extension: string;
+	basename: string;
+	type: SyncFileType;
+	vault: Vault;
+	caf: ContentAddressedFile;
+	ready: boolean = false;
+	connected: boolean = true;
+	destroyed: boolean = false;
+	offFileInfo: Unsubscriber = () => {};
+	uploadError?: string = undefined;
+	private syncPromise: Promise<void> | null = null;
+	private syncRequestedDuringSync = false;
+	private lastServerEdit: ServerEditMarker | null = null;
+	private lastUserEdit: UserEditMarker | null = null;
+
+	constructor(
+		public path: string,
+		private _guid: string,
+		private hashStore: ContentAddressedFileStore,
+		parent: SharedFolder,
+	) {
+		super();
+		this._parent = parent;
+		this.setLoggers(`[SharedFile](${this.path})`);
+		this.name = this.path.split("/").pop() || "";
+		this.extension = this.name.split(".").pop() || "";
+		this.basename = this.name.replace(`.${this.extension}`, "");
+		this.vault = this._parent.vault;
+		const syncType =
+			this.sharedFolder.syncStore.typeRegistry.getTypeForPath(path);
+		if (!syncType) {
+			throw new Error("unexpected synctype");
+		}
+		// XXX remove typecast
+		this.type = syncType as SyncFileType;
+
+		this.caf = new ContentAddressedFile(
+			this.vault,
+			this.sharedFolder.getPath(path),
+			this.hashStore,
+		);
+
+		this.log("created");
+	}
+
+	public get guid(): string {
+		return this._guid;
+	}
+
+	public set guid(guid: string) {
+		this._guid = guid;
+	}
+
+	public get mimetype(): string {
+		return getMimeType(this.path);
+	}
+
+	public get s3rn(): S3RNType {
+		const relayId = this.sharedFolder.relayId;
+		return relayId
+			? new S3RemoteFile(relayId, this.sharedFolder.guid, this.guid)
+			: new S3File(this.sharedFolder.guid, this.guid);
+	}
+
+	disconnect() {
+		// pass
+	}
+
+	public get inMeta() {
+		return !!this.sharedFolder.syncStore.getMeta(this.path);
+	}
+
+	public get pending() {
+		return !!this.sharedFolder.syncStore.pendingUpload.has(this.path);
+	}
+
+	public get tag() {
+		return this.uploadError
+			? this.uploadError
+			: this.inMeta
+				? ""
+				: this.pending
+					? "pending"
+					: "unknown";
+	}
+
+	move(newPath: string, sharedFolder: SharedFolder) {
+		if (newPath === this.path) {
+			return;
+		}
+		this._parent = sharedFolder;
+		this.debug("setting new path", newPath);
+		this.path = newPath;
+		this.caf.move(sharedFolder.getPath(newPath));
+		this.name = newPath.split("/").pop() || "";
+		this.extension = this.name.split(".").pop() || "";
+		this.basename = this.name.replace(`.${this.extension}`, "");
+		this.setLoggers(`[SharedFile](${this.path})`);
+	}
+
+	public get lastModified() {
+		return this.stat.mtime;
+		//return Math.max(this.stat.mtime, this.stat.ctime);
+	}
+
+	_refreshMeta() {
+		const meta = this.sharedFolder.syncStore.getMeta(this.path);
+		this.meta = meta as FileMetas;
+		return meta;
+	}
+
+	public noteLocalModify(stat: FileStats) {
+		if (
+			this.lastServerEdit &&
+			this.matchesEditStat(this.lastServerEdit, stat) &&
+			!this.hasUserEditAfter(this.lastServerEdit)
+		) {
+			return;
+		}
+		this.lastUserEdit = {
+			mtime: stat.mtime,
+			size: stat.size,
+		};
+	}
+
+	public async push(force = false) {
+		this.log("push");
+		// Explicit user uploads retain their current force semantics.
+		if (
+			!force &&
+			this.sharedFolder.shouldDeferPendingPublication(this.path)
+		) {
+			this.log("deferring pending publication until folder convergence");
+			return;
+		}
+		if (this.sharedFolder.skipStorageBlockedUpload(this.path)) {
+			return;
+		}
+		if (!this.sharedFolder.syncStore.canSync(this.path)) {
+			this.log("skipping push -- filetype is disabled");
+			return;
+		}
+		if (this.sharedFolder.intent !== "connected") {
+			this.log("skipping push -- folder is set to disconnected");
+			return;
+		}
+		const hash = await this.caf.hash();
+		this._refreshMeta();
+		if (this.meta?.hash === hash) {
+			this.clearCurrentUserEdit();
+		} else {
+			this.noteCurrentUserEdit();
+		}
+		this.debug("push state", {
+			path: this.path,
+			guid: this.guid,
+			force,
+			localHash: shortHash(hash),
+			metaHash: shortHash(this.meta?.hash),
+			metaSynctime: this.meta?.synctime,
+			statMtime: this.stat.mtime,
+		});
+		if (!this.meta || (hash && this.meta.hash !== hash) || force) {
+			try {
+				await this.sharedFolder.cas.writeFile(this);
+				await this.sharedFolder.markUploaded(this);
+				this.uploadError = undefined;
+				this.notifyListeners();
+				this.debug("push complete", {
+					path: this.path,
+					guid: this.guid,
+					hash: shortHash(hash),
+					force,
+				});
+			} catch (error) {
+				this.uploadError = formatUserFacingError(error, "Failed to push file");
+				this.notifyListeners();
+				throw error instanceof Error ? error : errorFromUnknown(error);
+			}
+		} else {
+			this.debug("push skipped -- hash already uploaded", {
+				path: this.path,
+				guid: this.guid,
+				hash: shortHash(hash),
+			});
+		}
+		return;
+	}
+
+	public async sync() {
+		if (this.syncPromise) {
+			this.syncRequestedDuringSync = true;
+			return this.syncPromise;
+		}
+
+		const syncPromise = this.syncUntilSettled().finally(() => {
+			if (this.syncPromise === syncPromise) {
+				this.syncPromise = null;
+			}
+		});
+		this.syncPromise = syncPromise;
+		return syncPromise;
+	}
+
+	private async syncUntilSettled() {
+		do {
+			this.syncRequestedDuringSync = false;
+			await this.syncOnce();
+		} while (this.syncRequestedDuringSync);
+	}
+
+	private async syncOnce() {
+		this.log("sync");
+		this._refreshMeta();
+		const localExists = this.caf.exists();
+		const localStat = localExists ? this.stat : undefined;
+		this.debug("sync state", {
+			path: this.path,
+			guid: this.guid,
+			localExists,
+			localStat: localStat
+				? { mtime: localStat.mtime, size: localStat.size }
+				: null,
+			meta: this.meta
+				? {
+						hash: shortHash(this.meta.hash),
+						synctime: this.meta.synctime,
+						type: this.meta.type,
+					}
+				: null,
+			pending: this.pending,
+		});
+
+		if (!localExists) {
+			if (!this.meta) {
+				throw new Error("unexpected case");
+			}
+			this.debug("sync decision", {
+				path: this.path,
+				guid: this.guid,
+				decision: "pull-missing-local",
+				metaHash: shortHash(this.meta.hash),
+				metaSynctime: this.meta.synctime,
+			});
+			await this.pull();
+			return;
+		} else if (!this.meta) {
+			this.debug("sync decision", {
+				path: this.path,
+				guid: this.guid,
+				decision: "push-missing-meta",
+				statMtime: this.stat.mtime,
+			});
+			await this.push();
+			return;
+		}
+
+		if (this.isCleanLastServerEdit(this.meta, this.stat)) {
+			this.debug("sync decision", {
+				path: this.path,
+				guid: this.guid,
+				decision: "noop-server-edit",
+				hash: shortHash(this.meta.hash),
+			});
+			if (this.uploadError) {
+				this.uploadError = undefined;
+				this.notifyListeners();
+			}
+			return;
+		}
+
+		try {
+			const hash = await this.caf.hash();
+			this.debug("sync hash comparison", {
+				path: this.path,
+				guid: this.guid,
+				localHash: shortHash(hash),
+				metaHash: shortHash(this.meta.hash),
+				statMtime: this.stat.mtime,
+				metaSynctime: this.meta.synctime,
+			});
+			if (flags().enableVerifyUploads) {
+				// Not remote
+				try {
+					if (!(await this.verifyUpload())) {
+						this.warn("file in metadata, but not on the server!");
+						await this.push();
+					}
+				} catch {
+					// pass
+				}
+			}
+			if (hash === this.meta.hash) {
+				this.clearCurrentUserEdit();
+				this.debug("sync decision", {
+					path: this.path,
+					guid: this.guid,
+					decision: "noop-hash-match",
+					hash: shortHash(hash),
+				});
+				if (this.uploadError) {
+					this.uploadError = undefined;
+					this.notifyListeners();
+				}
+			} else {
+				this.noteCurrentUserEdit();
+				// local is newer
+				if (this.stat.mtime > (this.meta).synctime) {
+					this.debug("sync decision", {
+						path: this.path,
+						guid: this.guid,
+						decision: "push-local-newer",
+						localHash: shortHash(hash),
+						metaHash: shortHash(this.meta.hash),
+						statMtime: this.stat.mtime,
+						metaSynctime: this.meta.synctime,
+					});
+					await this.push();
+					return;
+				}
+				// remote is newer
+				this.debug("sync decision", {
+					path: this.path,
+					guid: this.guid,
+					decision: "pull-remote-newer",
+					localHash: shortHash(hash),
+					metaHash: shortHash(this.meta.hash),
+					statMtime: this.stat.mtime,
+					metaSynctime: this.meta.synctime,
+				});
+				this.warn(
+					"synctime",
+					this.meta.synctime,
+					this.meta?.synctime,
+					this.stat.mtime,
+				);
+				await this.pull();
+				return;
+			}
+		} catch (err) {
+			if (this.uploadError) {
+				throw err;
+			}
+			this.warn("unable to compute hash", err);
+		}
+	}
+
+	shouldPull(meta: FileMetas) {
+		const tfile = this.tfile;
+		if (this.isLastServerEditSuccessor(meta)) {
+			return true;
+		}
+		return meta.synctime > tfile.stat.mtime;
+	}
+
+	private isCleanLastServerEdit(meta: FileMetas, stat: FileStats): boolean {
+		const edit = this.lastServerEdit;
+		if (!edit || meta.hash !== edit.hash) {
+			return false;
+		}
+		return this.matchesEditStat(edit, stat) && !this.hasUserEditAfter(edit);
+	}
+
+	private isLastServerEditSuccessor(meta: FileMetas): boolean {
+		const edit = this.lastServerEdit;
+		if (!edit || meta.hash === edit.hash) {
+			return false;
+		}
+		return !this.hasUserEditAfter(edit);
+	}
+
+	private hasUserEditAfter(edit: ServerEditMarker): boolean {
+		return !!this.lastUserEdit && this.lastUserEdit.mtime >= edit.mtime;
+	}
+
+	private matchesEditStat(
+		edit: { mtime: number; size: number } | null,
+		stat: FileStats,
+	): boolean {
+		return !!edit && stat.mtime === edit.mtime && stat.size === edit.size;
+	}
+
+	private clearCurrentUserEdit() {
+		if (this.matchesEditStat(this.lastUserEdit, this.stat)) {
+			this.lastUserEdit = null;
+		}
+	}
+
+	private noteCurrentUserEdit() {
+		this.lastUserEdit = {
+			mtime: this.stat.mtime,
+			size: this.stat.size,
+		};
+	}
+
+	public async verifyUpload() {
+		this.log("verify upload");
+		this._refreshMeta();
+		if (!this.meta) {
+			throw new Error("cannot verify upload without meta");
+		}
+		return this.sharedFolder.cas.verify(this);
+	}
+
+	public async pull() {
+		this.log("pull");
+		this._refreshMeta();
+		if (!this.meta) {
+			throw new Error("cannot pull without meta");
+		}
+		if (this.caf.exists()) {
+			const hash = await this.caf.hash();
+			this.debug("pull state", {
+				path: this.path,
+				guid: this.guid,
+				localHash: shortHash(hash),
+				metaHash: shortHash(this.meta.hash),
+				metaSynctime: this.meta.synctime,
+				statMtime: this.stat.mtime,
+			});
+			if (hash === this.meta.hash) {
+				this.debug("pull skipped -- hash already local", {
+					path: this.path,
+					guid: this.guid,
+					hash: shortHash(hash),
+				});
+				return;
+			}
+		}
+		try {
+			const content = await this.sharedFolder.cas.readFile(this);
+			const vaultPath = this.sharedFolder.getPath(this.path);
+			const edit: ServerEditMarker = {
+				mtime: Date.now(),
+				size: content.byteLength,
+				hash: this.meta.hash,
+			};
+			// Record the marker before writing so the modify event raised by
+			// writeBinary is recognized as our own server-write echo
+			// (noteLocalModify) rather than a user edit.
+			this.lastServerEdit = edit;
+			await this.vault.adapter.writeBinary(vaultPath, content, {
+				mtime: edit.mtime,
+			});
+			// Save the hash eagerly: the pulled content's hash is known from
+			// meta, and a durable entry is the local evidence that this file
+			// synced — cleanup relies on it after a restart.
+			this.hashStore
+				.saveHash(vaultPath, this.meta.hash, edit.mtime, this.guid)
+				.catch((error) => {
+					this.warn("Failed to save pulled hash:", error);
+				});
+			if (this.uploadError) {
+				this.uploadError = undefined;
+				this.notifyListeners();
+			}
+			this.debug("pull wrote local file", {
+				path: this.path,
+				guid: this.guid,
+				metaHash: shortHash(this.meta.hash),
+				size: content.byteLength,
+			});
+		} catch (error) {
+			// A failed pull must stay visible and claimable: swallowing the
+			// error here reported the download as complete, so nothing above
+			// ever retried and the file stayed missing until plugin reload.
+			this.uploadError = formatUserFacingError(error, "Failed to pull file");
+			this.notifyListeners();
+			throw error instanceof Error ? error : errorFromUnknown(error);
+		}
+	}
+
+	public get tfile(): TFile {
+		const abstractFile = this.vault.getAbstractFileByPath(
+			this.sharedFolder.getPath(this.path),
+		);
+		if (abstractFile instanceof TFile) {
+			return abstractFile;
+		}
+		throw new Error("TFile API used before file existed");
+	}
+
+	public get stat(): FileStats {
+		return this.tfile.stat;
+	}
+
+	public get parent(): TFolder | null {
+		return this.tfile?.parent || null;
+	}
+
+	public get sharedFolder(): SharedFolder {
+		return this._parent;
+	}
+
+	/**
+	 * Plan this file's background work. A sweep re-runs the file's own
+	 * content reconciliation unless its publication is being held back by
+	 * the folder; nothing else asks a file to plan.
+	 */
+	planSyncWork(context: PlanContext): WorkRequest<SyncParticipant>[] {
+		if (this.destroyed) return [];
+		if (context.occasion.kind !== "sweep") return [];
+		if (this.sharedFolder.shouldDeferPendingPublication(this.path)) return [];
+		return [createWorkRequest(this, "converge", "sweep")];
+	}
+
+	acceptsSession(): boolean {
+		return true;
+	}
+
+	/**
+	 * Every session-scope request for a file is the file's own content
+	 * reconciliation: uploads and converge passes take the same path.
+	 */
+	async runSyncSession(
+		_intent: SessionIntent,
+		_context: SyncOperationContext,
+	): Promise<void> {
+		await this.sync();
+	}
+
+	/** A transfer pulls the committed content for the file's path. */
+	async transferFromServer(
+		_context: SyncOperationContext,
+	): Promise<Uint8Array | undefined> {
+		await this.pull();
+		return undefined;
+	}
+
+	async connect(): Promise<boolean> {
+		if (this.sharedFolder.s3rn instanceof S3Folder) {
+			// Local only
+			return false;
+		}
+		return (
+			this.sharedFolder.shouldConnect &&
+			this.sharedFolder.connect().then((connected) => {
+				this.connected = connected;
+				return this.connected;
+			})
+		);
+	}
+
+	public async read(): Promise<string> {
+		return this.vault.read(this.tfile);
+	}
+
+	public async delete(): Promise<void> {
+		await this.caf.clear();
+		return this.sharedFolder.trashFile(this.tfile);
+	}
+
+	public async write(content: string): Promise<void> {
+		void this.vault.adapter.write(this.tfile.path, content);
+		await this.caf.hash();
+	}
+
+	public async append(content: string): Promise<void> {
+		void this.vault.append(this.tfile, content);
+		await this.caf.hash();
+	}
+
+	cleanup() {}
+
+	destroy() {
+		this.destroyed = true;
+		this.offFileInfo?.();
+		this.offFileInfo = null as unknown as typeof this.offFileInfo;
+
+		this._parent = null as unknown as typeof this._parent;
+		this.caf.destroy();
+	}
+}

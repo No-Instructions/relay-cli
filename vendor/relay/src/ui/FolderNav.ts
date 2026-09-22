@@ -1,0 +1,1185 @@
+import {
+	TAbstractFile,
+	TFile,
+	TFolder,
+	Vault,
+	Workspace,
+	WorkspaceLeaf,
+} from "obsidian";
+import { SharedFolder, SharedFolders } from "../SharedFolder";
+import type { ConnectionState } from "src/HasProvider";
+import { Document } from "src/Document";
+import Pill from "src/components/Pill.svelte";
+import TextPill from "src/components/TextPill.svelte";
+import UploadPill from "src/components/UploadPill.svelte";
+import { mountComponent, type MountedComponent } from "src/ui/svelteHost.svelte";
+import { flags, withAnyOf, withFlag } from "src/flagManager";
+import { flag } from "src/flags";
+import type { BackgroundSync, QueueItem } from "src/BackgroundSync";
+import type { Unsubscriber } from "src/observable/Observable";
+import type { ObservableSet } from "src/observable/ObservableSet";
+import type { SyncStatus } from "src/merge-hsm/types";
+import { SyncFile, isSyncFile } from "src/SyncFile";
+import { Canvas } from "src/Canvas";
+import { curryLog, metrics } from "src/debug";
+import { isDestroyedError } from "src/DestroyedError";
+import type { MergeHSM } from "src/merge-hsm/MergeHSM";
+
+class SiblingWatcher {
+	mutationObserver: MutationObserver | null;
+	el: HTMLElement;
+
+	constructor(el: HTMLElement, onceSibling: (el: HTMLElement) => void) {
+		this.el = el;
+		this.mutationObserver = new MutationObserver((mutationsList, observer) => {
+			for (const mutation of mutationsList) {
+				if (mutation.type === "childList") {
+					if (el.nextSibling) {
+						onceSibling(el);
+						observer.disconnect();
+					}
+				}
+			}
+		});
+		this.mutationObserver.observe(el.parentElement as HTMLElement, {
+			childList: true,
+			subtree: true,
+		});
+	}
+
+	destroy() {
+		this.mutationObserver?.disconnect();
+		this.mutationObserver = null;
+	}
+}
+
+interface TreeNode {
+	el: HTMLElement;
+}
+
+interface FileItem extends TreeNode {
+	el: HTMLElement;
+	selfEl: HTMLElement;
+}
+
+interface FolderItem extends TreeNode {
+	el: HTMLElement;
+	selfEl: HTMLElement;
+}
+
+interface FileSystemVisitor<T> {
+	visitFolder(
+		folder: TFolder,
+		item: FolderItem,
+		storage?: T,
+		sharedFolder?: SharedFolder,
+	): T | null;
+	visitFile(
+		file: TFile,
+		item: FileItem,
+		storage?: T,
+		sharedFolder?: SharedFolder,
+	): T | null;
+}
+
+interface Destroyable {
+	destroy(): void;
+}
+
+class BaseVisitor<T extends Destroyable> implements FileSystemVisitor<T> {
+	visitFolder(
+		folder: TFolder,
+		item: FolderItem,
+		storage?: T,
+		sharedFolder?: SharedFolder,
+	): T | null {
+		// do nothing
+		return null;
+	}
+
+	visitFile(
+		file: TFile,
+		item: FileItem,
+		storage: T,
+		sharedFolder: SharedFolder,
+	): T | null {
+		// do nothing
+		return null;
+	}
+}
+
+class FolderBar implements Destroyable {
+	el: HTMLElement;
+	sharedFolder: SharedFolder;
+	siblingWatcher: SiblingWatcher;
+
+	constructor(el: HTMLElement, sharedFolder: SharedFolder) {
+		this.el = el;
+		this.sharedFolder = sharedFolder;
+		this.siblingWatcher = new SiblingWatcher(this.el, (el) => {
+			this.add();
+		});
+		this.add();
+	}
+
+	add() {
+		(this.el.nextSibling as HTMLElement)?.addClass("system3-live");
+	}
+
+	remove() {
+		(this.el.nextSibling as HTMLElement)?.removeClass("system3-live");
+	}
+
+	destroy() {
+		this.siblingWatcher.destroy();
+		this.remove();
+	}
+}
+
+class FolderBarVisitor extends BaseVisitor<FolderBar> {
+	visitFolder(
+		folder: TFolder,
+		item: FolderItem,
+		storage: FolderBar,
+		sharedFolder?: SharedFolder,
+	): FolderBar | null {
+		if (sharedFolder && sharedFolder.path === folder.path) {
+			return storage || new FolderBar(item.selfEl, sharedFolder);
+		}
+		if (storage) {
+			storage.destroy();
+		}
+		return null;
+	}
+}
+
+type Unsubscribe = () => void;
+
+function syncStatusHasConflict(status: SyncStatus | undefined): boolean {
+	return status?.status === "conflict";
+}
+
+function fileHasConflict(sharedFolder: SharedFolder, guid: string): boolean {
+	const mergeManager = sharedFolder.mergeManager;
+	if (!mergeManager) return false;
+
+	const file = sharedFolder.files.get(guid);
+	const hsm = (file as { hsm?: MergeHSM | null } | undefined)?.hsm;
+	if (hsm) {
+		const status = hsm.getSyncStatus() as SyncStatus | undefined;
+		if (syncStatusHasConflict(status)) return true;
+		if (typeof hsm.getConflictData === "function" && hsm.getConflictData()) return true;
+		return false;
+	}
+	const status = mergeManager.syncStatus.get<SyncStatus>(guid);
+	return syncStatusHasConflict(status);
+}
+
+class PillDecoration {
+	el: HTMLElement;
+	sharedFolder: SharedFolder;
+	pill: MountedComponent;
+	unsubscribe: Unsubscribe;
+
+	constructor(el: HTMLElement, sharedFolder: SharedFolder) {
+		this.sharedFolder = sharedFolder;
+
+		// clean up failed destroys
+		const stalePills = el.querySelectorAll(".system3-folder-icons");
+		if (stalePills.length > 0) {
+			stalePills?.forEach((pill) => {
+				pill.remove();
+			});
+		}
+
+		this.el = el;
+		this.el.addClass("system3-pill");
+		this.el.setAttribute("data-relay-state", this.sharedFolder.state.status);
+
+		this.pill = mountComponent(Pill, {
+			target: this.el,
+			props: {
+				status: this.sharedFolder.state.status,
+				relayId: this.sharedFolder.relayId,
+				remote: this.sharedFolder.remote,
+				localOnly: this.sharedFolder.localOnly,
+				enableDraftMode: flags().enableDraftMode,
+				progress: 0,
+				showProgress: false,
+				syncStatus: "pending",
+			},
+		});
+
+		const unsubs: Unsubscribe[] = [];
+		unsubs.push(
+			this.sharedFolder.subscribe(this.el, (state: ConnectionState) => {
+				this.el.setAttribute("data-relay-state", state.status);
+				this.pill.set({
+					status: state.status,
+					relayId: this.sharedFolder.relayId,
+					remote: this.sharedFolder.remote,
+					localOnly: this.sharedFolder.localOnly,
+					enableDraftMode: flags().enableDraftMode,
+				});
+			}),
+		);
+
+		unsubs.push(
+			this.sharedFolder.backgroundSync.subscribeToFolderSyncSnapshot(
+				this.sharedFolder,
+				(snapshot) => {
+					this.pill.set({
+						progress: snapshot.percent,
+						showProgress: snapshot.showProgress,
+						syncStatus: snapshot.progressStatus,
+					});
+				},
+			),
+		);
+		this.unsubscribe = () => unsubs.forEach((u) => u());
+	}
+
+	destroy() {
+		this.pill.destroy();
+		this.unsubscribe();
+		this.el.removeClass("system3-pill");
+		this.el.removeAttribute("data-relay-state");
+	}
+}
+
+class FolderPillVisitor extends BaseVisitor<PillDecoration> {
+	visitFolder(
+		folder: TFolder,
+		item: FolderItem,
+		storage?: PillDecoration,
+		sharedFolder?: SharedFolder,
+	): PillDecoration | null {
+		if (sharedFolder && sharedFolder.path === folder.path) {
+			return (
+				storage ||
+				new PillDecoration(item.selfEl, sharedFolder)
+			);
+		}
+		if (storage) {
+			storage.destroy();
+		}
+		return null;
+	}
+}
+
+class QueueWatcher implements Destroyable {
+	private unsubscribers: Unsubscriber[] = [];
+	private titleEl: HTMLElement;
+
+	constructor(
+		private el: HTMLElement,
+		private path: string,
+		private activeSync: ObservableSet<QueueItem>,
+		private activeDownloads: ObservableSet<QueueItem>,
+	) {
+		this.titleEl = el.querySelector(".nav-file-title") || el;
+
+		this.unsubscribers.push(
+			this.activeSync.subscribe(() => this.checkStatus()),
+			this.activeDownloads.subscribe(() => this.checkStatus()),
+		);
+		this.checkStatus();
+	}
+
+	private checkStatus() {
+		const isSyncing = this.activeSync.some((item) => item.path === this.path);
+		const isDownloading = this.activeDownloads.some(
+			(item) => item.path === this.path,
+		);
+
+		if (isSyncing) {
+			this.titleEl.addClass("system3-syncing");
+		} else {
+			this.titleEl.removeClass("system3-syncing");
+		}
+
+		if (isDownloading) {
+			this.titleEl.addClass("system3-downloading");
+		} else {
+			this.titleEl.removeClass("system3-downloading");
+		}
+	}
+
+	destroy() {
+		this.titleEl.removeClass("system3-uploading");
+		this.titleEl.removeClass("system3-downloading");
+		this.unsubscribers.forEach((unsub) => unsub());
+	}
+}
+
+class QueueWatcherVisitor extends BaseVisitor<QueueWatcher> {
+	constructor(
+		private activeSync: ObservableSet<QueueItem>,
+		private activeDownloads: ObservableSet<QueueItem>,
+	) {
+		super();
+	}
+
+	visitFile(
+		file: TFile,
+		item: FileItem,
+		storage?: QueueWatcher,
+		sharedFolder?: SharedFolder,
+	): QueueWatcher | null {
+		if (
+			sharedFolder &&
+			sharedFolder.ready &&
+			sharedFolder.checkPath(file.path) &&
+			Document.checkExtension(file.path)
+		) {
+			return (
+				storage ||
+				new QueueWatcher(
+					item.el,
+					file.path,
+					this.activeSync,
+					this.activeDownloads,
+				)
+			);
+		}
+		if (storage) {
+			storage.destroy();
+		}
+		return null;
+	}
+}
+
+class FilePillDecoration {
+	pill?: MountedComponent;
+	unsubscribes: Unsubscriber[] = [];
+
+	constructor(
+		private el: HTMLElement,
+		public file: SyncFile,
+	) {
+		this.el.querySelectorAll(".system3-uploadpill").forEach((el) => {
+			el.remove();
+		});
+
+		this.unsubscribes.push(
+			this.file.subscribe(() => {
+				this.setText();
+			}),
+		);
+	}
+
+	setText() {
+		if (!this.file) {
+			return;
+		}
+		const tag = this.file.tag;
+		if (!tag) {
+			this.pill?.destroy();
+			return;
+		}
+		const status = this.file.uploadError
+			? ("error" as const)
+			: this.file.pending
+				? ("pending" as const)
+				: ("unknown" as const);
+		if (!this.pill) {
+			this.pill = mountComponent(UploadPill, {
+				target: this.el,
+				props: {
+					text: tag,
+					status,
+				},
+			});
+		} else {
+			this.pill.set({
+				text: tag,
+				status,
+			});
+		}
+	}
+
+	destroy() {
+		this.unsubscribes.forEach((off) => off());
+		this.el.querySelectorAll(".system3-uploadpill").forEach((el) => {
+			el.remove();
+		});
+		this.pill?.destroy();
+		this.file = null as unknown as typeof this.file;
+	}
+}
+
+class FilePillVisitor extends BaseVisitor<FilePillDecoration> {
+	visitFile(
+		tfile: TFile,
+		item: FileItem,
+		storage?: FilePillDecoration,
+		sharedFolder?: SharedFolder,
+	): FilePillDecoration | null {
+		if (
+			sharedFolder &&
+			!Document.checkExtension(tfile.path) &&
+			!Canvas.checkExtension(tfile.path) &&
+			sharedFolder.isSyncableTFile(tfile)
+		) {
+			if (sharedFolder.ready && sharedFolder.connected) {
+				try {
+					const file = sharedFolder.proxy.viewSyncFile(tfile);
+					if (file && isSyncFile(file)) {
+						if (storage && storage.file === file) {
+							return storage;
+						}
+						return new FilePillDecoration(item.selfEl, file);
+					}
+				} catch (e) {
+					const error = curryLog("FilePillVisitor.visitFile", "error");
+					error(e);
+				}
+			}
+		}
+		if (storage) {
+			storage.destroy();
+		}
+		return null;
+	}
+}
+
+class NotSyncedPillDecoration {
+	pill: MountedComponent;
+	unsubscribe?: () => void;
+
+	constructor(
+		private el: HTMLElement,
+		label: string,
+		reason: string,
+	) {
+		this.el.querySelectorAll(".system3-filepill").forEach((el) => {
+			el.remove();
+		});
+		// TODO: Ensure the not-synced pill comes last
+		this.pill = mountComponent(TextPill, {
+			target: this.el,
+			props: {
+				text: "NOT SYNCED",
+				label,
+				reason,
+			},
+		});
+	}
+
+	setLabel(label: string, reason: string) {
+		this.pill.set({ label, reason });
+	}
+
+	destroy() {
+		this.pill.destroy();
+		this.el.querySelectorAll(".system3-filepill").forEach((el) => {
+			el.remove();
+		});
+	}
+}
+
+class NotSyncedPillVisitor extends BaseVisitor<NotSyncedPillDecoration> {
+	visitFile(
+		file: TFile,
+		item: FileItem,
+		storage?: NotSyncedPillDecoration,
+		sharedFolder?: SharedFolder,
+	): NotSyncedPillDecoration | null {
+		if (
+			sharedFolder &&
+			sharedFolder.checkPath(file.path) &&
+			(sharedFolder.isStorageBlockedTFile(file) ||
+				!sharedFolder.isSyncableTFile(file))
+		) {
+			const storageBlocked = sharedFolder.isStorageBlockedTFile(file);
+			const label = storageBlocked
+				? "Attachment storage is required to sync this file"
+				: "Syncing this file type is disabled";
+			const reason = storageBlocked ? "storage-required" : "file-type-disabled";
+			if (storage) {
+				storage.setLabel(label, reason);
+				return storage;
+			}
+			return new NotSyncedPillDecoration(item.selfEl, label, reason);
+		}
+		if (storage) {
+			storage.destroy();
+		}
+		return null;
+	}
+}
+
+class DocumentStatus implements Destroyable {
+	el: HTMLElement;
+	document?: Document;
+
+	constructor(el: HTMLElement, document: Document, doc: TFile) {
+		this.el = el;
+		this.document = document;
+		this.document.subscribe(el, (status) => {
+			this.docStatus(status);
+		});
+		this.docStatus(this.document.state);
+	}
+
+	docStatus(status?: ConnectionState) {
+		if (status?.status === "connected") {
+			this.el.removeClass("system3-connecting");
+			this.el.addClass("system3-connected");
+			this.el.addClass("system3-live");
+		} else if (status?.status === "connecting") {
+			this.el.removeClass("system3-connected");
+			this.el.addClass("system3-connecting");
+			this.el.addClass("system3-live");
+		} else if (status?.status === "disconnected") {
+			this.el.addClass("system3-live");
+			this.el.removeClass("system3-connected");
+			this.el.removeClass("system3-connecting");
+		} else {
+			this.el.removeClass("system3-connected");
+			this.el.removeClass("system3-connecting");
+			this.el.removeClass("system3-live");
+		}
+	}
+
+	destroy() {
+		this.document?.unsubscribe(this.el);
+		this.docStatus();
+	}
+}
+
+class FileStatusVisitor extends BaseVisitor<DocumentStatus> {
+	visitFile(
+		file: TFile,
+		item: FileItem,
+		storage?: DocumentStatus,
+		sharedFolder?: SharedFolder,
+	): DocumentStatus | null {
+		if (sharedFolder) {
+			try {
+				const vpath = sharedFolder.getVirtualPath(file.path);
+				const guid = sharedFolder.syncStore.get(vpath);
+				if (!guid) return null;
+				const document = sharedFolder.files.get(guid);
+				if (!(document instanceof Document)) return null;
+				if (!document) return null;
+				return storage || new DocumentStatus(item.el, document, file);
+			} catch {
+				// document doesn't exist yet...
+				return null;
+			}
+		}
+		if (storage) {
+			storage.destroy();
+		}
+		return null;
+	}
+}
+
+class FileConflictDecoration implements Destroyable {
+	private applied = false;
+	private destroyed = false;
+
+	constructor(
+		private el: HTMLElement,
+		private sharedFolder: SharedFolder,
+		private guid: string,
+		private onDestroyed: (decoration: FileConflictDecoration) => void,
+	) {
+		this.sharedFolder.onDestroy(() => this.destroy());
+		this.update();
+	}
+
+	matches(sharedFolder: SharedFolder, guid: string): boolean {
+		return (
+			!this.destroyed &&
+			this.sharedFolder === sharedFolder &&
+			this.guid === guid
+		);
+	}
+
+	update() {
+		if (this.destroyed) return;
+		const conflict = fileHasConflict(this.sharedFolder, this.guid);
+		if (conflict && !this.applied) {
+			this.el.classList.add("system3-conflict");
+			this.applied = true;
+		} else if (!conflict && this.applied) {
+			this.el.classList.remove("system3-conflict");
+			this.applied = false;
+		}
+	}
+
+	destroy() {
+		if (this.destroyed) return;
+		this.destroyed = true;
+		if (this.applied) {
+			this.el.classList.remove("system3-conflict");
+			this.applied = false;
+		}
+		this.onDestroyed(this);
+	}
+}
+
+class FileConflictVisitor extends BaseVisitor<FileConflictDecoration> {
+	private decorationsByFolder = new WeakMap<
+		SharedFolder,
+		Map<string, FileConflictDecoration>
+	>();
+
+	private createDecoration(
+		el: HTMLElement,
+		sharedFolder: SharedFolder,
+		guid: string,
+	): FileConflictDecoration {
+		const decoration = new FileConflictDecoration(
+			el,
+			sharedFolder,
+			guid,
+			(destroyed) => {
+				const decorations = this.decorationsByFolder.get(sharedFolder);
+				if (decorations?.get(guid) === destroyed) {
+					decorations.delete(guid);
+					if (decorations.size === 0) {
+						this.decorationsByFolder.delete(sharedFolder);
+					}
+				}
+			},
+		);
+		let decorations = this.decorationsByFolder.get(sharedFolder);
+		if (!decorations) {
+			decorations = new Map();
+			this.decorationsByFolder.set(sharedFolder, decorations);
+		}
+		decorations.set(guid, decoration);
+		return decoration;
+	}
+
+	refresh(sharedFolder: SharedFolder, guids: ReadonlySet<string>): void {
+		const decorations = this.decorationsByFolder.get(sharedFolder);
+		if (!decorations) return;
+		for (const guid of guids) {
+			decorations.get(guid)?.update();
+		}
+	}
+
+	visitFile(
+		file: TFile,
+		item: FileItem,
+		storage?: FileConflictDecoration,
+		sharedFolder?: SharedFolder,
+	): FileConflictDecoration | null {
+		if (
+			sharedFolder &&
+			sharedFolder.ready &&
+			Document.checkExtension(file.path)
+		) {
+			try {
+				const vpath = sharedFolder.getVirtualPath(file.path);
+				const guid = sharedFolder.syncStore.get(vpath);
+				if (!guid) {
+					if (storage) storage.destroy();
+					return null;
+				}
+				if (storage) {
+					if (storage.matches(sharedFolder, guid)) {
+						storage.update();
+						return storage;
+					}
+					storage.destroy();
+				}
+				return this.createDecoration(item.selfEl, sharedFolder, guid);
+			} catch {
+				if (storage) storage.destroy();
+				return null;
+			}
+		}
+		if (storage) storage.destroy();
+		return null;
+	}
+}
+
+class FileExplorerWalker {
+	fileExplorer: WorkspaceLeaf;
+	sharedFolders: SharedFolders;
+	visitors: FileSystemVisitor<Destroyable>[];
+	storage: Map<FileSystemVisitor<Destroyable>, Map<TreeNode, Destroyable>>;
+	private conflictVisitor: FileConflictVisitor | null;
+
+	constructor(
+		fileExplorer: WorkspaceLeaf,
+		sharedFolders: SharedFolders,
+		visitors: FileSystemVisitor<Destroyable>[],
+	) {
+		this.fileExplorer = fileExplorer;
+		this.sharedFolders = sharedFolders;
+		this.visitors = visitors;
+		this.conflictVisitor =
+			this.visitors.find(
+				(visitor): visitor is FileConflictVisitor =>
+					visitor instanceof FileConflictVisitor,
+			) ?? null;
+
+		this.storage = new Map<
+			FileSystemVisitor<Destroyable>,
+			Map<TreeNode, Destroyable>
+		>();
+		for (const visitor of this.visitors) {
+			this.storage.set(visitor, new Map<TreeNode, Destroyable>());
+		}
+	}
+
+	private _getFileExplorerItem(path: string) {
+		// XXX this is a private API
+		try {
+			return (
+				this.fileExplorer.view as unknown as {
+					fileItems: Record<string, unknown>;
+				}
+			).fileItems[path];
+		} catch {
+			return null;
+		}
+	}
+	private getFileExplorerItem<T>(fileExplorer: WorkspaceLeaf, file: string): T;
+
+	private getFileExplorerItem<T>(
+		fileExplorer: WorkspaceLeaf,
+		file: TAbstractFile,
+	): T;
+
+	// XXX this is a private API
+	private getFileExplorerItem<T>(
+		fileExplorer: WorkspaceLeaf,
+		fileOrFolder: TAbstractFile | string,
+	) {
+		if (typeof fileOrFolder === "string") {
+			return this._getFileExplorerItem(fileOrFolder) as T;
+		}
+		return this._getFileExplorerItem(fileOrFolder.path) as T;
+	}
+
+	walk(folder: TFolder, _sharedFolder?: SharedFolder) {
+		if (this.fileExplorer.view.getViewType() !== "file-explorer") {
+			return;
+		}
+		const sharedFolder =
+			this.sharedFolders.find(
+				(sharedFolder) => sharedFolder.path === folder.path,
+			) || _sharedFolder;
+
+		const folderItem = this.getFileExplorerItem<FolderItem>(
+			this.fileExplorer,
+			folder,
+		);
+		if (folderItem) {
+			this.storage.forEach((store, visitor) => {
+				const stored = store.get(folderItem);
+				const update = visitor.visitFolder(
+					folder,
+					folderItem,
+					stored,
+					sharedFolder,
+				);
+				if (stored && !update) {
+					store.delete(folderItem);
+				} else if (update) {
+					store.set(folderItem, update);
+				}
+			});
+		}
+		folder.children.forEach((child) => {
+			if (child instanceof TFolder) {
+				this.walk(child, sharedFolder);
+			} else if (child instanceof TFile) {
+				const fileItem = this.getFileExplorerItem<FileItem>(
+					this.fileExplorer,
+					child,
+				);
+				if (!fileItem) {
+					// Android bug?
+					return;
+				}
+				this.storage.forEach((store, visitor) => {
+					const stored = store.get(fileItem);
+					const update = visitor.visitFile(
+						child,
+						fileItem,
+						stored,
+						sharedFolder,
+					);
+					if (stored && !update) {
+						store.delete(fileItem);
+					} else if (update) {
+						store.set(fileItem, update);
+					}
+				});
+			}
+		});
+	}
+
+	refreshConflicts(
+		sharedFolder: SharedFolder,
+		guids: ReadonlySet<string>,
+	): void {
+		this.conflictVisitor?.refresh(sharedFolder, guids);
+	}
+
+	destroy() {
+		this.storage.forEach((store) => {
+			store.forEach((item) => {
+				item.destroy();
+			});
+		});
+		this.conflictVisitor = null;
+	}
+}
+
+export class FolderNavigationDecorations {
+	vault: Vault;
+	workspace: Workspace;
+	sharedFolders: SharedFolders;
+	backgroundSync: BackgroundSync;
+	private warn = curryLog("[FolderNav]", "warn");
+	offLayoutChange: () => void;
+	treeState: Map<WorkspaceLeaf, FileExplorerWalker>;
+	layoutReady: boolean = false;
+
+	/**
+	 * Subscriptions to plugin-global observables (background sync
+	 * stores, workspace layout). Attached once in the constructor and
+	 * released once in destroy(). Never changes over the lifetime.
+	 */
+	private globalSubs: Unsubscribe[] = [];
+
+	/**
+	 * Root subscription on the SharedFolders ObservableSet itself —
+	 * fires when a folder is added or removed from the plugin.
+	 */
+	private rootSub: Unsubscribe | null = null;
+
+	/**
+	 * Folders we've already attached the main subscription bundle to
+	 * (syncSettings, folder, syncStore). Per-folder cleanup is
+	 * registered via `folder.onDestroy(...)` so it fires automatically
+	 * when the folder is destroyed — no per-subscriber teardown map
+	 * here. The WeakSet is just dedup: the sharedFolders observer
+	 * re-fires on every add/remove, and we only want to subscribe to
+	 * each folder once over its lifetime.
+	 */
+	private subscribedFolders = new WeakSet<SharedFolder>();
+
+	/**
+	 * Separate dedup for the `fset.on` subscription, which is gated by
+	 * `flag.enableDocumentStatus`. Tracked separately from
+	 * `subscribedFolders` so that if the flag is flipped on mid-session
+	 * the fset subscription is still attached on the next sharedFolders
+	 * notification — matching the behavior of the original
+	 * `offDocumentListeners` map.
+	 */
+	private subscribedFolderFsets = new WeakSet<SharedFolder>();
+
+	/**
+	 * Quick refresh requests share one microtask. Folder-specific requests are
+	 * unioned; an unscoped request subsumes every folder-specific request.
+	 */
+	private quickRefreshScheduled = false;
+	private pendingQuickRefreshAll = false;
+	private pendingQuickRefreshFolders = new Set<SharedFolder>();
+
+	/**
+	 * Changed GUIDs accumulated from sync-status change deliveries, drained
+	 * by the next quick-refresh flush. MergeManager replaces a status object
+	 * only after its semantic equality check fails, so every delivered key
+	 * is a meaningful change.
+	 */
+	private pendingSyncStatusGuids = new Map<SharedFolder, Set<string>>();
+	private destroyed = false;
+
+	constructor(
+		vault: Vault,
+		workspace: Workspace,
+		sharedFolders: SharedFolders,
+		backgroundSync: BackgroundSync,
+	) {
+		this.vault = vault;
+		this.workspace = workspace;
+		this.sharedFolders = sharedFolders;
+		this.backgroundSync = backgroundSync;
+		this.treeState = new Map<WorkspaceLeaf, FileExplorerWalker>();
+		this.workspace.onLayoutReady(() => {
+			this.layoutReady = true;
+			this.refresh();
+		});
+
+		this.globalSubs.push(
+			backgroundSync.activeSync.subscribe(() => this.quickRefresh()),
+			backgroundSync.activeDownloads.subscribe(() => this.quickRefresh()),
+			backgroundSync.syncGroups.subscribe(() => this.quickRefresh()),
+		);
+
+		// Subscribe to the SharedFolders set. On every notification,
+		// attach refresh-trigger subscriptions to any folders we
+		// haven't seen yet. Cleanup is registered with each folder
+		// via `folder.onDestroy(...)` — SharedFolder runs its own
+		// unsubscribe queue at the top of destroy(), so external
+		// subscriptions are released before any internal observable
+		// is torn down. No per-folder diff loop needed here.
+		//
+		// Behavior contract (matches the pre-refactor structure):
+		//   - whenReady().then(refresh) fires on every notification
+		//   - fset.on has its own dedup gated by the feature flag so
+		//     a mid-session flag flip can attach it late
+		//   - the other folder-level refresh subs are dedup'd per folder
+		//     (the pre-refactor code leaked
+		//     them on every notification — that was the teardown bug)
+		this.rootSub = this.sharedFolders.subscribe(() => {
+			this.sharedFolders.forEach((folder) => {
+				withAnyOf([flag.enableDocumentStatus], () => {
+					if (!this.subscribedFolderFsets.has(folder)) {
+						this.subscribedFolderFsets.add(folder);
+						folder.onDestroy(
+							folder.fset.on(() => {
+								// XXX a full refresh is only needed when a document
+								// is moved outside of a shared folder.
+								this.refresh();
+							}),
+						);
+					}
+				});
+
+				// Refresh once the folder finishes its own load so we
+				// paint decorations as soon as data is available. This
+				// intentionally runs on every notification — matches
+				// the pre-refactor behavior (the .then handler is
+				// attached to the same cached promise each time, so
+				// after resolution every repeat handler fires once).
+				folder.whenReady()
+					.then(() => this.refresh())
+					.catch((error) => {
+						if (!isDestroyedError(error)) {
+							this.warn("folder ready failed", error);
+						}
+						this.refresh();
+					});
+
+				if (this.subscribedFolders.has(folder)) return;
+				this.subscribedFolders.add(folder);
+
+				folder.onDestroy(
+					folder.syncSettingsManager.subscribe(() =>
+						this.quickRefresh(folder),
+					),
+				);
+				folder.onDestroy(
+					folder.subscribe(this, () => this.quickRefresh(folder)),
+				);
+				folder.onDestroy(
+					folder.syncStore.subscribe(() => this.quickRefresh(folder)),
+				);
+				folder.onDestroy(
+					folder.mergeManager.syncStatus.subscribeChanges(
+						(_statuses, changed) =>
+							this.syncStatusChanged(folder, changed),
+					),
+				);
+			});
+			this.refresh();
+		});
+
+		this.offLayoutChange = (() => {
+			const ref = this.workspace.on("layout-change", () => this.quickRefresh());
+			return () => {
+				this.workspace.offref(ref);
+			};
+		})();
+	}
+
+
+	makeVisitors(): FileSystemVisitor<Destroyable>[] {
+		const visitors = [];
+		visitors.push(new FolderBarVisitor());
+		visitors.push(new FolderPillVisitor());
+		withFlag(flag.enableDocumentStatus, () => {
+			visitors.push(new FileStatusVisitor());
+			visitors.push(
+				new QueueWatcherVisitor(
+					this.backgroundSync.activeSync,
+					this.backgroundSync.activeDownloads,
+				),
+			);
+		});
+		visitors.push(new FilePillVisitor());
+		visitors.push(new NotSyncedPillVisitor());
+		visitors.push(new FileConflictVisitor());
+		return visitors;
+	}
+
+	getFileExplorers(): WorkspaceLeaf[] {
+		// IMPORTANT: We manually iterate because a popular plugin make.md monkeypatches
+		// getLeavesOfType to return their custom folder explorer.
+		const fileExplorers: WorkspaceLeaf[] = [];
+		this.workspace.iterateAllLeaves((leaf) => {
+			const viewType = leaf.view.getViewType();
+			if (viewType === "file-explorer") {
+				if (!fileExplorers.includes(leaf)) {
+					fileExplorers.push(leaf);
+				}
+			}
+		});
+		return fileExplorers;
+	}
+
+	private syncStatusChanged(
+		folder: SharedFolder,
+		changed: ReadonlySet<string>,
+	): void {
+		// Before layout-ready the full refresh() paints everything anyway.
+		if (!this.layoutReady || changed.size === 0) return;
+		let pending = this.pendingSyncStatusGuids.get(folder);
+		if (!pending) {
+			pending = new Set();
+			this.pendingSyncStatusGuids.set(folder, pending);
+		}
+		for (const guid of changed) {
+			pending.add(guid);
+		}
+		this.scheduleQuickRefresh();
+	}
+
+	private scheduleQuickRefresh(): void {
+		if (this.quickRefreshScheduled || this.destroyed) return;
+		this.quickRefreshScheduled = true;
+		queueMicrotask(() => {
+			this.quickRefreshScheduled = false;
+			if (this.destroyed) return;
+			this.flushQuickRefresh();
+		});
+	}
+
+	quickRefresh(folder?: SharedFolder): void {
+		if (!this.layoutReady || this.destroyed) return;
+		if (folder) {
+			if (!this.pendingQuickRefreshAll) {
+				this.pendingQuickRefreshFolders.add(folder);
+			}
+		} else {
+			this.pendingQuickRefreshAll = true;
+			this.pendingQuickRefreshFolders.clear();
+		}
+		this.scheduleQuickRefresh();
+	}
+
+	private flushQuickRefresh(): void {
+		if (!this.layoutReady || this.destroyed) return;
+		const t0 = performance.now();
+		const refreshAll = this.pendingQuickRefreshAll;
+		const refreshFolders = new Set(this.pendingQuickRefreshFolders);
+		this.pendingQuickRefreshAll = false;
+		this.pendingQuickRefreshFolders.clear();
+
+		const changedStatuses = new Map<SharedFolder, Set<string>>();
+		for (const [folder, guids] of this.pendingSyncStatusGuids) {
+			if (!folder.destroyed && guids.size > 0) {
+				changedStatuses.set(folder, guids);
+			}
+		}
+		this.pendingSyncStatusGuids = new Map();
+
+		if (
+			!refreshAll &&
+			refreshFolders.size === 0 &&
+			changedStatuses.size === 0
+		) {
+			return;
+		}
+
+		const fileExplorers = this.getFileExplorers();
+		const folders = refreshAll
+			? this.sharedFolders.items()
+			: [...refreshFolders];
+		for (const fileExplorer of fileExplorers) {
+			const walker =
+				this.treeState.get(fileExplorer) ||
+				new FileExplorerWalker(
+					fileExplorer,
+					this.sharedFolders,
+					this.makeVisitors(),
+				);
+			this.treeState.set(fileExplorer, walker);
+			for (const folder of folders) {
+				if (folder.destroyed) continue;
+				const root = this.vault.getAbstractFileByPath(folder.path);
+				if (root instanceof TFolder) {
+					walker.walk(root);
+				}
+			}
+			for (const [folder, guids] of changedStatuses) {
+				if (!refreshAll && !refreshFolders.has(folder)) {
+					walker.refreshConflicts(folder, guids);
+				}
+			}
+		}
+		metrics.observeFoldernavRefresh("quick", (performance.now() - t0) / 1000);
+	}
+
+	refresh() {
+		if (!this.layoutReady || this.destroyed) return;
+		const t0 = performance.now();
+		this.pendingQuickRefreshAll = false;
+		this.pendingQuickRefreshFolders.clear();
+		this.pendingSyncStatusGuids.clear();
+		const fileExplorers = this.getFileExplorers();
+		for (const fileExplorer of fileExplorers) {
+			const walker =
+				this.treeState.get(fileExplorer) ||
+				new FileExplorerWalker(
+					fileExplorer,
+					this.sharedFolders,
+					this.makeVisitors(),
+				);
+			this.treeState.set(fileExplorer, walker);
+			const root = this.vault.getAbstractFileByPath("/");
+			if (root instanceof TFolder) {
+				walker.walk(root);
+			}
+		}
+		metrics.observeFoldernavRefresh("full", (performance.now() - t0) / 1000);
+	}
+
+	destroy() {
+		this.destroyed = true;
+		this.pendingQuickRefreshAll = false;
+		this.pendingQuickRefreshFolders.clear();
+		this.pendingSyncStatusGuids.clear();
+
+		// Release the root SharedFolders subscription first so no further
+		// folder-add notifications can arrive while we're tearing down.
+		this.rootSub?.();
+		this.rootSub = null;
+
+		// Release the plugin-global subscriptions. Per-folder subs are
+		// not touched here — they are registered with each SharedFolder
+		// via folder.onDestroy(), so they fire automatically when the
+		// folder is destroyed (either at runtime delete or as part of
+		// sharedFolders.destroy() during plugin unload).
+		for (const unsub of this.globalSubs) {
+			try { unsub(); } catch { /* observable torn down first */ }
+		}
+		this.globalSubs.length = 0;
+
+		this.treeState.forEach((walker) => walker.destroy());
+		this.treeState.clear();
+		this.offLayoutChange();
+		this.offLayoutChange = null as unknown as typeof this.offLayoutChange;
+
+		this.vault = null as unknown as typeof this.vault;
+		this.workspace = null as unknown as typeof this.workspace;
+		this.sharedFolders = null as unknown as typeof this.sharedFolders;
+		this.backgroundSync = null as unknown as typeof this.backgroundSync;
+		this.treeState = null as unknown as typeof this.treeState;
+		this.globalSubs = null as unknown as typeof this.globalSubs;
+		this.subscribedFolders = null as unknown as typeof this.subscribedFolders;
+		this.subscribedFolderFsets = null as unknown as typeof this.subscribedFolderFsets;
+	}
+}

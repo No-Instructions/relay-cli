@@ -1,0 +1,35 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# Credentials and Relay runtime state
+.env
+.env.*
+!.env.example
+.relay/
+.rmd-state/
+storage.key
+storage.key.*
+*.key
+tokens.json
+browser.db
+browser.db-*
+
+# Private development overlay (versioned with igit)
+/.igit/
+/.igitignore
+/.claude/
+/.agents/
+/.codex/
+/AGENTS.md
+/TODO.md
+/tickets/
+/plans/
+/specs/
+/test/integration/
+/test-plans/
+/.github/workflows/private-tests.yml
+
+# Local session bookkeeping
+/sessions.txt

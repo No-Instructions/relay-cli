@@ -1,0 +1,118 @@
+"use strict";
+import { Platform, requireApiVersion, TextFileView } from "obsidian";
+import type { CanvasView } from "src/CanvasView";
+
+export type BannerText = string | { short: string; long: string };
+
+export class Banner {
+	view: TextFileView | CanvasView;
+	text: BannerText;
+	onClick: () => Promise<boolean>;
+	private useHeaderButton: boolean;
+
+	constructor(
+		view: TextFileView | CanvasView,
+		text: BannerText,
+		onClick: () => Promise<boolean>,
+	) {
+		this.view = view;
+		this.text = text;
+		this.onClick = onClick;
+		// Use header button approach on mobile for Obsidian >=1.11.0 to avoid banner positioning issues
+		this.useHeaderButton = Platform.isMobile && requireApiVersion("1.11.0");
+		this.display();
+	}
+
+	private get shortText(): string {
+		return typeof this.text === "string" ? this.text : this.text.short;
+	}
+
+	private get longText(): string {
+		return typeof this.text === "string" ? this.text : this.text.long;
+	}
+
+	private handleClick(): void {
+		void this.onClick()
+			.then((destroy) => {
+				if (destroy) {
+					this.destroy();
+				}
+			})
+			.catch((error: unknown) => {
+				console.error("Banner click failed", error);
+			});
+	}
+
+	display() {
+		if (!this.view) return true;
+		const leafContentEl = this.view.containerEl;
+
+		if (!leafContentEl) {
+			return;
+		}
+
+		if (this.useHeaderButton) {
+			return this.displayHeaderButton();
+		}
+
+		const contentEl = this.view.containerEl.querySelector(".view-content");
+
+		// container to enable easy removal of the banner
+		let bannerBox = leafContentEl.querySelector(".system3-banner-box");
+		if (!bannerBox) {
+			bannerBox = leafContentEl.createDiv({ cls: "system3-banner-box" });
+			leafContentEl.insertBefore(bannerBox, contentEl);
+			leafContentEl.addClass("system3-has-banner");
+		}
+
+		let banner = leafContentEl.querySelector(".system3-banner");
+		if (!banner) {
+			banner = bannerBox.createDiv({ cls: "system3-banner" });
+			banner.createSpan({ text: this.longText });
+			banner.addEventListener("click", () => this.handleClick());
+		}
+		return true;
+	}
+
+	private displayHeaderButton() {
+		const leafContentEl = this.view.containerEl;
+		const viewHeaderLeftElement =
+			leafContentEl.querySelector(".view-header-left");
+
+		if (!viewHeaderLeftElement) {
+			return;
+		}
+
+		// Remove existing button if any
+		leafContentEl.querySelector(".system3-header-button")?.remove();
+
+		const button = leafContentEl.createEl("button", {
+			cls: "view-header-left system3-header-button",
+			text: this.shortText,
+			attr: { "aria-label": this.longText, tabindex: "0" },
+		});
+
+		button.addEventListener("click", () => this.handleClick());
+
+		viewHeaderLeftElement.insertAdjacentElement("afterend", button);
+		return true;
+	}
+
+	destroy() {
+		const leafContentEl = this.view.containerEl;
+		if (!leafContentEl) {
+			return;
+		}
+
+		if (this.useHeaderButton) {
+			leafContentEl.querySelector(".system3-header-button")?.remove();
+		} else {
+			const bannerBox = leafContentEl.querySelector(".system3-banner-box");
+			if (bannerBox) {
+				bannerBox.replaceChildren();
+			}
+		}
+		this.onClick = async () => true;
+		return true;
+	}
+}

@@ -1,0 +1,52 @@
+<script lang="ts">
+	import { Settings } from "lucide-svelte";
+	import { createEventDispatcher } from "svelte";
+
+	const dispatch = createEventDispatcher();
+
+	export var label = "Options";
+	export var action: string | undefined = undefined;
+
+	function handleSettingsClick(event: KeyboardEvent | MouseEvent) {
+		// No instanceof: the settings window has its own event constructors,
+		// so events born there never match this realm's classes.
+		if (
+			event.type === "click" ||
+			("key" in event && (event.key === "Enter" || event.key === " "))
+		) {
+			dispatch("settings");
+		}
+	}
+</script>
+
+<div
+	class="clickable-icon extra-setting-button"
+	aria-label={label}
+	data-action={action}
+	role="button"
+	tabindex="0"
+	on:click={handleSettingsClick}
+	on:keydown={handleSettingsClick}
+>
+	<slot>
+		<Settings
+			class="svg-icon lucide-settings"
+			props={{ class: "svg-icon lucide-settings" }}
+		/>
+	</slot>
+</div>
+
+<style>
+	.extra-setting-button:focus {
+		outline: none;
+		box-shadow: none;
+		color: var(--icon-color-focus);
+	}
+
+	.extra-setting-button:hover {
+		box-shadow: none;
+		opacity: var(--icon-opacity-hover);
+		color: var(--icon-color-hover);
+		background-color: var(--background-modifier-hover);
+	}
+</style>

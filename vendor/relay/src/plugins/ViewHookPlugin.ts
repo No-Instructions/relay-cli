@@ -1,0 +1,337 @@
+import { MarkdownView } from "obsidian";
+import { getPatcher } from "../Patcher";
+import type { EditorView } from "@codemirror/view";
+import { YText, YTextEvent, Transaction } from "yjs/dist/src/internals";
+import type { Document } from "../Document";
+import type { ViewRenderer } from "./ViewRenderer";
+import { PreviewRenderer } from "./PreviewRenderer";
+import { HasLogging } from "../debug";
+import type { ChangeSpec } from "@codemirror/state";
+import { trackPromise } from "../trackPromise";
+import diff_match_patch from "diff-match-patch";
+import { MetadataRenderer } from "./MetadataRenderer";
+
+/**
+ * Centralized Obsidian UI hooks coordinator.
+ * Manages all UI-specific edit pathways and coordinates save operations.
+ */
+export class ViewHookPlugin extends HasLogging {
+	private view: MarkdownView;
+	private document: Document;
+	private renderers: ViewRenderer[];
+	private unsubscribes: Array<() => void> = [];
+	private observer?: (event: YTextEvent, tr: Transaction) => void;
+	private _ytext: YText | null = null;
+	private destroyed = false;
+	private saving = false;
+
+	constructor(view: MarkdownView, document: Document) {
+		super();
+		this.view = view;
+		this.document = document;
+		this.setLoggers(`[ViewHookPlugin][${document.path}]`);
+		this.debug("created");
+
+		// Initialize renderers
+		this.renderers = [];
+		this.renderers.push(new PreviewRenderer(view));
+		this.renderers.push(new MetadataRenderer(view));
+
+		this.installMarkdownHooks(this.view);
+	}
+
+	private runWithRelaySaving<T>(fn: () => T): T {
+		const view = this.view as MarkdownView & { __relaySaving?: boolean };
+		const hadOwnFlag = Object.prototype.hasOwnProperty.call(view, "__relaySaving");
+		const previous = view.__relaySaving;
+		view.__relaySaving = true;
+		try {
+			return fn();
+		} finally {
+			if (hadOwnFlag) {
+				view.__relaySaving = previous;
+			} else {
+				delete view.__relaySaving;
+			}
+		}
+	}
+
+	private syncViewTextToHsm(text: string, reason: string): void {
+		const hsm = this.document.hsm;
+		if (!hsm) {
+			this.debug(`Skipping ${reason}: no HSM`);
+			return;
+		}
+
+		if (this.document.localText === text) {
+			return;
+		}
+
+		hsm.send({
+			type: "CM6_CHANGE",
+			changes: hsm.computeDiffChanges(this.document.localText, text),
+			docText: text,
+			userEvent: "set",
+		});
+	}
+
+	/**
+	 * Attach the document observer once localDoc is available.
+	 * Waits for the HSM to enter active mode if needed.
+	 */
+	async initialize(): Promise<void> {
+		// Wait for localDoc to become available (HSM entering active mode)
+		let localDoc = this.document.localDoc;
+		if (!localDoc) {
+			const hsm = this.document.hsm;
+			if (hsm?.awaitState) {
+				await trackPromise(`viewHook:awaitActive:${this.document.guid}`, hsm.awaitState((s) => s.startsWith("active.")));
+			}
+			localDoc = this.document.localDoc;
+		}
+		if (this.destroyed || !localDoc) return;
+
+		this._ytext = localDoc.getText("contents");
+		this.setupDocumentObserver();
+
+		// Perform initial render using localDoc content
+		this.runWithRelaySaving(() => {
+			(
+				this.view.previewMode as unknown as {
+					renderer: { set(text: string): void };
+				}
+			).renderer.set(this.document.localText);
+		});
+		this.renderAll();
+
+		void this.document.connect();
+		this.debug("initialized");
+	}
+
+	/**
+	 * Install hooks into Obsidian's internal methods for UI-specific edit pathways
+	 */
+	private installMarkdownHooks(view: MarkdownView): void {
+		// eslint-disable-next-line @typescript-eslint/no-this-alias -- Renderer hooks need the plugin instance when Obsidian supplies another receiver.
+		const that = this;
+
+		// Hook 1: Track metadata saves.
+		this.unsubscribes.push(
+			getPatcher().patch(view, {
+				// @ts-ignore
+				saveFrontmatter(old: (...args: unknown[]) => unknown) {
+					return function (this: unknown, data: unknown) {
+						that.debug("saveFrontmatter hook triggered");
+						that.document.hsm?.send({
+							type: 'OBSIDIAN_SAVE_FRONTMATTER',
+							path: that.document.path,
+						});
+						that.saving = true;
+						const result = old.call(this, data);
+						that.saving = false;
+						return result;
+					};
+				},
+			}),
+		);
+
+		// Hook 2: Coordinate saves between pathways
+		this.unsubscribes.push(
+			getPatcher().patch(view, {
+				// @ts-ignore
+				save(old: (...args: unknown[]) => unknown) {
+					return function (this: unknown, ...args: unknown[]) {
+						const result = old.apply(this, args);
+						try {
+							const viewMode = that.view.getMode?.() ?? "unknown";
+							if (viewMode === "preview" && that.saving) {
+								that.debug("Syncing metadata changes through HSM during save");
+								that.document.hsm?.send({
+									type: "OBSIDIAN_METADATA_SYNC",
+									path: that.document.path,
+									mode: viewMode,
+								});
+								that.syncViewTextToHsm(
+									(that.view as MarkdownView & { text?: string }).text ?? "",
+									"preview.save",
+								);
+							}
+						} catch (e) {
+							that.error("Error syncing during save:", e);
+						}
+						return result;
+					};
+				},
+			}),
+		);
+
+		// Hook 3: Preview mode direct edits.
+		this.unsubscribes.push(
+			getPatcher().patch(view.previewMode as unknown as Record<string, unknown>, {
+				edit(old: (...args: unknown[]) => unknown) {
+					return function (this: unknown, data: string) {
+						that.debug("Preview edit hook triggered");
+						//@ts-ignore
+						if (that.view.getMode?.() === "preview") {
+							const editor = (
+								that.view as MarkdownView & {
+									editor?: { cm?: EditorView };
+								}
+							).editor;
+							if (editor?.cm) {
+								// If CodeMirror editor is available, dispatch changes there
+								const changes = that.incrementalBufferChange(data);
+								editor.cm.dispatch({
+									changes,
+								});
+								that.debug("Dispatched preview edit to CodeMirror");
+							} else {
+								// Otherwise route the preview edit through HSM.
+								that.syncViewTextToHsm(data, "preview.edit");
+								that.debug("Synced preview edit through HSM");
+							}
+							return;
+						}
+
+						return old.call(this, data);
+					};
+				},
+			}),
+		);
+	}
+
+	/**
+	 * Setup document observer to trigger UI updates
+	 */
+	private setupDocumentObserver(): void {
+		if (!this._ytext) return;
+
+		this.observer = (event: YTextEvent, tr: Transaction) => {
+			void (async () => {
+			if (!this.active()) {
+				this.debug("Received yjs event against a non-active view");
+				return;
+			}
+			if (this.destroyed) {
+				this.debug("Received yjs event but plugin was destroyed");
+				return;
+			}
+
+			this.renderAll();
+			})();
+		};
+
+		this._ytext.observe(this.observer);
+	}
+
+	/**
+	 * Check if this plugin is still active
+	 */
+	private active(): boolean {
+		return !this.destroyed && !!this.view;
+	}
+
+	/**
+	 * Update all UI renderers when document changes
+	 */
+	private renderAll(): void {
+		const viewMode =
+			// @ts-ignore
+			this.view.getMode?.() || this.view.getViewType?.() || "unknown";
+		this.runWithRelaySaving(() => {
+			this.renderers.forEach((renderer) => {
+				try {
+					renderer.render(this.document, viewMode);
+				} catch (error) {
+					this.error("Error in renderer:", error);
+				}
+			});
+		});
+	}
+	/**
+	 * Calculate incremental buffer changes using diff-match-patch
+	 */
+	private incrementalBufferChange(newBuffer: string): ChangeSpec[] {
+		const currentBuffer =
+			(
+				this.view as MarkdownView & { editor?: { cm?: EditorView } }
+			).editor?.cm?.state.doc.toString() ?? "";
+		const dmp = new diff_match_patch();
+		const diffs = dmp.diff_main(currentBuffer, newBuffer);
+		dmp.diff_cleanupSemantic(diffs);
+
+		const changes: ChangeSpec[] = [];
+		let pos = 0;
+
+		for (const [type, text] of diffs) {
+			switch (type) {
+				case 0: // EQUAL
+					pos += text.length;
+					break;
+				case 1: // INSERT
+					changes.push({
+						from: pos,
+						to: pos,
+						insert: text,
+					});
+					break;
+				case -1: // DELETE
+					changes.push({
+						from: pos,
+						to: pos + text.length,
+						insert: "",
+					});
+					pos += text.length;
+					break;
+			}
+		}
+
+		// Merge adjacent delete+insert pairs into single replacements.
+		// CM6 silently drops split delete/insert at the same boundary.
+		const merged: ChangeSpec[] = [];
+		let i = 0;
+		while (i < changes.length) {
+			const current = changes[i] as { from: number; to: number; insert: string };
+			const next = changes[i + 1] as { from: number; to: number; insert: string } | undefined;
+			if (
+				next &&
+				current.insert === "" &&
+				next.from === current.to &&
+				next.to === next.from
+			) {
+				merged.push({ from: current.from, to: current.to, insert: next.insert });
+				i += 2;
+			} else {
+				merged.push(current);
+				i++;
+			}
+		}
+		return merged;
+	}
+
+	/**
+	 * Clean up hooks and renderers
+	 */
+	destroy(): void {
+		this.destroyed = true;
+		this.debug("destroyed");
+
+		// Clean up document observer
+		if (this.observer) {
+			this._ytext?.unobserve(this.observer);
+		}
+
+		// Clean up Obsidian hooks
+		this.unsubscribes.forEach((unsubscribe) => unsubscribe());
+		this.unsubscribes.length = 0;
+
+		// Clean up renderers
+		this.renderers.forEach((renderer) => renderer.destroy());
+		this.renderers.length = 0;
+
+		// Clear references
+		this._ytext = null;
+		this.view = null as unknown as typeof this.view;
+		this.document = null as unknown as typeof this.document;
+	}
+}
