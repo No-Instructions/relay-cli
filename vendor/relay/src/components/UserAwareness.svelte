@@ -1,0 +1,638 @@
+<script lang="ts">
+	import Avatar from "./Avatar.svelte";
+	import { onDestroy, onMount } from "svelte";
+	import type { Awareness } from "y-protocols/awareness.js";
+	import type { RelayUser } from "../Relay";
+	import { derived, writable } from "svelte/store";
+	import { Highlighter } from "lucide-svelte";
+	import {
+		getAttributionFilter,
+		toggleUserAttribution,
+		toggleUserAttributionForUser,
+		type AttributionFilter,
+	} from "../y-codemirror.next/UserAttributionPlugin";
+	import { flags } from "../flagManager";
+	import { ANONYMOUS_PROFILE_NAME } from "../User";
+
+	export let awareness: Awareness;
+	export let relayUsers: any;
+	export let vertical = false;
+	export let getEditor: (() => unknown) | undefined = undefined;
+
+	const filterStore = writable<AttributionFilter>(null);
+	$: attributionAvailable = !!getEditor;
+
+	function refreshFilter() {
+		if (!getEditor) return;
+		const ed = getEditor();
+		filterStore.set(ed ? getAttributionFilter(ed) : null);
+	}
+
+	function onToggleGlobal() {
+		if (!getEditor) return;
+		const ed = getEditor();
+		if (!ed) return;
+		toggleUserAttribution(ed);
+		refreshFilter();
+	}
+
+	function onToggleUser(userId: string) {
+		if (!getEditor) return;
+		const ed = getEditor();
+		if (!ed) return;
+		toggleUserAttributionForUser(ed, userId);
+		refreshFilter();
+	}
+
+	function attributionIsOn(filter: AttributionFilter): boolean {
+		return filter !== null;
+	}
+
+	function userIsIncluded(
+		filter: AttributionFilter,
+		userId: string,
+	): boolean {
+		if (filter === null) return false;
+		if (filter.users.size === 0) return true;
+		return filter.users.has(userId);
+	}
+
+	let showPopover = false;
+	let popoverElement: HTMLElement;
+	let avatarStackElement: HTMLElement;
+
+	interface AwarenessUserData {
+		name: string;
+		id: string;
+		color: string;
+		colorLight: string;
+		relayUser?: RelayUser;
+	}
+
+	const VISIBLE_AVATAR_COUNT = 4;
+
+	// Create a writable store to trigger updates when awareness changes
+	const awarenessUpdate = writable(0);
+
+	// Subscribe to awareness changes to trigger store updates
+	let cleanupFunction: (() => void) | null = null;
+
+	$: if (awareness) {
+		// Clean up previous listener if any
+		if (cleanupFunction) {
+			cleanupFunction();
+		}
+
+		const handleChange = () => {
+			awarenessUpdate.update((n) => n + 1);
+		};
+
+		awareness.on("change", handleChange);
+		awarenessUpdate.set(0); // Initial trigger
+
+		// Store cleanup function
+		cleanupFunction = () => {
+			awareness.off("change", handleChange);
+		};
+	}
+
+	// Create derived store that combines awareness states with relay users
+	const allUsers = derived(
+		[relayUsers, awarenessUpdate],
+		([$relayUsers, _]) => {
+			if (!awareness || !$relayUsers) {
+				return [];
+			}
+
+			const states = awareness.getStates();
+			const users: AwarenessUserData[] = [];
+
+			states.forEach((state, clientId) => {
+				// Include all users (both local and remote)
+				const user = state.user;
+				if (user && user.id) {
+					// Try to look up the full RelayUser from the users store
+					const relayUser = $relayUsers.get(user.id);
+					const awarenessName = flags().enableStreamerMode
+						? ANONYMOUS_PROFILE_NAME
+						: user.name || ANONYMOUS_PROFILE_NAME;
+
+					users.push({
+						name: relayUser?.name || awarenessName,
+						id: user.id,
+						color: user.color || "#30bced",
+						colorLight: user.colorLight || user.color + "33" || "#30bced33",
+						relayUser: relayUser,
+					});
+				}
+			});
+
+			// Remove duplicates by id (in case same user has multiple clients)
+			const uniqueUsers = users.filter(
+				(user, index, arr) => arr.findIndex((u) => u.id === user.id) === index,
+			);
+
+			// Sort users so current user appears first, then users with avatars
+			const sortedUsers = uniqueUsers.sort((a, b) => {
+				const localState = awareness.getLocalState();
+				const localUserId = localState?.user?.id;
+				
+				// Current user always first
+				if (a.id === localUserId) return -1;
+				if (b.id === localUserId) return 1;
+				
+				// Then prefer users with avatars (relayUser)
+				if (a.relayUser && !b.relayUser) return -1;
+				if (!a.relayUser && b.relayUser) return 1;
+				
+				return 0;
+			});
+
+			return [...sortedUsers];
+		},
+	);
+
+	// Arrange users for display: current user at the end, others before
+	const displayUsers = derived([allUsers], ([$allUsers]) => {
+		if ($allUsers.length === 0) return [];
+
+		const localState = awareness?.getLocalState();
+		const localUserId = localState?.user?.id;
+
+		// Find current user and other users
+		const currentUser = $allUsers.find((user) => user.id === localUserId);
+		const otherUsers = $allUsers.filter((user) => user.id !== localUserId);
+
+		// Always put current user at the end, regardless of total count
+		if (currentUser) {
+			if ($allUsers.length <= VISIBLE_AVATAR_COUNT) {
+				// Show all other users first, then current user
+				return [...otherUsers, currentUser];
+			} else {
+				// Show limited other users first, then current user at the end
+				const visibleOthers = otherUsers.slice(0, VISIBLE_AVATAR_COUNT - 1);
+				return [...visibleOthers, currentUser];
+			}
+		} else {
+			// No current user found, just show other users
+			return otherUsers.slice(0, VISIBLE_AVATAR_COUNT);
+		}
+	});
+
+	function togglePopover() {
+		showPopover = !showPopover;
+		if (showPopover) refreshFilter();
+	}
+
+	function handleClickOutside(event: MouseEvent) {
+		if (popoverElement && !popoverElement.contains(event.target as Node)) {
+			showPopover = false;
+		}
+	}
+
+	// Calculate spacing for each avatar (CSS handles hover behavior)
+	function getAvatarSpacing(index: number): string {
+		return index === 0
+			? "0"
+			: index === 1
+				? "-1em"
+				: index === 2
+					? "-1.4em"
+					: "-1.8em";
+	}
+
+	onMount(() => {
+		document.addEventListener("click", handleClickOutside);
+		return () => {
+			document.removeEventListener("click", handleClickOutside);
+		};
+	});
+
+	// Cleanup on component destroy
+	onDestroy(() => {
+		if (cleanupFunction) {
+			cleanupFunction();
+		}
+		document.removeEventListener("click", handleClickOutside);
+	});
+</script>
+
+{#if $allUsers.length > 0}
+	<div class="user-awareness" class:vertical bind:this={popoverElement}>
+		<!-- Stacked avatars -->
+		<div
+			class="avatar-stack"
+			class:multi-user={$displayUsers.length > 1}
+			bind:this={avatarStackElement}
+			on:click={togglePopover}
+			on:keydown={(e) => e.key === "Enter" && togglePopover()}
+			role="button"
+			tabindex="-1"
+		>
+			{#each $displayUsers as user, index (user.id)}
+				<div
+					class="stacked-avatar"
+					style="z-index: {10 - index}; {vertical ? 'margin-top' : 'margin-left'}: {getAvatarSpacing(
+						index,
+					)}; transition: all 0.2s ease;"
+					aria-label={user.name}
+				>
+					{#if user.relayUser}
+						<div class="avatar-with-border" style="border-color: {user.color};">
+							<Avatar user={user.relayUser} size="2em" alt={user.name} />
+						</div>
+					{:else}
+						<div class="avatar-with-border" style="border-color: {user.color};">
+							<div class="user-avatar" style="background-color: {user.color};">
+								<span class="user-initial">
+									{user.name.charAt(0).toUpperCase()}
+								</span>
+							</div>
+						</div>
+					{/if}
+				</div>
+			{/each}
+			{#if $allUsers.length > VISIBLE_AVATAR_COUNT}
+				<div
+					class="more-indicator"
+					style="z-index: 11; {vertical ? 'margin-top: -1em' : 'margin-top: 1em; margin-left: -1em'}; transition: all 0.2s ease;"
+				>
+					+{$allUsers.length - VISIBLE_AVATAR_COUNT}
+				</div>
+			{/if}
+		</div>
+
+		<!-- Popover -->
+		{#if showPopover}
+			<div class="user-popover">
+				<div class="popover-header">
+					<span class="popover-title"
+						>Active Users ({$allUsers.length})</span
+					>
+					{#if attributionAvailable}
+						<button
+							type="button"
+							class="clickable-icon attribution-toggle"
+							class:is-active={attributionIsOn($filterStore)}
+							aria-pressed={attributionIsOn($filterStore)}
+							aria-label={attributionIsOn($filterStore)
+								? "Turn off author highlighting"
+								: "Highlight text by author"}
+							title={attributionIsOn($filterStore)
+								? "Turn off author highlighting"
+								: "Highlight text by author"}
+							on:click|stopPropagation={onToggleGlobal}
+						>
+							<Highlighter class="svg-icon lucide-highlighter" size={14} />
+						</button>
+					{/if}
+				</div>
+				<div class="user-list">
+					{#each $allUsers as user, index (user.id)}
+						{@const included = userIsIncluded($filterStore, user.id)}
+						<button
+							type="button"
+							class="user-item"
+							class:current-user={index === 0}
+							class:clickable={attributionAvailable}
+							class:attribution-on={attributionAvailable &&
+								attributionIsOn($filterStore) &&
+								included}
+							class:attribution-off={attributionAvailable &&
+								attributionIsOn($filterStore) &&
+								!included}
+							aria-pressed={attributionAvailable &&
+							attributionIsOn($filterStore)
+								? included
+								: undefined}
+							disabled={!attributionAvailable}
+							on:click={() => onToggleUser(user.id)}
+							title={attributionAvailable
+								? included
+									? `Hide ${user.name}'s highlights`
+									: `Highlight ${user.name}'s writing`
+								: undefined}
+						>
+							{#if user.relayUser}
+								<div
+									class="avatar-with-border"
+									style="border-color: {user.color};"
+								>
+									<Avatar user={user.relayUser} size="20px" alt={user.name} />
+								</div>
+							{:else}
+								<div
+									class="avatar-with-border"
+									style="border-color: {user.color};"
+								>
+									<div
+										class="user-avatar"
+										style="background-color: {user.color}; width: 20px; height: 20px;"
+									>
+										<span class="user-initial">
+											{user.name.charAt(0).toUpperCase()}
+										</span>
+									</div>
+								</div>
+							{/if}
+							<span class="user-name"
+								>{user.name}{index === 0 ? " (You)" : ""}</span
+							>
+							{#if attributionAvailable && attributionIsOn($filterStore)}
+								<span
+									class="attribution-dot"
+									class:active={included}
+									style="background-color: {included
+										? user.color
+										: 'transparent'}; border-color: {user.color};"
+								></span>
+							{/if}
+						</button>
+					{/each}
+				</div>
+			</div>
+		{/if}
+	</div>
+{/if}
+
+<style>
+	/* The outer container is created by AwarenessViewPlugin and is therefore
+	 * outside this component's scope — reached via :global(). Axis-specific
+	 * positioning (vertical offset) lives in AwarenessViewPlugin's
+	 * configureContainer hook, not here. */
+	:global(.user-awareness-container) {
+		position: absolute;
+		top: 0;
+		right: 0;
+		display: flex;
+		align-items: center;
+		flex-shrink: 0;
+		z-index: 10;
+	}
+
+	/* On narrow panes the note heading needs the full content width. Let the
+	 * markdown facepile occupy its own row instead of covering the first line. */
+	@media (max-width: 480px) {
+		:global(.user-awareness-container--markdown) {
+			position: relative;
+			top: auto;
+			right: auto;
+			width: 100%;
+			justify-content: flex-end;
+		}
+	}
+
+	.user-awareness {
+		position: relative;
+		display: flex;
+		align-items: center;
+	}
+
+	.avatar-stack {
+		display: flex;
+		align-items: center;
+		cursor: pointer;
+		position: relative;
+		transition: width 0.2s ease;
+		overflow: visible;
+	}
+
+	.user-awareness.vertical .avatar-stack {
+		flex-direction: column;
+	}
+
+	.stacked-avatar {
+		position: relative;
+	}
+
+	/* Transition axis follows the layout axis so hover overlap animates. */
+	.user-awareness:not(.vertical) .avatar-stack.multi-user .stacked-avatar {
+		transition: margin-left 0.2s ease;
+	}
+	.user-awareness.vertical .avatar-stack.multi-user .stacked-avatar {
+		transition: margin-top 0.2s ease;
+	}
+
+	/* Hover fan-out: horizontal variant fans out along X, vertical variant
+	 * fans out along Y but only for avatars 2+ so the stack top stays put.
+	 * `!important` is needed to override the inline per-avatar offset
+	 * (margin-left in horizontal, margin-top in vertical). */
+	@media (hover: hover) and (pointer: fine) {
+		.user-awareness:not(.vertical)
+			.avatar-stack.multi-user:hover
+			.stacked-avatar {
+			margin-left: -10px !important;
+			margin-right: 2px;
+			transition-delay: 300ms;
+		}
+		.user-awareness.vertical
+			.avatar-stack.multi-user:hover
+			.stacked-avatar:nth-child(n + 2) {
+			margin-top: -10px !important;
+			margin-bottom: 2px;
+			transition-delay: 300ms;
+		}
+	}
+
+	.more-indicator {
+		width: 2em;
+		height: 2em;
+		border-radius: 50%;
+		background-color: var(--background-modifier-border);
+		border: 2px solid var(--text-muted);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 0.6em;
+		font-weight: 600;
+		color: var(--text-muted);
+		position: relative;
+	}
+
+	.user-popover {
+		position: absolute;
+		top: 100%;
+		right: 0;
+		margin-top: 8px;
+		background: var(--background-primary);
+		border: 1px solid var(--background-modifier-border);
+		border-radius: 8px;
+		box-shadow: var(--shadow-s);
+		min-width: min(200px, calc(100vw - 24px));
+		max-width: min(300px, calc(100vw - 24px));
+		z-index: 1000;
+	}
+
+	/* Vertical stacks open the popover to the left of the column rather
+	 * than below it, since the column hugs the right edge of the view. */
+	.user-awareness.vertical .user-popover {
+		top: 0;
+		right: calc(100% + 8px);
+		margin-top: 0;
+	}
+
+	.user-popover::before {
+		content: "";
+		position: absolute;
+		top: -8px;
+		right: 20px;
+		width: 0;
+		height: 0;
+		border-left: 8px solid transparent;
+		border-right: 8px solid transparent;
+		border-bottom: 8px solid var(--background-modifier-border);
+	}
+
+	.user-popover::after {
+		content: "";
+		position: absolute;
+		top: -7px;
+		right: 20px;
+		width: 0;
+		height: 0;
+		border-left: 8px solid transparent;
+		border-right: 8px solid transparent;
+		border-bottom: 8px solid var(--background-secondary);
+	}
+
+	.user-awareness.vertical .user-popover::before,
+	.user-awareness.vertical .user-popover::after {
+		display: none;
+	}
+
+	.popover-header {
+		padding: 12px 16px 8px 16px;
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--text-muted);
+		border-bottom: 1px solid var(--background-modifier-border);
+		background: var(--background-secondary);
+		border-radius: 8px 8px 0 0;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+	}
+
+	.popover-title {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.attribution-toggle {
+		width: 22px;
+		height: 22px;
+		padding: 3px;
+		border: 0;
+		background: none;
+		box-shadow: none;
+		color: inherit;
+	}
+
+	.attribution-toggle:hover,
+	.attribution-toggle:focus,
+	.attribution-toggle:active {
+		box-shadow: none;
+	}
+
+	.attribution-toggle.is-active {
+		color: var(--text-accent);
+		background-color: var(--background-modifier-hover);
+	}
+
+	.attribution-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		border: 1.5px solid;
+		margin-left: auto;
+		flex-shrink: 0;
+	}
+
+	.user-item.clickable {
+		cursor: pointer;
+	}
+
+	.user-item.attribution-off {
+		opacity: 0.55;
+	}
+
+	.user-list {
+		padding: 8px 0;
+		max-height: 200px;
+		overflow-y: auto;
+	}
+
+	.user-item {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		width: 100%;
+		padding: 6px 16px;
+		border: 0;
+		background: none;
+		box-shadow: none;
+		font: inherit;
+		color: inherit;
+		height: auto;
+		min-height: 0;
+		text-align: left;
+		cursor: default;
+		justify-content: flex-start;
+	}
+
+	.user-item:hover:not(:disabled) {
+		background-color: var(--background-modifier-hover);
+		box-shadow: none;
+	}
+
+	.user-item:focus,
+	.user-item:active {
+		box-shadow: none;
+	}
+
+	.user-item:focus-visible {
+		outline: 1px solid var(--background-modifier-border-focus);
+		outline-offset: -2px;
+	}
+
+	.user-item:disabled {
+		opacity: 1;
+	}
+
+	.user-name {
+		font-size: 14px;
+		color: var(--text-normal);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.avatar-with-border {
+		border-radius: 50%;
+		border: 2px solid;
+		display: inline-block;
+		overflow: hidden;
+		flex-shrink: 0;
+		background: var(--background-primary);
+		box-sizing: border-box;
+		padding: 1px;
+	}
+
+	.user-avatar {
+		width: 2em;
+		height: 2em;
+		border-radius: 50%;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		position: relative;
+	}
+
+	.user-initial {
+		color: white;
+		font-size: 1em;
+		font-weight: 600;
+	}
+</style>

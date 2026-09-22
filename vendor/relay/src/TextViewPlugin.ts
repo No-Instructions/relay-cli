@@ -1,0 +1,392 @@
+import { MarkdownView, type TextFileView } from "obsidian";
+import { getPatcher } from "./Patcher";
+import { HasLogging } from "src/debug";
+import { Document, isDocument } from "./Document";
+import { ViewHookPlugin } from "./plugins/ViewHookPlugin";
+
+import { isLive, type LiveView } from "./LiveViews";
+import { YText, YTextEvent, Transaction } from "yjs/dist/src/internals";
+import { trackPromise } from "./trackPromise";
+import type { TFile } from "obsidian";
+
+export class TextFileViewPlugin extends HasLogging {
+	view: LiveView<TextFileView>;
+	doc: Document | undefined;
+	_ytext?: YText;
+	observer?: (event: YTextEvent, tr: Transaction) => void;
+	unsubscribes: Array<() => void>;
+	private destroyed = false;
+	private saving = false;
+	viewHookPlugin?: ViewHookPlugin;
+
+	getDocument(): Document | undefined {
+		const file = this.view.view.file;
+		if (file) {
+			if (this.doc?._tfile === file) {
+				return this.doc;
+			}
+			this.warn("[TextViewPlugin] getDocument() lookup:", {
+				filePath: file.path,
+				currentDocPath: this.doc?.path,
+				currentDocTFile: this.doc?._tfile?.path,
+			});
+			const folder = this.view.connectionManager.sharedFolders.lookup(
+				file.path,
+			);
+			if (folder) {
+				try {
+					const newDoc = folder.getFile(file);
+					if (isDocument(newDoc)) {
+						this.warn("[TextViewPlugin] getDocument() found:", {
+							newDocPath: newDoc.path,
+							newDocGuid: newDoc.guid,
+							newDocTFile: newDoc._tfile?.path,
+						});
+						this.doc = newDoc;
+						return this.doc;
+					}
+					this.warn("[TextViewPlugin] getDocument(): no shared document", {
+						filePath: file.path,
+					});
+				} catch (error) {
+					this.warn("[TextViewPlugin] getDocument() failed:", {
+						filePath: file.path,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		}
+		// Fallback to the LiveView's document
+		if (this.view.document) {
+			this.warn("[TextViewPlugin] getDocument() using fallback:", {
+				fallbackDocPath: this.view.document.path,
+				fallbackDocGuid: this.view.document.guid,
+			});
+			return this.view.document;
+		}
+	}
+
+	constructor(view: LiveView<TextFileView>) {
+		super();
+		this.view = view;
+		this.doc = view.document;
+		this.unsubscribes = [];
+		this.saving = false;
+
+		// Validate that document TFile matches view file and get correct document
+		const documentTFile = this.doc._tfile;
+		const viewFile = this.view.view?.file;
+		if (documentTFile !== viewFile) {
+			this.error("[TextViewPlugin] CRITICAL: Document TFile mismatch!", {
+				documentPath: this.doc.path,
+				documentTFilePath: documentTFile?.path,
+				viewFilePath: viewFile?.path,
+				viewType: this.view.view?.getViewType?.(),
+				documentGuid: this.doc.guid,
+				tFilesSame: documentTFile === viewFile,
+			});
+			// Get the correct document instance
+			const correctDoc = this.getDocument();
+			if (correctDoc) {
+				this.doc = correctDoc;
+				this.warn("[TextViewPlugin] Switched to correct document:", {
+					newDocPath: this.doc.path,
+					newDocGuid: this.doc.guid,
+				});
+			}
+		}
+
+		if (this.view.view instanceof MarkdownView) {
+			this.viewHookPlugin = new ViewHookPlugin(this.view.view, this.doc);
+		}
+
+		this.install();
+	}
+
+	private requestNativeViewSave(): void {
+		this.saving = true;
+		try {
+			this.view.view.requestSave();
+		} finally {
+			this.saving = false;
+		}
+	}
+
+	/**
+	 * Push document content into the view. Conforming TextFileViews accept
+	 * setViewData, but the kanban view only rerenders from its own state
+	 * store — its setViewData leaves the rendered board (and getViewData)
+	 * stale, which also poisons the next save's diff. When the view does
+	 * not accept the data, set the raw view data and refresh the board
+	 * through the kanban state manager for the file.
+	 */
+	private applyDataToView(data: string): void {
+		const view = this.view.view;
+		this.saving = true;
+		try {
+			view.setViewData(data, false);
+			if (view.getViewData() !== data) {
+				(view as { data?: string }).data = data;
+				const file = view.file;
+				const kanban = (view.app as unknown as {
+					plugins?: {
+						plugins?: Record<
+							string,
+							{ stateManagers?: Map<TFile, { forceRefresh?: () => void }> } | undefined
+						>;
+					};
+				} | undefined)?.plugins?.plugins?.["obsidian-kanban"];
+				const stateManagers = kanban?.stateManagers;
+				if (stateManagers && file) {
+					for (const [smFile, sm] of stateManagers) {
+						if (smFile === file || smFile?.path === file.path) {
+							try {
+								sm.forceRefresh!();
+							} catch (e) {
+								this.warn("kanban state refresh failed", e);
+							}
+						}
+					}
+				}
+			}
+		} finally {
+			this.saving = false;
+		}
+	}
+
+	async resync() {
+		if (
+			isLive(this.view) &&
+			!this.view.tracking &&
+			!this.destroyed &&
+			this.view.view.file
+		) {
+			// Dynamically get the correct document
+			this.doc = this.getDocument();
+			if (!this.doc) {
+				this.warn("resync() - no document available");
+				return;
+			}
+
+			const hsm = this.doc.hsm;
+			if (hsm?.awaitState) {
+				await trackPromise(`textView:awaitActive:${this.doc?.guid}`, hsm.awaitState((s) => s.startsWith("active.")));
+			} else {
+				return;
+			}
+			const docText = this.doc.localText;
+			if (docText === this.view.view.getViewData()) {
+				// Document and view content already match - set tracking immediately
+				this.view.tracking = true;
+				this.warn("resync() - content matches, setting tracking=true");
+				return;
+			} else {
+				this.warn("diff in resync - DETAILED DEBUG:", {
+					documentPath: this.doc.path,
+					documentTFilePath: this.doc._tfile?.path,
+					viewFilePath: this.view.view.file?.path,
+					documentText: docText,
+					viewData: this.view.view.getViewData(),
+					documentGuid: this.doc.guid,
+					tFilesMatching: this.doc._tfile === this.view.view.file,
+					documentTextLength: docText?.length || 0,
+					viewDataLength: this.view.view.getViewData()?.length || 0,
+				});
+			}
+			if (!this.doc.hasLocalDB() && docText === "") {
+				this.warn("local db missing, not setting buffer");
+				return;
+			}
+			// Check if document has HSM conflict before overwriting view content
+			const hasConflict = this.doc.hasHSMConflict();
+			if (hasConflict && this.view) {
+				this.warn("Document has HSM conflict - showing merge banner");
+				void this.view.checkStale(); // This will show the merge banner via HSM
+			} else {
+				// The document is authoritative, so force the view to match its CRDT state.
+				this.warn("Document is authoritative - syncing view to CRDT state");
+				await this.syncViewToCRDT();
+			}
+		}
+	}
+
+	async syncViewToCRDT() {
+		// Force the view to match the authoritative CRDT state.
+		if (
+			isLive(this.view) &&
+			!this.destroyed &&
+			this.doc &&
+			this.view.view.file
+		) {
+			this.warn("Syncing view to CRDT - setViewData");
+			this.applyDataToView(this.doc.localText);
+			this.requestNativeViewSave();
+			this.view.tracking = true;
+		}
+	}
+
+	private install() {
+		if (!this.view) return;
+
+		// Don't install if view file is not ready
+		if (!this.view.view.file) {
+			this.warn("view file not ready, deferring install");
+			// Retry installation after a short delay
+			window.setTimeout(() => {
+				if (!this.destroyed && this.view?.view?.file) {
+					this.install();
+				}
+			}, 100);
+			return;
+		}
+
+		this.warn(
+			"connecting textfile view",
+			this.view.view.file?.path,
+			this.view.document.path,
+		);
+
+		const owner = () => this;
+
+		this.unsubscribes.push(
+			getPatcher().patch(this.view.view, {
+				setViewData(old: (...args: unknown[]) => unknown) {
+					return function (
+						this: { getViewType(): string },
+						data: string,
+						clear: boolean,
+					) {
+						const plugin = owner();
+						plugin.warn("instance hook: setViewData", this.getViewType());
+
+						// Don't process if file isn't loaded yet
+						if (!plugin.view.view.file) {
+							plugin.warn(
+								"setViewData called before file loaded, deferring to original",
+							);
+							return old.call(this, data, clear);
+						}
+
+						if (clear) {
+							if (
+								isLive(plugin.view) &&
+								plugin.doc &&
+								plugin.view.view.file === plugin.doc.tfile
+							) {
+								if (plugin.doc.localText === data) {
+									plugin.view.tracking = true;
+								}
+							}
+						}
+
+						const result = old.call(this, data, clear);
+
+						// Call resync AFTER original setViewData succeeds
+						if (clear) {
+							void plugin.resync();
+						}
+
+						return result;
+					};
+				},
+				requestSave(old: (...args: unknown[]) => unknown) {
+					return function (this: { getViewType(): string }) {
+						const plugin = owner();
+						plugin.warn("instance hook: requestSave called", this.getViewType());
+						if (isLive(plugin.view) && !plugin.saving && plugin.doc) {
+							if (plugin.view.tracking && !plugin.saving) {
+								plugin.warn("tracking - applying diff");
+								const hsm = plugin.doc.hsm;
+								const docText = plugin.view.view.getViewData();
+								if (!hsm) {
+									throw new Error("TextFileViewPlugin requestSave: no HSM");
+								}
+								hsm.send({
+									type: "CM6_CHANGE",
+									changes: hsm.computeDiffChanges(plugin.doc.localText, docText),
+									docText,
+									userEvent: "set",
+								});
+								return old.call(this);
+							} else {
+								plugin.warn("not tracking - resync");
+								void plugin.resync();
+							}
+						}
+						return old.call(this);
+					};
+				},
+			}),
+		);
+
+		this.observer = (event, tr) => {
+			// Dynamically get the correct document
+			this.doc = this.getDocument();
+			if (!this.doc) {
+				this.debug("observer - no document available");
+				return;
+			}
+
+			if (!isLive(this.view)) {
+				this.debug("Recived yjs event against a non-live view");
+				return;
+			}
+			if (this.destroyed) {
+				this.debug("Recived yjs event but editor was destroyed");
+				return;
+			}
+
+			// Called when a yjs event is received. Results in view update
+			if (tr.origin !== this.doc) {
+				if (tr.origin === this.doc.hsm) {
+					return;
+				}
+				if (!this.view.tracking) {
+					this.warn("resync from update, not tracking");
+					void this.resync();
+				}
+				this.warn("setting view data");
+				this.applyDataToView(this.doc.localText);
+				this.requestNativeViewSave();
+				this.view.tracking = true;
+			}
+			};
+
+		void this.resync();
+
+		// Use the dynamically retrieved document for ytext
+		this.doc = this.getDocument();
+		if (this.doc) {
+			const localDoc = this.doc.localDoc;
+			if (localDoc) {
+				this._ytext = localDoc.getText("contents");
+				this._ytext.observe(this.observer);
+			}
+		}
+
+		// Initialize ViewHookPlugin after sync state is established
+		if (this.viewHookPlugin) {
+			this.viewHookPlugin.initialize().catch((error) => {
+				this.error("Error initializing ViewHookPlugin:", error);
+			});
+		}
+	}
+
+	destroy() {
+		this.warn("destroying view");
+		this.destroyed = true;
+		if (this.observer) {
+			this._ytext?.unobserve(this.observer);
+		}
+		this.unsubscribes.forEach((unsubscribe) => unsubscribe());
+		this.unsubscribes.length = 0;
+
+		// Clean up ViewHookPlugin
+		this.viewHookPlugin?.destroy();
+
+		this.observer = null as unknown as typeof this.observer;
+		this._ytext = null as unknown as typeof this._ytext;
+		this.view = null as unknown as typeof this.view;
+		this.doc = null as unknown as typeof this.doc;
+	}
+}

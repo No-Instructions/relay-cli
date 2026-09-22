@@ -1,0 +1,58 @@
+import { App, Modal } from "obsidian";
+import type { RemoteSharedFolder } from "src/Relay";
+import AddToVaultModalContent from "../components/AddToVaultModalContent.svelte";
+import { mountComponent, type MountedComponent } from "./svelteHost.svelte";
+import type { SharedFolder, SharedFolders } from "src/SharedFolder";
+
+export class AddToVaultModal extends Modal {
+	private component?: MountedComponent;
+
+	constructor(
+		app: App,
+		private sharedFolders: SharedFolders,
+		public remoteFolder: RemoteSharedFolder | undefined,
+		private availableFolders: RemoteSharedFolder[],
+		private onConfirm: (
+			remoteFolder: RemoteSharedFolder,
+			folderName: string,
+			folderLocation: string,
+		) => Promise<SharedFolder>,
+		private noFoldersMessage?: string,
+	) {
+		super(app);
+		this.onConfirm = onConfirm;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+
+		this.component = mountComponent(AddToVaultModalContent, {
+			target: contentEl,
+			props: {
+				remoteFolder: this.remoteFolder,
+				availableFolders: this.availableFolders,
+				sharedFolders: this.sharedFolders,
+				noFoldersMessage: this.noFoldersMessage,
+				onConfirm: async (
+					remoteFolder: RemoteSharedFolder,
+					folderName: string,
+					folderLocation: string,
+				) => {
+					await this.onConfirm(remoteFolder, folderName, folderLocation);
+					this.close();
+				},
+				app: this.app,
+			},
+		});
+	}
+
+	onClose() {
+		const { contentEl } = this;
+		contentEl.empty();
+		this.component?.destroy();
+		this.onConfirm = null as unknown as typeof this.onConfirm;
+		this.sharedFolders = null as unknown as typeof this.sharedFolders;
+		this.remoteFolder = undefined;
+		this.availableFolders.length = 0;
+	}
+}

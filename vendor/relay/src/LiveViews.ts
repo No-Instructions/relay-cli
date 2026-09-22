@@ -1,0 +1,1897 @@
+import type { Extension } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import {
+	App,
+	MarkdownView,
+	TFile,
+	TextFileView,
+	Workspace,
+	editorInfoField,
+	moment,
+	type WorkspaceLeaf,
+	type CachedMetadata,
+} from "obsidian";
+import ViewActions from "src/components/ViewActions.svelte";
+import { mountComponent, type MountedComponent } from "src/ui/svelteHost.svelte";
+import * as Y from "yjs";
+import { Document, isDocument } from "./Document";
+import type { EditorViewRef } from "./merge-hsm/types";
+import type { ConnectionState } from "./HasProvider";
+import { LoginManager } from "./LoginManager";
+import NetworkStatus from "./NetworkStatus";
+import { SharedFolder, SharedFolders } from "./SharedFolder";
+import { curryLog, HasLogging, RelayInstances, metrics } from "./debug";
+import { Banner } from "./ui/Banner";
+import { HSMEditorPlugin } from "./merge-hsm/integration/HSMEditorPlugin";
+import {
+	yRemoteSelections,
+	yRemoteSelectionsTheme,
+} from "./y-codemirror.next/RemoteSelections";
+import {
+	attributionFilterField,
+	userAttributionPlugin,
+	userAttributionTheme,
+} from "./y-codemirror.next/UserAttributionPlugin";
+import { InvalidLinkPlugin } from "./markdownView/InvalidLinkExtension";
+import * as Differ from "./differ/differencesView";
+import type { CanvasView } from "./CanvasView";
+import { isCanvas, type Canvas } from "./Canvas";
+import { CanvasPlugin } from "./CanvasPlugin";
+import { LiveNode } from "./y-codemirror.next/LiveNodePlugin";
+import { flags } from "./flagManager";
+import {
+	AwarenessViewPlugin,
+	resolveMarkdownAwarenessAnchor,
+} from "./AwarenessViewPlugin";
+import { TextFileViewPlugin } from "./TextViewPlugin";
+import {
+	iterateTextFileViews,
+	type TextViewRegistry,
+} from "./TextViewRegistry";
+import { ViewHookPlugin } from "./plugins/ViewHookPlugin";
+import { DiskBuffer } from "./DiskBuffer";
+import { trackPromise } from "./trackPromise";
+import { isDocumentDestroyedError } from "./DocumentDestroyedError";
+import { trackAsyncCleanup } from "./reloadUtils";
+import { transitionViewsOffline } from "./offlineViews";
+import type { ObsidianCanvas } from "src/CanvasView";
+
+/**
+ * Access the LiveViewManager singleton via the Obsidian plugin registry.
+ * Replaces ConnectionManagerStateField — no CM6 state field needed since
+ * the plugin is a singleton reachable from any EditorView.
+ */
+export function getConnectionManager(
+	editor: EditorView,
+): LiveViewManager | null {
+	const fileInfo = editor.state.field(editorInfoField, false);
+	return (
+		(fileInfo as unknown as {
+			app?: {
+				plugins?: {
+					plugins?: Record<string, { _liveViews?: LiveViewManager }>;
+				};
+			};
+		} | undefined)?.app?.plugins?.plugins?.["system3-relay"]?._liveViews ?? null
+	);
+}
+
+export type DocumentViewer = WorkspaceLeaf | symbol;
+
+const BACKGROUND_CONNECTIONS = 3;
+
+function iterateCanvasViews(
+	workspace: Workspace,
+	fn: (leaf: CanvasView) => void,
+) {
+	workspace.iterateAllLeaves((leaf) => {
+		if (leaf.view.getViewType() === "canvas") {
+			fn(leaf.view as unknown as CanvasView);
+		}
+	});
+}
+
+function ViewsetsEqual(vs1: S3View[], vs2: S3View[]): boolean {
+	if (vs1.length !== vs2.length) {
+		return false;
+	}
+
+	for (let i = 0; i < vs1.length; i++) {
+		if (vs1[i].view.file?.path !== vs2[i].view.file?.path) {
+			return false;
+		}
+		if (vs1[i].document?.path !== vs2[i].document?.path) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function refreshLeafViewForUnload(
+	leaf: WorkspaceLeaf | undefined,
+	options: {
+		file?: TFile | null;
+		filePath?: string;
+		label: string;
+		mode?: string;
+	},
+): void {
+	const rawLeaf:
+		| (WorkspaceLeaf & {
+				view?: { getMode?: () => string };
+				rebuildView?: () => Promise<void>;
+			})
+		| undefined = leaf;
+	if (!rawLeaf) return;
+
+	const cleanup = (async () => {
+		const viewState = rawLeaf.getViewState?.();
+		if (
+			viewState?.type === "markdown" &&
+			options.file &&
+			typeof rawLeaf.setViewState === "function" &&
+			typeof rawLeaf.openFile === "function"
+		) {
+			try {
+				await rawLeaf.setViewState({ type: "empty", state: {} }, { focus: false });
+				await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+				await rawLeaf.openFile(options.file, { active: false });
+				await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+
+				if (options.mode && rawLeaf.view?.getMode?.() !== options.mode) {
+					const currentState = rawLeaf.getViewState?.() ?? viewState;
+					await rawLeaf.setViewState(
+						{
+							...currentState,
+							state: {
+								...(currentState.state ?? {}),
+								file: options.filePath ?? options.file.path,
+								mode: options.mode,
+							},
+						},
+						{ focus: false },
+					);
+					await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+				}
+			} catch (error) {
+				try {
+					await rawLeaf.setViewState(viewState, { focus: false });
+				} catch {
+					// Best-effort restore; preserve the original failure for logging.
+				}
+				throw error;
+			}
+			return;
+		}
+
+		const result = rawLeaf.rebuildView?.();
+		if (result && typeof result.then === "function") {
+			await result;
+		}
+	})();
+
+	trackAsyncCleanup(cleanup, options.label);
+}
+
+export interface S3View {
+	view: TextFileView | CanvasView;
+	release: () => void;
+	attach: () => Promise<S3View>;
+	document: Document | Canvas | null;
+	destroy: () => void;
+	canConnect: boolean;
+	offlineBanner?: () => () => void;
+}
+
+export class LoggedOutView implements S3View {
+	view: TextFileView | CanvasView;
+	login: () => Promise<boolean>;
+	banner?: Banner;
+	document = null;
+	canConnect = false;
+
+	private _parent: LiveViewManager;
+
+	constructor(
+		connectionManager: LiveViewManager,
+		view: TextFileView | CanvasView,
+		login: () => Promise<boolean>,
+	) {
+		this._parent = connectionManager; // for debug
+		this.view = view;
+		this.login = login;
+	}
+
+	attach(): Promise<S3View> {
+		this.banner = new Banner(
+			this.view,
+			{ short: "Login to Relay", long: "Login to enable Live edits" },
+			async () => {
+				return await this.login();
+			},
+		);
+		return Promise.resolve(this);
+	}
+
+	release() {
+		this.banner?.destroy();
+	}
+
+	destroy() {
+		this.banner?.destroy();
+		this.banner = undefined;
+		this.view = null as unknown as typeof this.view;
+	}
+}
+
+export function isLiveMd(view?: S3View): view is LiveView<MarkdownView> {
+	return (
+		view instanceof LiveView &&
+		view.view instanceof MarkdownView &&
+		view.document !== undefined &&
+		view.document.text !== undefined
+	);
+}
+
+export function isLive(view?: S3View): view is LiveView<TextFileView> {
+	return (
+		view instanceof LiveView &&
+		view.document !== undefined &&
+		view.document.text !== undefined
+	);
+}
+
+export function isRelayCanvasView(view?: S3View): view is RelayCanvasView {
+	return view instanceof RelayCanvasView && view.document !== undefined;
+}
+
+export class RelayCanvasView implements S3View {
+	view: CanvasView;
+	canvas: Canvas;
+	shouldConnect: boolean;
+	canConnect: boolean;
+	plugin?: CanvasPlugin;
+	document: Canvas;
+
+	private _viewActions?: MountedComponent;
+	private offConnectionStatusSubscription?: () => void;
+	private _parent: LiveViewManager;
+	private _banner?: Banner;
+	private _awarenessPlugin?: AwarenessViewPlugin;
+	private _lockViewer?: DocumentViewer;
+	tracking: boolean;
+
+	constructor(
+		connectionManager: LiveViewManager,
+		view: CanvasView,
+		canvas: Canvas,
+		shouldConnect = true,
+		canConnect = true,
+	) {
+		this._parent = connectionManager; // for debug
+		this.view = view;
+		this.canvas = canvas;
+		this.document = canvas;
+		this.tracking = false;
+
+		this.shouldConnect = shouldConnect;
+		this.canConnect = canConnect;
+		if (!connectionManager.networkStatus.online) {
+			this.offlineBanner();
+		}
+	}
+
+	toggleConnection() {
+		this.shouldConnect = !this.shouldConnect;
+		if (this.shouldConnect) {
+			void this.canvas.connect().then((connected) => {
+				if (!connected) {
+					// If we couldn't connect, ensure their next press tries again.
+					this.shouldConnect = false;
+				}
+			});
+		} else {
+			this.canvas.disconnect();
+		}
+	}
+
+	toggleLocalOnly() {
+		this.toggleConnection();
+	}
+
+	offlineBanner(): () => void {
+		if (this.shouldConnect) {
+			const banner = new Banner(
+				this.view,
+				{ short: "Offline", long: "You're offline -- click to reconnect" },
+				async () => {
+					void this._parent.networkStatus.checkStatus();
+					this.connect();
+					return this._parent.networkStatus.online;
+				},
+			);
+			this._parent.networkStatus.onceOnline(() => {
+				this.connect();
+				banner.destroy();
+			});
+		}
+		return () => {};
+	}
+
+	setConnectionDot(): void {
+		const viewActionsElement =
+			this.view.containerEl.querySelector(".view-actions");
+		if (viewActionsElement && viewActionsElement.firstChild) {
+			if (!this._viewActions) {
+				this.clearViewActions();
+				if (this.offConnectionStatusSubscription) {
+					this.offConnectionStatusSubscription();
+				}
+				this._viewActions = mountComponent(ViewActions, {
+					target: viewActionsElement,
+					anchor: viewActionsElement.firstChild,
+					props: {
+						view: this,
+						state: this.canvas.state,
+						remote: this.canvas.sharedFolder.remote,
+						tracking: this.tracking,
+						enableDraftMode: flags().enableDraftMode,
+					},
+				});
+				this.offConnectionStatusSubscription = this.canvas.subscribe(
+					viewActionsElement,
+					(state: ConnectionState) => {
+						this._viewActions?.set({
+							view: this,
+							state: state,
+							remote: this.canvas.sharedFolder.remote,
+							tracking: this.tracking,
+							enableDraftMode: flags().enableDraftMode,
+						});
+					},
+				);
+			}
+			this._viewActions.set({
+				view: this,
+				state: this.canvas.state,
+				remote: this.canvas.sharedFolder.remote,
+				tracking: this.tracking,
+				enableDraftMode: flags().enableDraftMode,
+			});
+		}
+	}
+
+	clearViewActions() {
+		const viewActionsElement =
+			this.view.containerEl.querySelector(".view-actions");
+		if (viewActionsElement && viewActionsElement.firstChild) {
+			const viewActions = this.view.containerEl.querySelectorAll(
+				".system3-view-action",
+			);
+			if (viewActions.length > 0) {
+				viewActions.forEach((viewAction) => {
+					viewAction.remove();
+				});
+			}
+		}
+	}
+
+	attach(): Promise<RelayCanvasView> {
+		// can be called multiple times, whereas release is only ever called once
+		this._lockViewer = this._lockViewer ?? this.view.leaf ?? Symbol(`canvas:${this.canvas.path}`);
+		this._parent.acquireCanvasLock(this.canvas, this._lockViewer);
+
+		// Add CSS class to indicate this view should have live editing
+		this.view.containerEl.addClass("relay-live-editor");
+
+		this.setConnectionDot();
+
+		if (!this.plugin) {
+			this.plugin = new CanvasPlugin(this._parent, this);
+		}
+
+		if (!this._awarenessPlugin) {
+			const viewEl = this.view.containerEl;
+			this._awarenessPlugin = new AwarenessViewPlugin(
+				{
+					view: this.view,
+					doc: this.canvas,
+					resolveAnchor: (containerEl) => {
+						const viewContent =
+							containerEl.querySelector<HTMLElement>(".view-content");
+						return viewContent
+							? { anchor: viewContent, position: "afterbegin" }
+							: null;
+					},
+					vertical: true,
+					configureContainer: (el) => {
+						const controls =
+							viewEl.querySelector<HTMLElement>(".canvas-controls");
+						const gap = 12;
+						const top = controls
+							? controls.offsetTop + controls.offsetHeight + gap
+							: gap;
+						el.style.top = `${top}px`;
+						const isMobile =
+							viewEl.ownerDocument.body.classList.contains("is-mobile");
+						el.style.right = isMobile ? "12px" : "6px";
+					},
+				},
+				this._parent.sharedFolders.manager.users,
+			);
+		}
+
+		return new Promise((resolve, reject) => {
+			void trackPromise(
+				`canvasView:whenReady:${this.canvas.guid}`,
+				this.canvas.whenReady(),
+			)
+				.then((doc) => {
+					if (
+						this._parent.networkStatus.online &&
+						this.canvas.sharedFolder.shouldConnect &&
+						this.shouldConnect &&
+						this.canConnect
+					) {
+						this.connect();
+					} else {
+						this.canvas.disconnect();
+					}
+					resolve(this);
+				})
+				.catch((error) => {
+					if (isDocumentDestroyedError(error)) {
+						this.release();
+						reject(error);
+						return;
+					}
+					this.offlineBanner();
+					resolve(this);
+				});
+		});
+	}
+
+	connect() {
+		void this.canvas.connect();
+	}
+
+	release() {
+		// Called when a view is released from management
+
+		// Remove the live editor class
+		this.view.containerEl.removeClass("relay-live-editor");
+
+		this.plugin?.destroy();
+		this.plugin = undefined;
+		this._awarenessPlugin?.destroy();
+		this._awarenessPlugin = undefined;
+		this._viewActions?.destroy();
+		this._viewActions = undefined;
+		this._banner?.destroy();
+		this._banner = undefined;
+		if (this.offConnectionStatusSubscription) {
+			this.offConnectionStatusSubscription();
+			this.offConnectionStatusSubscription = undefined;
+		}
+		// Another pane may still show this canvas; only the last viewer
+		// releases the machine lock and the connection.
+		const viewer =
+			this._lockViewer ?? this.view.leaf ?? Symbol(`canvas:${this.canvas.path}`);
+		const stillHeld = this._parent.releaseCanvasLock(this.canvas, viewer);
+		if (!stillHeld) {
+			this.canvas.disconnect();
+		}
+	}
+
+	destroy() {
+		this.plugin?.destroy();
+		this.plugin = null as unknown as typeof this.plugin;
+		this.release();
+		this.clearViewActions();
+		refreshLeafViewForUnload(this.view.leaf, {
+			file: this.view.file,
+			filePath: this.view.file?.path,
+			label: `canvasView:refreshLeaf:${this.canvas.guid}`,
+		});
+		this._parent = null as unknown as typeof this._parent;
+		this.view = null as unknown as typeof this.view;
+		this.canvas = null as unknown as typeof this.canvas;
+	}
+}
+
+export class LiveView<ViewType extends TextFileView>
+	extends HasLogging
+	implements S3View
+{
+	view: ViewType;
+	document: Document;
+	shouldConnect: boolean;
+	canConnect: boolean;
+	private _plugin?: TextFileViewPlugin;
+	private _viewHookPlugin?: ViewHookPlugin;
+
+	private _viewActions?: MountedComponent;
+	private offConnectionStatusSubscription?: () => void;
+	private _parent: LiveViewManager;
+	private _banner?: Banner;
+	_tracking: boolean;
+	private _awarenessPlugin?: AwarenessViewPlugin;
+	private _hsmStateUnsubscribe?: () => void;
+	private _hasLock = false;
+	private _released = false;
+	private readonly _fallbackViewer = Symbol("live-view-viewer");
+
+	constructor(
+		connectionManager: LiveViewManager,
+		view: ViewType,
+		document: Document,
+		shouldConnect = true,
+		canConnect = true,
+	) {
+		super();
+		this._parent = connectionManager; // for debug
+		this.view = view;
+		this.document = document;
+		this._tracking = false;
+
+		this.shouldConnect = shouldConnect;
+		this.canConnect = canConnect;
+		if (!connectionManager.networkStatus.online) {
+			this.offlineBanner();
+		}
+	}
+
+	toggleConnection() {
+		this.shouldConnect = !this.shouldConnect;
+		if (this.shouldConnect) {
+			void this.document.connect().then((connected) => {
+				if (!connected) {
+					// If we couldn't connect, ensure their next press tries again.
+					this.shouldConnect = false;
+				}
+			});
+		} else {
+			this.document.disconnect();
+		}
+	}
+
+	toggleLocalOnly() {
+		const hsm = this.document.hsm;
+		if (hsm) {
+			const wasLocalOnly = hsm.isLocalOnly;
+			hsm.setLocalOnly(!wasLocalOnly);
+			if (wasLocalOnly && !this.document.connected) {
+				void this.document.connect();
+			}
+			void this.attach().catch((error) => {
+				this.warn("toggleLocalOnly attach failed", error);
+			});
+		}
+	}
+
+	public get tracking() {
+		if (this.document?.hsm) {
+			return this.document.hsm.state.statePath === "active.tracking";
+		}
+		return this._tracking;
+	}
+
+	public set tracking(value: boolean) {
+		const old = this._tracking;
+		this._tracking = value;
+		// Only call attach for non-HSM mode (fallback for views without HSM)
+		if (this._tracking !== old && !this.document?.hsm) {
+			void this.attach().catch((error) => {
+				this.warn("tracking attach failed", error);
+			});
+		}
+	}
+
+	public get ytext(): Y.Text {
+		return this.document.ytext;
+	}
+
+	public get connectionManager(): LiveViewManager {
+		return this._parent;
+	}
+
+	public async syncViewToCRDT(): Promise<void> {
+		if (this._plugin && typeof this._plugin.syncViewToCRDT === "function") {
+			await this._plugin.syncViewToCRDT();
+		}
+	}
+
+	mergeBanner(): () => void {
+		this._banner = new Banner(
+			this.view,
+			{ short: "Merge conflict", long: "Merge conflict -- click to resolve" },
+			async () => {
+				// HSM-aware conflict resolution path
+				const hsm = this.document.hsm;
+				if (hsm) {
+					const conflictData = hsm.getConflictData({ fresh: true });
+					const localDoc = hsm.getLocalDoc();
+					if (
+						conflictData &&
+						localDoc &&
+						hsm.state.statePath.includes("conflict")
+					) {
+						this.log("[mergeBanner] Opening diff view for conflict resolution");
+
+						// Check if there are inline conflict regions (new flow)
+						const hasInlineConflicts =
+							conflictData.conflictRegions &&
+							conflictData.conflictRegions.length > 0;
+
+						if (hasInlineConflicts) {
+							// With inline conflicts, clicking banner opens diff view as alternative
+							this.log(
+								"[mergeBanner] Inline conflicts present, opening diff view as alternative",
+							);
+						}
+
+						// Use the conflict payload sides directly so labels and hunk actions
+						// stay aligned with what the HSM declared as ours/theirs.
+						const oursContent = conflictData.ours;
+						const theirsContent = conflictData.theirs;
+						const currentLocalContent = localDoc.getText("contents").toString();
+						if (currentLocalContent !== oursContent) {
+							this.log(
+								`[mergeBanner] conflict side drift detected: localDoc=${currentLocalContent.length}, conflict.ours=${oursContent.length}`,
+							);
+						}
+
+						this.log(
+							`[mergeBanner] ours: ${oursContent.length} chars, theirs: ${theirsContent.length} chars`,
+						);
+
+						const oursLabel = conflictData.oursLabel ?? "Editor";
+						const theirsLabel = conflictData.theirsLabel ?? "Disk";
+						const showRemoteOnTop =
+							oursLabel.toLowerCase().includes("local")
+							&& (
+								theirsLabel.toLowerCase().includes("remote")
+								|| theirsLabel.toLowerCase().includes("peer")
+							);
+						const topContent = showRemoteOnTop ? theirsContent : oursContent;
+						const bottomContent = showRemoteOnTop ? oursContent : theirsContent;
+						const topLabel = showRemoteOnTop ? theirsLabel : oursLabel;
+						const bottomLabel = showRemoteOnTop ? oursLabel : theirsLabel;
+
+						// Create DiskBuffer wrappers (differ expects TFile-like objects).
+						// file1 is always shown on top/left in the differ.
+						const topFile = new DiskBuffer(
+							this._parent.app.vault,
+							this.document.path + ` (${topLabel})`,
+							topContent,
+						);
+						const bottomFile = new DiskBuffer(
+							this._parent.app.vault,
+							this.document.path + ` (${bottomLabel})`,
+							bottomContent,
+						);
+
+						// Transition HSM to resolving state
+						hsm.send({ type: "OPEN_DIFF_VIEW" });
+
+						// Open diff view: file1 is rendered on top/left.
+						this._parent.openDiffView({
+							file1: topFile,
+							file2: bottomFile,
+							showMergeOption: true,
+							oursLabel: topLabel,
+							theirsLabel: bottomLabel,
+							sourceVaultPath: this.document.tfile?.path,
+							onResolve: async () => {
+								this.log("[mergeBanner] HSM conflict resolved via diff view");
+
+								// The differ modifies file1 in-place via its contents.
+								// Get the resolved content and apply it to HSM's localDoc.
+								const resolvedContent = topFile.contents;
+
+								hsm.send({ type: "RESOLVE", contents: resolvedContent });
+
+								this._banner?.destroy();
+								this._banner = undefined;
+							},
+							onCancel: () => {
+								this.log("[mergeBanner] Diff view closed without resolving");
+								hsm.send({ type: "CANCEL" });
+							},
+						});
+						return false; // Don't destroy banner yet - wait for resolution
+					}
+				}
+				return false;
+			},
+		);
+		return () => {};
+	}
+
+	offlineBanner(): () => void {
+		if (this.shouldConnect) {
+			const banner = new Banner(
+				this.view,
+				{ short: "Offline", long: "You're offline -- click to reconnect" },
+				async () => {
+					void this._parent.networkStatus.checkStatus();
+					this.connect();
+					return this._parent.networkStatus.online;
+				},
+			);
+			this._parent.networkStatus.onceOnline(() => {
+				this.connect();
+				banner.destroy();
+			});
+		}
+		return () => {};
+	}
+
+	setConnectionDot(): void {
+		const viewActionsElement =
+			this.view.containerEl.querySelector(".view-actions");
+		if (viewActionsElement && viewActionsElement.firstChild) {
+			if (!this._viewActions) {
+				this.clearViewActions();
+				if (this.offConnectionStatusSubscription) {
+					this.offConnectionStatusSubscription();
+				}
+				this._viewActions = mountComponent(ViewActions, {
+					target: viewActionsElement,
+					anchor: viewActionsElement.firstChild,
+					props: {
+						view: this,
+						state: this.document.state,
+						remote: this.document.sharedFolder.remote,
+						tracking: this.tracking,
+						localOnly: this.document.hsm?.isLocalOnly ?? false,
+						enableDraftMode: flags().enableDraftMode,
+						folderConnected: this.document.sharedFolder.connected,
+						pendingOutbound: this.document.hsm?.pendingOutbound ?? 0,
+						pendingInbound: this.document.hsm?.pendingInbound ?? 0,
+					},
+				});
+				this.offConnectionStatusSubscription = this.document.subscribe(
+					viewActionsElement,
+					(state: ConnectionState) => {
+						this._viewActions?.set({
+							view: this,
+							state: state,
+							remote: this.document.sharedFolder.remote,
+							tracking: this.tracking,
+							localOnly: this.document.hsm?.isLocalOnly ?? false,
+							enableDraftMode: flags().enableDraftMode,
+							folderConnected: this.document.sharedFolder.connected,
+							pendingOutbound: this.document.hsm?.pendingOutbound ?? 0,
+							pendingInbound: this.document.hsm?.pendingInbound ?? 0,
+						});
+					},
+				);
+			}
+			// Subscribe to HSM state changes to update tracking icon and conflict banner
+			const hsm = this.document.hsm;
+			if (hsm && !this._hsmStateUnsubscribe) {
+				this._hsmStateUnsubscribe = hsm.stateChanges.subscribe((state) => {
+					if (!this.document.sharedFolder) return;
+					this._viewActions?.set({
+						tracking: state.statePath === "active.tracking",
+						localOnly: this.document.hsm?.isLocalOnly ?? false,
+						enableDraftMode: flags().enableDraftMode,
+						folderConnected: this.document.sharedFolder.connected,
+						pendingOutbound: this.document.hsm?.pendingOutbound ?? 0,
+						pendingInbound: this.document.hsm?.pendingInbound ?? 0,
+					});
+					const isConflict = state.statePath.includes("conflict");
+					if (isConflict && !this._banner) {
+						this.log(
+							"[LiveView] HSM entered conflict state, showing merge banner",
+						);
+						this.mergeBanner();
+					} else if (!isConflict && this._banner) {
+						this.log(
+							"[LiveView] HSM exited conflict state, hiding merge banner",
+						);
+						this._banner.destroy();
+						this._banner = undefined;
+					}
+				});
+			}
+			this._viewActions.set({
+				view: this,
+				state: this.document.state,
+				remote: this.document.sharedFolder.remote,
+				tracking: this.tracking,
+				localOnly: this.document.hsm?.isLocalOnly ?? false,
+				enableDraftMode: flags().enableDraftMode,
+				folderConnected: this.document.sharedFolder.connected,
+				pendingOutbound: this.document.hsm?.pendingOutbound ?? 0,
+				pendingInbound: this.document.hsm?.pendingInbound ?? 0,
+			});
+		}
+	}
+
+	clearViewActions() {
+		const viewActionsElement =
+			this.view.containerEl.querySelector(".view-actions");
+		if (viewActionsElement && viewActionsElement.firstChild) {
+			const viewActions = this.view.containerEl.querySelectorAll(
+				".system3-view-action",
+			);
+			if (viewActions.length > 0) {
+				viewActions.forEach((viewAction) => {
+					viewAction.remove();
+				});
+			}
+		}
+	}
+
+	async checkStale() {
+		if (
+			this.view instanceof MarkdownView &&
+			this.view.getMode() === "preview"
+		) {
+			this.log("[LiveView.checkStale] skipping - preview mode");
+			return false;
+		}
+
+		// Use HSM conflict detection
+		const hsmConflict = this.document.hasHSMConflict();
+		this.log(`[LiveView.checkStale] HSM conflict detection: ${hsmConflict}`);
+		if (hsmConflict === true) {
+			this.log(
+				"[LiveView.checkStale] HSM reports conflict, showing merge banner",
+			);
+			this.mergeBanner();
+			return true;
+		} else {
+			this._banner?.destroy();
+			this._banner = undefined;
+			return false;
+		}
+	}
+
+	private initializeEditorIntegration(): void {
+		if (!(this.view instanceof MarkdownView)) {
+			return;
+		}
+		const cm = (this.view.editor as { cm?: EditorView } | undefined)?.cm;
+		if (!cm) {
+			return;
+		}
+		const plugin = cm.plugin(HSMEditorPlugin);
+		plugin?.initializeIfReady();
+	}
+
+	attach(): Promise<this> {
+		this._released = false;
+
+		// can be called multiple times, whereas release is only ever called once
+		// Acquire a lock synchronously. Subsequent attach calls for the same view
+		// are idempotent until release().
+		if (!this._hasLock) {
+			this._parent.acquireDocumentLock(
+				this.document,
+				this.view,
+				this.view.leaf ?? this._fallbackViewer,
+			);
+			this._hasLock = true;
+		}
+		this.initializeEditorIntegration();
+
+		// Add CSS class to indicate this view should have live editing
+		if (this.view instanceof MarkdownView) {
+			this.view.containerEl.addClass("relay-live-editor");
+
+			// Initialize ViewHookPlugin to capture non-CM6 edit paths
+			// (preview mode checkbox toggles, frontmatter saves via Properties panel)
+			if (!this._viewHookPlugin) {
+				this._viewHookPlugin = new ViewHookPlugin(this.view, this.document);
+				this._viewHookPlugin.initialize().catch((error) => {
+					this.error("Error initializing ViewHookPlugin:", error);
+				});
+			}
+		}
+
+		if (!(this.view instanceof MarkdownView)) {
+			if (!this._plugin) {
+				this.warn("[LiveView] Creating TextFileViewPlugin in attach() for:", {
+					path: this.document.path,
+					viewType: this.view.getViewType?.(),
+					viewFilePath: this.view.file?.path,
+				});
+				this._plugin = new TextFileViewPlugin(this);
+			}
+		}
+
+		this.setConnectionDot();
+
+		if (isLiveMd(this)) {
+			if (!this._awarenessPlugin) {
+				this._awarenessPlugin = new AwarenessViewPlugin(
+					{
+						view: this.view,
+						doc: this.document,
+						resolveAnchor: (containerEl) =>
+							resolveMarkdownAwarenessAnchor(
+								containerEl,
+								this.view.getMode(),
+							),
+						variantClass: "user-awareness-container--markdown",
+						getEditor: () => this.view.editor,
+					},
+					this._parent.sharedFolders.manager.users,
+				);
+			} else {
+				this._awarenessPlugin.refresh();
+			}
+		}
+
+		return new Promise((resolve, reject) => {
+			void trackPromise(
+				`liveView:whenReady:${this.document.guid}`,
+				this.document.whenReady(),
+			)
+				.then((doc) => {
+					this.initializeEditorIntegration();
+					if (
+						this._parent.networkStatus.online &&
+						this.document.sharedFolder.shouldConnect &&
+						this.shouldConnect &&
+						this.canConnect
+					) {
+						this.connect();
+					} else {
+						this.document.disconnect();
+					}
+					resolve(this);
+				})
+				.catch((error) => {
+					if (isDocumentDestroyedError(error)) {
+						this.release();
+						reject(error);
+						return;
+					}
+					this.offlineBanner();
+					resolve(this);
+				});
+		});
+	}
+
+	connect() {
+		void this.document.connect();
+	}
+
+	release() {
+		// Called when a view is released from management
+		if (!this.document || !this.view || this._released) {
+			return;
+		}
+		this._released = true;
+
+		// Remove the live editor class
+		if (this.view instanceof MarkdownView) {
+			this.view.containerEl.removeClass("relay-live-editor");
+		}
+
+		this._viewActions?.destroy();
+		this._viewActions = undefined;
+		this._banner?.destroy();
+		this._banner = undefined;
+		if (this.offConnectionStatusSubscription) {
+			this.offConnectionStatusSubscription();
+			this.offConnectionStatusSubscription = undefined;
+		}
+		// Clean up HSM state subscription
+		if (this._hsmStateUnsubscribe) {
+			this._hsmStateUnsubscribe();
+			this._hsmStateUnsubscribe = undefined;
+		}
+		this._awarenessPlugin?.destroy();
+		this._awarenessPlugin = undefined;
+		this._viewHookPlugin?.destroy();
+		this._viewHookPlugin = undefined;
+		this._plugin?.destroy();
+		this._plugin = undefined;
+		const sharedFolder = this.document.destroyed ? null : this.document.sharedFolder;
+		const preservePendingUpload =
+			!!sharedFolder && sharedFolder.isPendingUpload(this.document.path);
+		let stillLocked = this.document.userLock;
+		if (this._hasLock) {
+			stillLocked = this._parent.releaseDocumentLock(
+				this.document,
+				this.view.leaf ?? this._fallbackViewer,
+			);
+			this._hasLock = false;
+		}
+		if (!preservePendingUpload && !stillLocked) {
+			if (!this.document.deferDisconnectForPendingMessages()) {
+				this.document.disconnect();
+			}
+		}
+	}
+
+	destroy() {
+		this.release();
+		this.clearViewActions();
+		this._parent = null as unknown as typeof this._parent;
+		this.view = null as unknown as typeof this.view;
+		this.document = null as unknown as typeof this.document;
+		this._plugin = null as unknown as typeof this._plugin;
+	}
+}
+
+export class LiveViewManager {
+	destroyed = false;
+	workspace: Workspace;
+	views: S3View[];
+	private _activePromise?: Promise<boolean> | null;
+	private loginManager: LoginManager;
+	private offListeners: (() => void)[] = [];
+	private folderListeners: Map<SharedFolder, () => void> = new Map();
+	private metadataListeners: Map<
+		TFile,
+		(data: string, cache: CachedMetadata) => void
+	>;
+	sharedFolders: SharedFolders;
+	extensions: Extension[];
+	networkStatus: NetworkStatus;
+	refreshQueue: (() => Promise<boolean>)[];
+	private documentViewers: Map<string, Set<DocumentViewer>>;
+	private canvasViewers: Map<string, Set<DocumentViewer>>;
+	private textViewRegistry: TextViewRegistry;
+	log: (message: string, ...args: unknown[]) => void;
+	warn: (message: string, ...args: unknown[]) => void;
+
+	constructor(
+		public app: App,
+		sharedFolders: SharedFolders,
+		loginManager: LoginManager,
+		networkStatus: NetworkStatus,
+		textViewRegistry: TextViewRegistry,
+	) {
+		this.textViewRegistry = textViewRegistry;
+		this.workspace = app.workspace;
+		this.sharedFolders = sharedFolders;
+		this.views = [];
+		this.extensions = [];
+		this._activePromise = null;
+		this.loginManager = loginManager;
+		this.networkStatus = networkStatus;
+		this.refreshQueue = [];
+		this.documentViewers = new Map();
+		this.canvasViewers = new Map();
+
+		this.log = curryLog("[LiveViews]", "log");
+		this.warn = curryLog("[LiveViews]", "warn");
+
+		this.metadataListeners = new Map();
+		const cb = (tfile: TFile, data: string, cache: CachedMetadata) => {
+			const sub = this.metadataListeners.get(tfile);
+			sub?.(data, cache);
+		};
+
+		const offRef = this.app.metadataCache.on("changed", cb);
+		this.offListeners.push(() => {
+			this.app.metadataCache.offref(offRef);
+		});
+
+		this.offListeners.push(
+			this.loginManager.on(() => {
+				void this.refresh("[LoginManager]");
+			}),
+		);
+
+		const folderSub = (folder: SharedFolder) => {
+			if (!folder.ready) {
+				void (async () => {
+					trackPromise(
+						`liveViews:folderReady:${folder.guid}`,
+						folder.whenReady(),
+					)
+						.then(() => {
+							void this.refresh("[Shared Folder Ready]");
+						})
+						.catch((_) => {
+							this.views.forEach((view) => {
+								if (view.document?.sharedFolder === folder) {
+									view.offlineBanner?.();
+								}
+							});
+						});
+				})();
+
+				// whenReady() resolves for established folders even while
+				// they are still waiting on a provider handshake, so the
+				// refresh above can run before the folder is ready. Watch
+				// connection-state notifications and refresh once ready
+				// actually flips, then stop watching.
+				const watcherKey = {};
+				const offReady = folder.subscribe(watcherKey, () => {
+					if (this.destroyed) {
+						offReady();
+						return;
+					}
+					if (folder.ready) {
+						offReady();
+						void this.refresh("[Shared Folder Ready]");
+					}
+				});
+				folder.onDestroy(offReady);
+			}
+
+			return folder.fset.on(() => {
+				void this.refresh("[Docset]");
+			});
+		};
+
+		this.offListeners.push(
+			this.sharedFolders.subscribe(() => {
+				void this.refresh("[Shared Folders]");
+				this.folderListeners.forEach((off, folder) => {
+					if (!this.sharedFolders.has(folder)) {
+						off();
+						this.folderListeners.delete(folder);
+					}
+				});
+				this.sharedFolders.forEach((folder) => {
+					if (!this.folderListeners.has(folder)) {
+						this.folderListeners.set(folder, folderSub(folder));
+					}
+				});
+			}),
+		);
+		RelayInstances.set(this, "LiveViewManager");
+	}
+
+	onMeta(tfile: TFile, cb: (data: string, cache: CachedMetadata) => void) {
+		this.metadataListeners.set(tfile, cb);
+	}
+
+	offMeta(tfile: TFile) {
+		this.metadataListeners.delete(tfile);
+	}
+
+	openDiffView(state: Differ.ViewState) {
+		void Differ.openDiffView(this.workspace, state);
+	}
+
+	goOffline() {
+		this.log("[System 3][Relay][Live Views] going offline");
+		transitionViewsOffline(this.views);
+		void this.refresh("[NetworkStatus]");
+	}
+
+	goOnline() {
+		this.log("[System 3][Relay][Live Views] going online");
+		void this.refresh("[NetworkStatus]");
+		this.sharedFolders.items().forEach((folder: SharedFolder) => {
+			void folder.connect();
+		});
+		void this.viewsAttachedWithConnectionPool(this.views).catch((error) => {
+			this.warn("[LiveViews] online attach failed", error);
+		});
+	}
+
+	docIsOpen(doc: Document): boolean {
+		return this.views.some((view) => view.document === doc);
+	}
+
+	private isDocumentOpenInWorkspace(document: Document): boolean {
+		const sharedFolder = document.sharedFolder;
+		if (!sharedFolder) return false;
+		const fullPath = sharedFolder.getPath(document.path);
+		let open = false;
+		iterateTextFileViews(this.workspace, this.textViewRegistry, (view) => {
+			if (open) return;
+			if (view.file?.path === fullPath) {
+				open = true;
+			}
+		});
+		return open;
+	}
+
+	private isCanvasOpenInWorkspace(canvas: Canvas): boolean {
+		const sharedFolder = canvas.sharedFolder;
+		if (!sharedFolder) return false;
+		const fullPath = sharedFolder.getPath(canvas.path);
+		let open = false;
+		iterateCanvasViews(this.workspace, (view) => {
+			if (open) return;
+			if (view.file?.path === fullPath) {
+				open = true;
+			}
+		});
+		return open;
+	}
+
+	/**
+	 * Ref-counted canvas lock: the same canvas open in several panes holds
+	 * one machine lock, acquired on the first viewer and released only
+	 * when the last viewer lets go and no workspace leaf still shows the
+	 * file — the same contract documents get from acquireDocumentLock.
+	 */
+	acquireCanvasLock(canvas: Canvas, viewer: DocumentViewer): void {
+		let viewers = this.canvasViewers.get(canvas.guid);
+		if (!viewers) {
+			viewers = new Set();
+			this.canvasViewers.set(canvas.guid, viewers);
+		}
+
+		if (viewers.has(viewer)) {
+			canvas.userLock = true;
+			return;
+		}
+
+		const wasEmpty = viewers.size === 0;
+		viewers.add(viewer);
+		canvas.userLock = true;
+
+		if (wasEmpty) {
+			canvas.acquireLock();
+		}
+	}
+
+	/** Returns true while other viewers (or open leaves) still hold the lock. */
+	releaseCanvasLock(canvas: Canvas, viewer: DocumentViewer): boolean {
+		const viewers = this.canvasViewers.get(canvas.guid);
+		if (!viewers) {
+			if (this.isCanvasOpenInWorkspace(canvas)) {
+				canvas.userLock = true;
+				return true;
+			}
+			canvas.userLock = false;
+			canvas.releaseLock();
+			return false;
+		}
+
+		viewers.delete(viewer);
+		if (viewers.size > 0) {
+			canvas.userLock = true;
+			return true;
+		}
+
+		this.canvasViewers.delete(canvas.guid);
+		if (this.isCanvasOpenInWorkspace(canvas)) {
+			canvas.userLock = true;
+			return true;
+		}
+		canvas.userLock = false;
+		canvas.releaseLock();
+		return false;
+	}
+
+	acquireDocumentLock(
+		document: Document,
+		editorViewRef: EditorViewRef,
+		viewer: DocumentViewer,
+	): void {
+		let viewers = this.documentViewers.get(document.guid);
+		if (!viewers) {
+			viewers = new Set();
+			this.documentViewers.set(document.guid, viewers);
+		}
+
+		if (viewers.has(viewer)) {
+			document.userLock = true;
+			return;
+		}
+
+		const wasEmpty = viewers.size === 0;
+		viewers.add(viewer);
+		document.userLock = true;
+
+		if (wasEmpty) {
+			document.acquireLock(editorViewRef);
+		}
+	}
+
+	releaseDocumentLock(
+		document: Document,
+		viewer: DocumentViewer,
+	): boolean {
+		const viewers = this.documentViewers.get(document.guid);
+		if (!viewers) {
+			if (this.isDocumentOpenInWorkspace(document)) {
+				document.userLock = true;
+				return true;
+			}
+			document.userLock = false;
+			void document.releaseLock();
+			return false;
+		}
+
+		viewers.delete(viewer);
+		if (viewers.size > 0) {
+			document.userLock = true;
+			return true;
+		}
+
+		this.documentViewers.delete(document.guid);
+		if (this.isDocumentOpenInWorkspace(document)) {
+			document.userLock = true;
+			return true;
+		}
+		document.userLock = false;
+		void document.releaseLock();
+		return false;
+	}
+
+	/**
+	 * Notify MergeManagers which documents have open editors.
+	 * Groups views by their shared folder and calls setActiveDocuments() on each.
+	 * This transitions HSMs from 'loading' to the appropriate mode (idle or active).
+	 *
+	 * Per spec (Gap 8): LiveViews sends bulk update to MergeManager indicating which
+	 * documents have open editors. MergeManager fans out SET_MODE_ACTIVE to those HSMs,
+	 * and SET_MODE_IDLE to all others.
+	 */
+	private async updateMergeManagerActiveDocuments(
+		views: S3View[],
+	): Promise<void> {
+		// Group document GUIDs by their shared folder
+		const folderToGuids = new Map<SharedFolder, Set<string>>();
+
+		for (const view of views) {
+			const doc = view.document;
+			if (!doc) continue;
+
+			const folder = doc.sharedFolder;
+			if (!folder?.mergeManager) continue;
+
+			if (!folderToGuids.has(folder)) {
+				folderToGuids.set(folder, new Set());
+			}
+			folderToGuids.get(folder)!.add(doc.guid);
+		}
+
+		// Also discover embedded markdown files inside canvas views.
+		// Canvas nodes with type='file' have a child TextFileView whose file
+		// may belong to a shared folder. Their HSMs need active mode too.
+		for (const view of views) {
+			if (!(view instanceof RelayCanvasView)) continue;
+			const canvas = view.view.canvas;
+			if (!canvas?.nodes) continue;
+
+			for (const [, node] of canvas.nodes) {
+				const nodeData = node.getData?.();
+				const child =
+					(node as { child?: { file?: TFile } }).child ?? nodeData?.child;
+				if (!child?.file) continue;
+
+				const filePath: string = child.file.path;
+				if (!filePath.endsWith(".md")) continue;
+
+				const folder = this.sharedFolders.lookup(filePath);
+				if (!folder?.mergeManager || !folder.ready) continue;
+
+				let embeddedDoc: Document | null;
+				try {
+					const ifile = folder.getFile(child.file);
+					embeddedDoc = isDocument(ifile) ? ifile : null;
+				} catch {
+					// No shared handle (membership refused or undecided).
+					continue;
+				}
+				if (!embeddedDoc) continue;
+
+				if (!folderToGuids.has(folder)) {
+					folderToGuids.set(folder, new Set());
+				}
+				folderToGuids.get(folder)!.add(embeddedDoc.guid);
+			}
+		}
+
+		// Call setActiveDocuments on each folder's MergeManager
+		for (const [folder, guids] of folderToGuids) {
+			const allGuids = Array.from(folder.files.keys());
+			folder.mergeManager.setActiveDocuments(guids, allGuids);
+		}
+
+		// Also notify folders with no active views (all HSMs should be idle)
+		for (const folder of this.sharedFolders.items()) {
+			if (!folderToGuids.has(folder) && folder.mergeManager) {
+				const allGuids = Array.from(folder.files.keys());
+				folder.mergeManager.setActiveDocuments(new Set(), allGuids);
+			}
+		}
+	}
+
+	private releaseViews(views: S3View[]) {
+		views.forEach((view) => {
+			try {
+				view.release();
+			} catch (e) {
+				this.warn("[LiveViews] error releasing stale view", e);
+			}
+		});
+	}
+
+	private findFolders(): SharedFolder[] {
+		const folders: Set<SharedFolder> = new Set<SharedFolder>();
+		iterateTextFileViews(this.workspace, this.textViewRegistry, (textFileView) => {
+			// Check if the view is displaying a file
+			const viewFilePath = textFileView.file?.path;
+			if (!viewFilePath) {
+				return;
+			}
+			const folder = this.sharedFolders.lookup(viewFilePath);
+			if (folder) {
+				folders.add(folder);
+			}
+		});
+		iterateCanvasViews(this.workspace, (canvasView) => {
+			// Check if the view is displaying a file
+			const viewFilePath = canvasView.file?.path;
+			if (!viewFilePath) {
+				return;
+			}
+			const folder = this.sharedFolders.lookup(viewFilePath);
+			if (folder) {
+				folders.add(folder);
+			}
+		});
+		if (folders.size == 0) {
+			return [];
+		}
+		return [...folders];
+	}
+
+	private async foldersReady(): Promise<SharedFolder[]> {
+		const folders: Set<SharedFolder> = new Set<SharedFolder>();
+		iterateTextFileViews(this.workspace, this.textViewRegistry, (textFileViews) => {
+			// Check if the view is displaying a file
+			const viewFilePath = textFileViews.file?.path;
+			if (!viewFilePath) {
+				return;
+			}
+			const folder = this.sharedFolders.lookup(viewFilePath);
+			if (folder) {
+				folders.add(folder);
+			}
+		});
+		iterateCanvasViews(this.workspace, (canvasView) => {
+			// Check if the view is displaying a file
+			const viewFilePath = canvasView.file?.path;
+			if (!viewFilePath) {
+				return;
+			}
+			const folder = this.sharedFolders.lookup(viewFilePath);
+			if (folder) {
+				folders.add(folder);
+			}
+		});
+		if (folders.size === 0) {
+			return [];
+		}
+		const readyFolders = [...folders].map(async (folder) =>
+			trackPromise(
+				`liveViews:findFolders:${folder.guid}`,
+				folder.whenReady(),
+			).catch((error) => {
+				this.warn("[LiveViews] folder not ready", error);
+				return null;
+			}),
+		);
+		const results = await Promise.all(readyFolders);
+		return results.filter((folder): folder is SharedFolder => !!folder);
+	}
+
+	private async getViews(): Promise<S3View[]> {
+		const views: S3View[] = [];
+		iterateTextFileViews(this.workspace, this.textViewRegistry, (textFileView) => {
+			const viewFile = textFileView.file;
+			if (!viewFile) {
+				return;
+			}
+			const viewFilePath = viewFile.path;
+			const folder = this.sharedFolders.lookup(viewFilePath);
+			if (folder) {
+				if (!this.loginManager.loggedIn) {
+					const view = new LoggedOutView(this, textFileView, () => {
+						return this.loginManager.openLoginPage();
+					});
+					views.push(view);
+				} else if (folder.ready) {
+					try {
+						const doc = folder.getFile(viewFile);
+						if (isDocument(doc)) {
+							const view = new LiveView<typeof textFileView>(
+								this,
+								textFileView,
+								doc,
+							);
+							views.push(view);
+						} else {
+							this.log(
+								`No shared document for ${viewFilePath}; skipping view.`,
+							);
+						}
+					} catch (e) {
+						// No shared handle (membership refused or undecided):
+						// the file opens as a plain local editor.
+						this.log(
+							`No shared document for ${viewFilePath}; skipping view.`,
+							e,
+						);
+					}
+				} else {
+					this.log(`Folder not ready, skipping views. folder=${folder.path}`);
+				}
+			}
+		});
+
+		iterateCanvasViews(this.workspace, (canvasView) => {
+			const viewFilePath = canvasView.file?.path;
+			if (!viewFilePath) {
+				return;
+			}
+			const folder = this.sharedFolders.lookup(viewFilePath);
+			if (folder && canvasView.file) {
+				if (!this.loginManager.loggedIn) {
+					const view = new LoggedOutView(this, canvasView, () => {
+						return this.loginManager.openLoginPage();
+					});
+					views.push(view);
+				} else if (folder.ready) {
+					const canvas = folder.getFile(canvasView.file);
+					if (isCanvas(canvas)) {
+						const view = new RelayCanvasView(this, canvasView, canvas);
+						views.push(view);
+					} else {
+						this.log(`Skipping canvas view connection for ${viewFilePath}`);
+					}
+				} else {
+					this.log(`Folder not ready, skipping views. folder=${folder.path}`);
+				}
+			}
+		});
+
+		return views;
+	}
+
+	findView(cmEditor: EditorView): LiveView<MarkdownView> | undefined {
+		return this.views.filter(isLiveMd).find((view) => {
+			const editor = view.view.editor as typeof view.view.editor & {
+				cm: EditorView;
+			};
+			const cm = editor.cm;
+			return cm === cmEditor;
+		});
+	}
+
+	findCanvas(cmEditor: EditorView): RelayCanvasView | undefined {
+		const state = (
+			cmEditor.state as unknown as {
+				values: { node?: { canvas: ObsidianCanvas } }[];
+			}
+		).values.find((state: { node?: { canvas: ObsidianCanvas } }) => {
+			if (state && state.node) return state.node;
+		});
+		if (!state) return;
+		return this.views.filter(isRelayCanvasView).find((view) => {
+			return (
+				view.view.canvas ===
+				(state.node as { canvas: ObsidianCanvas }).canvas
+			);
+		});
+	}
+
+	private async viewsReady(views: S3View[]): Promise<LiveView<TextFileView>[]> {
+		const results = await Promise.all(
+			views.filter(isLive).map(async (view) => {
+				try {
+					await view.document.whenReady();
+					return view;
+				} catch (error) {
+					if (isDocumentDestroyedError(error)) {
+						this.releaseViews([view]);
+						void this.refresh("[Document Destroyed]");
+						return null;
+					}
+					this.warn("[LiveViews] document not ready", error);
+					view.offlineBanner?.();
+					return view;
+				}
+			}),
+		);
+		return results.filter((view): view is LiveView<TextFileView> => !!view);
+	}
+
+	private async viewsAttachedWithConnectionPool(
+		views: S3View[],
+		backgroundConnections: number = BACKGROUND_CONNECTIONS,
+	): Promise<S3View[]> {
+		const activeView =
+			this.workspace.getActiveViewOfType<TextFileView>(TextFileView);
+
+		let attemptedConnections = 0;
+
+		const viewHistory = [...views].sort(
+			(a, b) =>
+				(b.view.leaf as unknown as { activeTime: number }).activeTime -
+				(a.view.leaf as unknown as { activeTime: number }).activeTime,
+		);
+		const connectedDocuments = new Set<Document>();
+		for (const view of viewHistory) {
+			if (view instanceof LiveView) {
+				if (view.view === activeView || connectedDocuments.has(view.document)) {
+					view.canConnect = true;
+					connectedDocuments.add(view.document);
+				} else if (attemptedConnections < backgroundConnections) {
+					view.canConnect = true;
+					connectedDocuments.add(view.document);
+					attemptedConnections++;
+				} else {
+					view.canConnect = false;
+				}
+			}
+		}
+
+		if (attemptedConnections > backgroundConnections) {
+			this.warn(
+				`[System 3][Relay][Live Views] connection pool (max ${backgroundConnections}): rejected connections for ${
+					attemptedConnections - backgroundConnections
+				} views`,
+			);
+		}
+
+		return this.viewsAttached(views);
+	}
+
+	private async viewsAttached(views: S3View[]): Promise<S3View[]> {
+		const results = await Promise.all(
+			views.map(async (view) => {
+				try {
+					return await view.attach();
+				} catch (error) {
+					if (isDocumentDestroyedError(error)) {
+						this.releaseViews([view]);
+						void this.refresh("[Document Destroyed]");
+						return null;
+					}
+					this.warn("[LiveViews] view attach failed", error);
+					view.offlineBanner?.();
+					return view;
+				}
+			}),
+		);
+		return results.filter((view): view is S3View => !!view);
+	}
+
+	private getExpectedViewPath(document: S3View["document"]): string | null {
+		if (!document?.path) {
+			return null;
+		}
+		const sharedFolder = document.sharedFolder;
+		if (!sharedFolder) {
+			return null;
+		}
+		return sharedFolder.getPath(document.path);
+	}
+
+	private deduplicate(views: S3View[]): [S3View[], S3View[]] {
+		const stale: S3View[] = [];
+		const matching: S3View[] = [];
+		this.views.forEach((oldView) => {
+			if (oldView.document?.destroyed) {
+				stale.push(oldView);
+				return;
+			}
+			const viewPath = oldView.view?.file?.path;
+			const expectedViewPath = this.getExpectedViewPath(oldView.document);
+			if (
+				oldView.document?.path &&
+				viewPath &&
+				expectedViewPath &&
+				viewPath !== expectedViewPath
+			) {
+				this.warn("[LiveViews] stale view path mismatch", {
+					viewPath,
+					expectedViewPath,
+					documentPath: oldView.document.path,
+					viewType: oldView.view.getViewType?.(),
+				});
+				stale.push(oldView);
+				return;
+			}
+			const found = views.find((newView) => {
+				if (
+					oldView.document == newView.document &&
+					oldView.view == newView.view
+				) {
+					return true;
+				}
+			});
+			if (found) {
+				matching.push(oldView);
+				views.remove(found);
+			} else {
+				stale.push(oldView);
+			}
+		});
+		views.forEach((view) => {
+			matching.push(view);
+		});
+		return [matching, stale];
+	}
+
+	async _refreshViews(
+		context: string,
+		queuedAt: moment.Moment,
+	): Promise<boolean> {
+		const ctx = `[LiveViews][${context}]`;
+		const log = curryLog(ctx, "debug");
+		const logViews = (message: string, views: S3View[]) => {
+			log(
+				message,
+				views.map((view) => ({
+					type: view.constructor.name,
+					file: view.document?.path,
+					canConnect: view.canConnect,
+				})),
+			);
+		};
+		log("Refresh");
+
+		if (this.destroyed) return false;
+
+		await this.foldersReady();
+
+		let views: S3View[] = [];
+		try {
+			views = await this.getViews();
+		} catch (e) {
+			this.warn("[System 3][Relay][Live Views] error getting views", e);
+			return false;
+		}
+		const activeDocumentFolders = this.findFolders();
+
+		// Notify MergeManagers which documents have open editors (Gap 8: mode determination)
+		// This transitions HSMs from 'loading' to the appropriate mode before attach() calls acquireLock()
+		await this.updateMergeManagerActiveDocuments(views);
+
+		if (activeDocumentFolders.length === 0 && views.length === 0) {
+			logViews("Releasing Views", this.views);
+			this.releaseViews(this.views);
+			this.views = [];
+			return true; // no live views open
+		}
+
+		if (this.loginManager.loggedIn && this.networkStatus.online) {
+			activeDocumentFolders.forEach((folder) => {
+				void folder.connect();
+			});
+		} else {
+			this.sharedFolders.forEach((folder) => {
+				folder.disconnect();
+			});
+		}
+
+		const [matching, stale] = this.deduplicate(views);
+		logViews("Releasing Views", stale);
+		this.releaseViews(stale);
+		if (stale.length === 0 && ViewsetsEqual(matching, this.views)) {
+			// We can assume all views are ready.
+			const attachedViews = await this.viewsAttachedWithConnectionPool(
+				this.views,
+			);
+			logViews("Attached Views", attachedViews);
+			this.views = attachedViews;
+		} else {
+			const nonLiveViews = matching.filter((view) => !isLive(view));
+			const readyViews = await this.viewsReady(matching);
+			logViews("Ready Views", readyViews);
+			const attachedViews =
+				await this.viewsAttachedWithConnectionPool([
+					...nonLiveViews,
+					...readyViews,
+				]);
+			logViews("Attached Views", attachedViews);
+			this.views = attachedViews;
+		}
+		log("loading plugins");
+		this.load();
+		const now = moment.utc();
+		const durationMs = now.diff(queuedAt);
+		log(`refresh completed in ${durationMs}ms`, ctx);
+		metrics.observeLiveviewsRefresh(durationMs / 1000);
+		return true;
+	}
+
+	async refresh(context: string) {
+		if (this.destroyed) return false;
+		const log = curryLog(context, "warn");
+		const queuedAt = moment.utc();
+		this.refreshQueue.push(() => {
+			return this._refreshViews(context, queuedAt);
+		});
+		metrics.setLiveviewsQueueDepth(this.refreshQueue.length);
+		if (this._activePromise !== null) {
+			return false;
+		}
+		while (this.refreshQueue.length > 0) {
+			if (this.destroyed) return false;
+			if (this.refreshQueue.length > 2) {
+				log("refreshQueue size:", this.refreshQueue.length);
+			}
+			const job = this.refreshQueue.pop()!;
+			this.refreshQueue.length = 0;
+			this._activePromise = job().finally(() => {
+				this._activePromise = null;
+			});
+			try {
+				await this._activePromise;
+			} catch (error) {
+				this.warn("[LiveViews] refresh failed", error);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	wipe() {
+		this.extensions.length = 0;
+		this.workspace.updateOptions();
+	}
+
+	load() {
+		if (this.extensions.length > 0) return; // already registered
+		this.extensions.push([
+			HSMEditorPlugin,
+			LiveNode,
+			yRemoteSelectionsTheme,
+			yRemoteSelections,
+			attributionFilterField,
+			userAttributionTheme,
+			userAttributionPlugin,
+			InvalidLinkPlugin,
+		]);
+		this.workspace.updateOptions();
+	}
+
+	private refreshOpenEditorLeavesForUnload(): void {
+		const refreshed = new Set<WorkspaceLeaf>();
+		iterateTextFileViews(this.workspace, this.textViewRegistry, (view) => {
+			const leaf = view.leaf;
+			if (!leaf || refreshed.has(leaf)) return;
+			if (!(view as { editor?: { cm?: EditorView } }).editor?.cm) return;
+			refreshed.add(leaf);
+			refreshLeafViewForUnload(leaf, {
+				file: view.file,
+				filePath: view.file?.path,
+				label: `liveViews:refreshOpenLeaf:${view.file?.path ?? refreshed.size}`,
+				mode:
+					view instanceof MarkdownView
+						? view.getMode?.()
+						: undefined,
+			});
+		});
+	}
+
+	public destroy() {
+		this.destroyed = true;
+		this.releaseViews(this.views);
+		// Remove Relay's CM6 extensions before rebuilding open views so the
+		// replacement editors are created from clean workspace options.
+		this.wipe();
+		this.refreshOpenEditorLeavesForUnload();
+		this.offListeners.forEach((off) => off());
+		this.offListeners.length = 0;
+		this.metadataListeners.clear();
+		this.metadataListeners = null as unknown as typeof this.metadataListeners;
+		this.folderListeners.forEach((off) => off());
+		this.folderListeners.clear();
+		this.folderListeners = null as unknown as typeof this.folderListeners;
+		this.documentViewers.clear();
+		this.documentViewers = null as unknown as typeof this.documentViewers;
+		this.views.forEach((view) => view.destroy());
+		this.views = [];
+		this.sharedFolders = null as unknown as typeof this.sharedFolders;
+		this.refreshQueue = null as unknown as typeof this.refreshQueue;
+		this.networkStatus = null as unknown as typeof this.networkStatus;
+		this._activePromise = null;
+		this.loginManager = null as unknown as typeof this.loginManager;
+		this.app = null as unknown as typeof this.app;
+		this.workspace = null as unknown as typeof this.workspace;
+	}
+}

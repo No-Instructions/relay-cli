@@ -1,0 +1,733 @@
+// Adapted from https://github.com/friebetill/obsidian-file-diff
+//
+// MIT License
+//
+// Copyright (c) 2022 Till Friebe
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+import { structuredPatch, diffWords } from "diff";
+import {
+	setIcon,
+	Workspace,
+	ItemView,
+	TFile,
+	TAbstractFile,
+	parseLinktext,
+	type ViewStateResult,
+	View,
+	WorkspaceLeaf,
+} from "obsidian";
+import { diffMatchPatch } from "src/y-diffMatchPatch";
+import { Difference } from "./difference";
+import { FileDifferences } from "./fileDifferences";
+import { preventEmptyString } from "./stringUtils";
+import { ActionLine } from "./actionLine";
+import { Document } from "src/Document";
+import { DiskBuffer } from "src/DiskBuffer";
+import { ActionLineButton } from "./actionLineButton";
+import { ActionLineDivider } from "./actionLineDivider";
+import { flags } from "src/flagManager";
+import { curryLog } from "src/debug";
+
+export const VIEW_TYPE_DIFFERENCES = "system3-differences-view";
+
+interface DiffTextRun {
+	text: string;
+	className?: string;
+}
+
+interface DiffLinkRange {
+	from: number;
+	to: number;
+	target: string;
+	resolved: boolean;
+	resolvedPath?: string;
+}
+
+type RevealLeafWorkspace = {
+	revealLeaf?: (leaf: WorkspaceLeaf) => Promise<void>;
+};
+
+export interface ViewState {
+	file1: TFile;
+	file2: TFile;
+	showMergeOption: boolean;
+	oursLabel?: string;
+	theirsLabel?: string;
+	onResolve?: () => Promise<void>;
+	onCancel?: () => void;
+	originalLeaf?: WorkspaceLeaf;
+	// Optional source file in vault-space. Used to close the diff if the
+	// backing file is deleted or renamed while the diff is open.
+	sourceVaultPath?: string;
+	[key: string]: unknown;
+}
+
+export async function openDiffView(
+	workspace: Workspace,
+	state: ViewState,
+): Promise<void> {
+	// Capture the currently active leaf to return to it later
+	if (!state.originalLeaf) {
+		state.originalLeaf = workspace.getActiveViewOfType(View)?.leaf;
+	}
+
+	// Closes all leafs (views) of the type VIEW_TYPE_DIFFERENCES
+	workspace.detachLeavesOfType(VIEW_TYPE_DIFFERENCES);
+
+	// Opens a new leaf (view) of the type VIEW_TYPE_DIFFERENCES
+	const leaf = workspace.getLeaf(true);
+	void leaf.setViewState({
+		type: VIEW_TYPE_DIFFERENCES,
+		active: true,
+		state,
+	});
+	const revealLeaf = (workspace as unknown as RevealLeafWorkspace).revealLeaf;
+	if (typeof revealLeaf === "function") {
+		void revealLeaf.call(workspace, leaf);
+	} else {
+		workspace.setActiveLeaf(leaf, { focus: true });
+	}
+}
+
+export class DifferencesView extends ItemView {
+	private state?: ViewState;
+	private file1Content?: string;
+	private file2Content?: string;
+	private fileDifferences?: FileDifferences;
+	private file1Lines: string[] = [];
+	private file2Lines: string[] = [];
+	private resolved = false;
+	private sourceGuardsInstalled = false;
+	private closingForSourceMissing = false;
+	protected log;
+
+	constructor(leaf: WorkspaceLeaf) {
+		super(leaf);
+		const logContext = this.constructor.name;
+		this.log = curryLog(`[${logContext}]`, "log");
+	}
+
+	async getContent(file: TFile): Promise<string> {
+		if (file instanceof Document) {
+			return file.text;
+		} else if (file instanceof DiskBuffer) {
+			return file.contents;
+		}
+		return await this.app.vault.read(file);
+	}
+
+	override getViewType(): string {
+		return VIEW_TYPE_DIFFERENCES;
+	}
+
+	override getDisplayText(): string {
+		if (this.state?.file1 && this.state?.file2) {
+			return (
+				`File diff: ${this.state.file1.name} ` + `and ${this.state.file2.name}`
+			);
+		}
+		return `File diff`;
+	}
+
+	override async setState(
+		state: ViewState,
+		result: ViewStateResult,
+	): Promise<void> {
+		void super.setState(state, result);
+		this.state = state;
+		this.installSourceGuards();
+
+		await this.updateState();
+		this.build();
+	}
+
+	onunload(): void {
+		if (!this.resolved) {
+			this.state?.onCancel?.();
+		}
+	}
+
+	private closeAndReturnToOriginal(): void {
+		// Return to original leaf if available and still valid
+		if (this.state?.originalLeaf && this.state.originalLeaf.parent) {
+			this.app.workspace.setActiveLeaf(this.state.originalLeaf, { focus: true });
+		}
+		this.leaf.detach();
+	}
+
+	private normalizePath(path: string | undefined): string | null {
+		if (!path) return null;
+		return path.startsWith("/") ? path.slice(1) : path;
+	}
+
+	private getWatchedPaths(): string[] {
+		if (!this.state) return [];
+		const paths = new Set<string>();
+		const sourcePath = this.normalizePath(this.state.sourceVaultPath);
+		if (sourcePath) {
+			paths.add(sourcePath);
+		}
+
+		const file1Path = this.normalizePath(this.state.file1?.path);
+		if (file1Path) {
+			paths.add(file1Path);
+		}
+		const file2Path = this.normalizePath(this.state.file2?.path);
+		if (file2Path) {
+			paths.add(file2Path);
+		}
+		return Array.from(paths);
+	}
+
+	private watchesPath(path: string): boolean {
+		const normalized = this.normalizePath(path);
+		if (!normalized) return false;
+		return this.getWatchedPaths().includes(normalized);
+	}
+
+	private closeBecauseSourceMissing(reason: string, file: TAbstractFile): void {
+		if (this.closingForSourceMissing) return;
+		this.closingForSourceMissing = true;
+		this.log(`[diff] closing: ${reason}`, file.path);
+		if (!this.resolved) {
+			this.state?.onCancel?.();
+			this.resolved = true;
+		}
+		this.closeAndReturnToOriginal();
+	}
+
+	private installSourceGuards(): void {
+		if (this.sourceGuardsInstalled) return;
+		this.sourceGuardsInstalled = true;
+
+		this.registerEvent(
+			this.app.vault.on("delete", (file) => {
+				if (!this.watchesPath(file.path)) return;
+				this.closeBecauseSourceMissing("source file deleted", file);
+			}),
+		);
+	}
+
+	private async updateState(): Promise<void> {
+		if (this.state?.file1 == null || this.state?.file2 == null) {
+			return;
+		}
+
+		this.file1Content = await this.getContent(this.state.file1);
+		this.file2Content = await this.getContent(this.state.file2);
+		if (this.resolved) {
+			return;
+		}
+
+		this.file1Lines = this.file1Content
+			// Add trailing new line as this removes edge cases
+			.concat("\n")
+			.split("\n")
+			// Streamline empty spaces at the end as this remove edge cases
+			.map((line) => line.trimEnd());
+
+		this.file2Lines = this.file2Content
+			// Add trailing new spaces as this removes edge cases
+			.concat("\n")
+			.split("\n")
+			// Streamline empty lines at the end as this remove edge cases
+			.map((line) => line.trimEnd());
+
+		const parsedDiff = structuredPatch(
+			this.state.file1.path,
+			this.state.file2.path,
+			this.file1Lines.join("\n"),
+			this.file2Lines.join("\n"),
+		);
+		this.fileDifferences = FileDifferences.fromParsedDiff(parsedDiff);
+
+		if (this.fileDifferences.differences.length === 0) {
+			if (this.resolved) {
+				return;
+			}
+			if (this.file1Content !== this.file2Content) {
+				this.log(
+					"byte level difference with differ equivalence",
+					this.file1Content.length,
+					this.file2Content.length,
+				);
+				if (flags().enableDeltaLogging) {
+					// Iterate through each byte and print location and byte if they don't match
+					const content1 = this.file1Content || "";
+					const content2 = this.file2Content || "";
+					const maxLength = Math.max(content1.length, content2.length);
+
+					for (let i = 0; i < maxLength; i++) {
+						const byte1 =
+							i < content1.length ? content1.charCodeAt(i) : undefined;
+						const byte2 =
+							i < content2.length ? content2.charCodeAt(i) : undefined;
+
+						if (byte1 !== byte2) {
+							const hex1 =
+								byte1 !== undefined
+									? `0x${byte1.toString(16).padStart(2, "0")}`
+									: "EOF";
+							const hex2 =
+								byte2 !== undefined
+									? `0x${byte2.toString(16).padStart(2, "0")}`
+									: "EOF";
+							this.log(
+								`Byte difference at position ${i}: file1=${byte1} (${hex1}), file2=${byte2} (${hex2})`,
+							);
+						}
+					}
+				}
+				await this.modify(this.state.file2, this.file1Content || "");
+				if (this.resolved) {
+					return;
+				}
+			}
+			this.resolved = true;
+			await this.state.onResolve?.();
+			this.closeAndReturnToOriginal();
+		}
+	}
+
+	private build(): void {
+		this.contentEl.empty();
+
+		const container = this.contentEl.createDiv({
+			cls: "file-diff__container",
+		});
+
+		this.buildHeader(container);
+		this.buildLines(container);
+		this.scrollToFirstDifference();
+	}
+
+	private update(): void {
+		const scrollTop = this.contentEl.scrollTop;
+
+		this.contentEl.empty();
+
+		const container = this.contentEl.createDiv({
+			cls: "file-diff__container",
+		});
+
+		this.buildHeader(container);
+		this.buildLines(container);
+
+		this.contentEl.scrollTop = scrollTop;
+	}
+
+	private buildHeader(container: HTMLDivElement): void {
+		// Create action line similar to the existing ones
+		const actionLine = container.createDiv({
+			cls: "flex flex-row gap-1 py-0-5",
+		});
+
+		const oursLabel = this.state?.oursLabel ?? "Editor";
+		const theirsLabel = this.state?.theirsLabel ?? "Disk";
+
+		// Left file (top)
+		new ActionLineButton({
+			text: `Keep ${oursLabel} Contents`,
+			onClick: async (e) => {
+				e.preventDefault();
+				await this.acceptAllFromLeft();
+			},
+		}).build(actionLine);
+
+		ActionLineDivider.build(actionLine);
+
+		// Right file (bottom)
+		new ActionLineButton({
+			text: `Accept All from ${theirsLabel}`,
+			onClick: async (e) => {
+				e.preventDefault();
+				await this.acceptAllFromRight();
+			},
+		}).build(actionLine);
+	}
+
+	async modify(file: TFile, newContent: string): Promise<void> {
+		if (file instanceof Document) {
+			diffMatchPatch(file.getWritableDoc(), newContent, this);
+			return;
+		} else if (file instanceof DiskBuffer) {
+			file.contents = newContent;
+			return;
+		}
+		await this.app.vault.modify(file, newContent);
+	}
+
+	private async acceptAllFromLeft(): Promise<void> {
+		if (!this.state || !this.fileDifferences) return;
+		await this.modify(this.state.file2, this.file1Content || "");
+		this.resolved = true;
+		await this.state.onResolve?.();
+		this.closeAndReturnToOriginal();
+	}
+
+	private async acceptAllFromRight(): Promise<void> {
+		if (!this.state || !this.fileDifferences) return;
+		await this.modify(this.state.file1, this.file2Content || "");
+		this.resolved = true;
+		await this.state.onResolve?.();
+		this.closeAndReturnToOriginal();
+	}
+
+	private buildLines(container: HTMLDivElement): void {
+		let lineCount1 = 0;
+		let lineCount2 = 0;
+		const maxLineCount = Math.max(
+			this.file1Lines?.length || 0,
+			this.file2Lines?.length || 0,
+		);
+		while (lineCount1 <= maxLineCount || lineCount2 <= maxLineCount) {
+			const difference = this.fileDifferences?.differences.find(
+				(d) => d.file1Start === lineCount1 && d.file2Start === lineCount2,
+			);
+
+			if (difference != null) {
+				const differenceContainer = container.createDiv({
+					cls: "difference",
+				});
+				this.buildDifferenceVisualizer(differenceContainer, difference);
+				lineCount1 += difference.file1Lines.length;
+				lineCount2 += difference.file2Lines.length;
+			} else {
+				const line =
+					lineCount1 <= lineCount2
+						? this.file1Lines[lineCount1]
+						: this.file2Lines[lineCount2];
+				const lineDiv = container.createDiv({
+					// Necessary to give the line a height when it's empty.
+					cls: "file-diff__line",
+				});
+				lineDiv.appendChild(
+					this.buildDecoratedLine([{ text: preventEmptyString(line ?? "") }]),
+				);
+				lineCount1 += 1;
+				lineCount2 += 1;
+			}
+		}
+	}
+
+	private buildDifferenceVisualizer(
+		container: HTMLDivElement,
+		difference: Difference,
+	): void {
+		if (this.state?.showMergeOption) {
+			new ActionLine(this.app, {
+				difference,
+				file1: this.state.file1,
+				file2: this.state.file2,
+				file1Content: this.file1Content || "",
+				file2Content: this.file2Content || "",
+				oursLabel: this.state.oursLabel,
+				theirsLabel: this.state.theirsLabel,
+				triggerRebuild: async (): Promise<void> => {
+					await this.updateState();
+					this.update();
+				},
+			}).build(container);
+		}
+
+		// Draw top diff
+		for (let i = 0; i < difference.file1Lines.length; i += 1) {
+			const line1 = difference.file1Lines[i];
+			const line2 = difference.file2Lines[i];
+
+			const lineDiv = container.createDiv({
+				cls: "file-diff__line file-diff__top-line__bg",
+			});
+			const diffSpans = this.buildDiffLine(
+				line1,
+				line2,
+				"file-diff_top-line__character",
+			);
+
+			// Remove border radius if applicable
+			if (
+				i < difference.file1Lines.length - 1 ||
+				difference.file2Lines.length !== 0
+			) {
+				lineDiv.classList.add("file-diff__no-bottom-border");
+			}
+			if (i !== 0) {
+				lineDiv.classList.add("file-diff__no-top-border");
+			}
+
+			lineDiv.appendChild(diffSpans);
+		}
+
+		// Draw bottom diff
+		for (let i = 0; i < difference.file2Lines.length; i += 1) {
+			const line1 = difference.file1Lines[i];
+			const line2 = difference.file2Lines[i];
+
+			const lineDiv = container.createDiv({
+				cls: "file-diff__line file-diff__bottom-line__bg",
+			});
+			const diffSpans = this.buildDiffLine(
+				line2,
+				line1,
+				"file-diff_bottom-line__character",
+			);
+
+			// Remove border radius if applicable
+			if ((i == 0 && difference.file1Lines.length > 0) || i > 0) {
+				lineDiv.classList.add("file-diff__no-top-border");
+			}
+			if (i < difference.file2Lines.length - 1) {
+				lineDiv.classList.add("file-diff__no-bottom-border");
+			}
+
+			lineDiv.appendChild(diffSpans);
+		}
+	}
+
+	private buildDiffLine(line1: string, line2: string, charClass: string) {
+		if (line1 != undefined && line1.length === 0) {
+			return this.buildDecoratedLine([{ text: preventEmptyString(line1) }]);
+		}
+
+		if (line1 != undefined && line2 != undefined) {
+			const differences = diffWords(line2, line1);
+			const runs: DiffTextRun[] = [];
+
+			for (const difference of differences) {
+				if (difference.removed) {
+					continue;
+				}
+
+				// Necessary to give the line a height when it's empty.
+				runs.push({
+					text: preventEmptyString(difference.value),
+					className: difference.added ? charClass : undefined,
+				});
+			}
+
+			return this.buildDecoratedLine(runs);
+		}
+
+		if (line1 != undefined && line2 == undefined) {
+			// Necessary to give the line a height when it's empty.
+			return this.buildDecoratedLine([
+				{ text: preventEmptyString(line1), className: charClass },
+			]);
+		}
+
+		return this.buildDecoratedLine([{ text: preventEmptyString(line1) }]);
+	}
+
+	private buildDecoratedLine(runs: DiffTextRun[]): HTMLDivElement {
+		const fragment = createDiv();
+		const text = runs.map((run) => run.text).join("");
+		if (text.length === 0) {
+			fragment.textContent = preventEmptyString(text);
+			return fragment;
+		}
+
+		const runRanges = this.buildRunRanges(runs);
+		const linkRanges = flags().enableDiffLinkStatus
+			? this.findInternalLinkRanges(text)
+			: [];
+		const boundaries = new Set<number>([0, text.length]);
+		for (const range of runRanges) {
+			boundaries.add(range.from);
+			boundaries.add(range.to);
+		}
+		for (const range of linkRanges) {
+			boundaries.add(range.from);
+			boundaries.add(range.to);
+		}
+
+		const orderedBoundaries = Array.from(boundaries).sort((a, b) => a - b);
+		for (let i = 0; i < orderedBoundaries.length - 1; i += 1) {
+			const from = orderedBoundaries[i];
+			const to = orderedBoundaries[i + 1];
+			if (from === to) continue;
+
+			const segment = text.slice(from, to);
+			const run = runRanges.find((range) => from >= range.from && to <= range.to);
+			const link = linkRanges.find(
+				(range) => from >= range.from && to <= range.to,
+			);
+			const span = fragment.createSpan();
+			span.textContent = segment;
+			if (run?.className) {
+				span.classList.add(run.className);
+			}
+			if (link) {
+				this.decorateLinkSpan(span, link);
+			}
+			if (link && to === link.to && !link.resolved) {
+				fragment.appendChild(this.createBrokenLinkIcon(link));
+			}
+		}
+
+		return fragment;
+	}
+
+	private buildRunRanges(runs: DiffTextRun[]) {
+		let offset = 0;
+		return runs.map((run) => {
+			const from = offset;
+			offset += run.text.length;
+			return {
+				from,
+				to: offset,
+				className: run.className,
+			};
+		});
+	}
+
+	private decorateLinkSpan(span: HTMLSpanElement, link: DiffLinkRange): void {
+		span.classList.add(
+			"file-diff__link",
+			link.resolved
+				? "file-diff__link--resolved"
+				: "file-diff__link--unresolved",
+		);
+		span.dataset.linkResolved = String(link.resolved);
+		span.title = link.resolved
+			? `Link resolves to ${link.resolvedPath}`
+			: `Link target not found: ${link.target}`;
+	}
+
+	private createBrokenLinkIcon(link: DiffLinkRange): HTMLSpanElement {
+		const span = createSpan();
+		span.classList.add("invalid-link", "file-diff__link-warning");
+		span.title = `Link target not found: ${link.target}`;
+		setIcon(span, "file-warning");
+		return span;
+	}
+
+	private findInternalLinkRanges(text: string): DiffLinkRange[] {
+		const ranges: DiffLinkRange[] = [];
+		const wikiLinkRegex = /!?\[\[([^\]\n]+)\]\]/g;
+		for (const match of text.matchAll(wikiLinkRegex)) {
+			const from = match.index ?? 0;
+			const target = this.getWikiLinkTarget(match[1]);
+			if (!target) continue;
+			ranges.push({
+				from,
+				to: from + match[0].length,
+				target,
+				...this.resolveInternalLink(target),
+			});
+		}
+
+		const markdownLinkRegex = /!?\[[^\]\n]*\]\(([^)\n]+)\)/g;
+		for (const match of text.matchAll(markdownLinkRegex)) {
+			const from = match.index ?? 0;
+			if (this.overlapsLinkRange(from, from + match[0].length, ranges)) {
+				continue;
+			}
+			const target = this.getMarkdownLinkTarget(match[1]);
+			if (!target) continue;
+			ranges.push({
+				from,
+				to: from + match[0].length,
+				target,
+				...this.resolveInternalLink(target),
+			});
+		}
+
+		return ranges.sort((a, b) => a.from - b.from);
+	}
+
+	private getWikiLinkTarget(linkText: string): string | null {
+		const target = linkText.split("|")[0]?.trim();
+		return target || null;
+	}
+
+	private getMarkdownLinkTarget(rawTarget: string): string | null {
+		let target = rawTarget.trim();
+		if (!target) return null;
+		if (target.startsWith("<")) {
+			const closeIndex = target.indexOf(">");
+			if (closeIndex === -1) return null;
+			target = target.slice(1, closeIndex);
+		} else {
+			target = target.replace(/\s+["'][^"']*["']\s*$/, "");
+		}
+		try {
+			target = decodeURI(target);
+		} catch {
+			// Keep the raw target when it is not URI-encoded.
+		}
+		if (this.isExternalLinkTarget(target)) return null;
+		return target || null;
+	}
+
+	private isExternalLinkTarget(target: string): boolean {
+		return /^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith("//");
+	}
+
+	private overlapsLinkRange(
+		from: number,
+		to: number,
+		ranges: DiffLinkRange[],
+	): boolean {
+		return ranges.some((range) => from < range.to && to > range.from);
+	}
+
+	private resolveInternalLink(target: string): {
+		resolved: boolean;
+		resolvedPath?: string;
+	} {
+		const sourcePath = this.getLinkSourcePath();
+		if (!sourcePath) return { resolved: false };
+
+		const parsed = parseLinktext(target);
+		const linkPath = parsed.path || (target.startsWith("#") ? sourcePath : target);
+		const linkedFile = this.app.metadataCache.getFirstLinkpathDest(
+			linkPath,
+			sourcePath,
+		);
+		return {
+			resolved: !!linkedFile,
+			resolvedPath: linkedFile?.path,
+		};
+	}
+
+	private getLinkSourcePath(): string | null {
+		const sourcePath = this.normalizePath(this.state?.sourceVaultPath);
+		if (sourcePath) return sourcePath;
+		return this.normalizePath(this.state?.file1?.path);
+	}
+
+	private scrollToFirstDifference(): void {
+		if (this.fileDifferences?.differences.length === 0) {
+			return;
+		}
+
+		const containerRect = this.contentEl
+			.getElementsByClassName("file-diff__container")[0]
+			.getBoundingClientRect();
+		const elementRect = this.contentEl
+			.getElementsByClassName("difference")[0]
+			.getBoundingClientRect();
+		this.contentEl.scrollTo({
+			top: elementRect.top - containerRect.top - 100,
+			behavior: "smooth",
+		});
+	}
+}

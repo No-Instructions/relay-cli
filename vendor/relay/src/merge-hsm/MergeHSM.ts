@@ -1,0 +1,7724 @@
+/**
+ * MergeHSM - Hierarchical State Machine for Document Synchronization
+ *
+ * Manages the sync between disk, local CRDT (Yjs), and remote CRDT.
+ * Pure state machine: events in → state transitions → effects out.
+ *
+ * Architecture:
+ * - While awake: localDoc (persisted) + remoteDoc (ephemeral)
+ * - In active mode: editor ↔ localDoc ↔ remoteDoc ↔ server
+ * - In idle mode: the residency pool may hibernate localDoc after persistence settles
+ *
+ * CRITICAL INVARIANTS (DO NOT VIOLATE):
+ *
+ * 1. ONE-TIME CONTENT INSERTION: Disk content must only be inserted into the
+ *    CRDT exactly ONCE during initial enrollment.
+ *    After enrollment, content flows through CRDT operations, never by reinsertion.
+ *
+ * 2. NO FULL CRDT REPLACE: Never use the pattern `delete(0, length) + insert(0, newContent)`
+ *    on any Y.Text. This destroys the operational history and causes content duplication
+ *    when merged with other clients. Always use diff-based updates (diff-match-patch).
+ *
+ * 3. NEVER WRITE DISK WHEN EDITOR OPEN: In active mode, the editor owns the file.
+ *    Disk writes can only happen when transitioning to idle or during conflict resolution.
+ */
+
+import * as Y from "yjs";
+import { adaptiveDiff3Merge } from "./diff3";
+import { diff_match_patch } from "diff-match-patch";
+import {
+	Conflict,
+	computeConflict,
+	findConflictRegionOffset,
+	toConflictInfoSnapshot,
+	type ConflictData,
+	type ConflictInfoSnapshot,
+} from "./conflict";
+import type {
+	MergeState,
+	MergeEvent,
+	MergeEffect,
+	StatePath,
+	LCAState,
+	MergeMetadata,
+	PositionedChange,
+	MergeHSMConfig,
+	MergeResult,
+	SyncStatus,
+	SyncStatusType,
+	PersistedMergeState,
+	IYDocPersistence,
+	CreatePersistence,
+	PersistenceMetadata,
+	ConflictRegion,
+	ResolveEvent,
+	ResolveHunkEvent,
+	DiskLoader,
+	MachineHSM,
+	ActiveInvoke,
+	Fork,
+	CaptureOpts,
+	EditorViewRef,
+	ResourcePresence,
+	EnrollmentCompleteEvent,
+	ServerAheadEvent,
+	SyncMachine,
+	SyncWorkState,
+	YjsSnapshot,
+} from "./types";
+import type { TimeProvider } from "../TimeProvider";
+import { DefaultTimeProvider } from "../TimeProvider";
+import { curryLog, describeError, recordHSMEntry } from "../debug";
+import { flags } from "../flagManager";
+import { generateHash } from "../hashing";
+import { Lifetime } from "../promiseUtils";
+import { processEvent } from "../hsm/interpreter";
+import { MACHINE, createInterpreterConfig, validateMachine } from "./machine-definition";
+import type { InterpreterConfig, GuardFn, ActionFn, InvokeSourceFn } from "./types";
+import { DISK_ORIGIN, MACHINE_EDIT_ORIGIN, OpCapture } from "./undo";
+import {
+	emptySnapshot,
+	isEmptyDoc,
+	mergeSnapshotHeads,
+	restoreTextAtSnapshot,
+	seedUpdateBoundedByHead,
+	snapshotContains,
+	snapshotFromDoc,
+	snapshotHasOpsMissingFrom,
+	snapshotIsAhead,
+	snapshotIsEmpty,
+	snapshotCoversItem,
+	snapshotMetaFromUpdate,
+	snapshotsEqual,
+	yjsDocIsAhead,
+	yjsDocsEqual,
+	yjsUpdateIsNoop,
+} from "./snapshots";
+import { SyncBridge } from "./SyncBridge";
+import type { SyncBridgeHost } from "./SyncBridge";
+import type { FrontMatterPrimitives } from "./types";
+import { errorFromUnknown, formatUserFacingError } from "../UserFacingError";
+import { DiskFileNotFoundError } from "./DiskFileNotFoundError";
+
+const FRONTMATTER_MIRROR_ORIGIN = "frontmatter-mirror";
+type PendingDiskSource = "disk-event" | "view-data" | "derived";
+type RecoverLCADisk = { content: string; hash: string; mtime: number };
+type MachineEditTeardownCompletion =
+	| {
+		kind: "watching";
+		sourceText: string;
+		intermediateText: string;
+		deleteChanges: PositionedChange[];
+		insertChanges: PositionedChange[];
+	}
+	| {
+		kind: "half-applied";
+		intermediateText: string;
+		insertChanges: PositionedChange[];
+	}
+	| { kind: "closed" };
+type PendingMachineEdit = {
+	fn: (data: string) => string;
+	expectedText: string;
+	captureMark: number;
+	registeredAt: number;
+	teardownCompletion: MachineEditTeardownCompletion;
+};
+/**
+ * An LCA produced by an idle-merge invoke. The head snapshot is deferred
+ * (null) when the invoke computed the merge on a temp doc: the real head
+ * exists only after the onDone action applies the result to localDoc.
+ */
+type LCACandidate = Omit<LCAState, "snapshot"> & {
+	snapshot: Uint8Array | null;
+};
+type ConflictInit = {
+	base: string;
+	ours: string;
+	theirs: string;
+	oursLabel?: string;
+	theirsLabel?: string;
+	regions: ConflictRegion[];
+};
+type RecoverLCAResult =
+	| {
+		kind: "synced";
+		disk: RecoverLCADisk;
+		newLCA: LCAState;
+		localSnapshot: Uint8Array;
+		remoteSnapshot: Uint8Array;
+	}
+	| {
+		kind: "remoteAhead";
+		disk: RecoverLCADisk;
+		newLCA: LCAState;
+		localSnapshot: Uint8Array;
+		remoteSnapshot: Uint8Array;
+		pendingIdleUpdates?: Uint8Array;
+	}
+	| {
+		kind: "diverged";
+		disk: RecoverLCADisk;
+		localSnapshot: Uint8Array;
+		remoteSnapshot: Uint8Array;
+		newLCA?: LCAState;
+		pendingIdleUpdates?: Uint8Array;
+		pendingDiskContents?: string;
+	}
+	| {
+		kind: "declined";
+		reason: string;
+		detail?: Record<string, unknown>;
+	};
+
+// =============================================================================
+// Simple Observable for HSM
+// =============================================================================
+
+type Subscriber<T> = (value: T) => void;
+type Unsubscriber = () => void;
+
+/**
+ * Simple Observable interface matching the spec.
+ */
+export interface IObservable<T> {
+	subscribe(run: Subscriber<T>): Unsubscriber;
+}
+
+/**
+ * Simple Observable implementation for the HSM.
+ * Does not use PostOffice - notifications are synchronous.
+ */
+class SimpleObservable<T> implements IObservable<T> {
+	private listeners: Set<Subscriber<T>> = new Set();
+
+	subscribe(run: Subscriber<T>): Unsubscriber {
+		this.listeners.add(run);
+		return () => {
+			this.listeners.delete(run);
+		};
+	}
+
+	emit(value: T): void {
+		for (const listener of this.listeners) {
+			listener(value);
+		}
+	}
+
+	get listenerCount(): number {
+		return this.listeners.size;
+	}
+
+	clear(): void {
+		this.listeners.clear();
+	}
+}
+
+// =============================================================================
+// MergeHSM Class
+// =============================================================================
+
+type EventKeys<E> = E extends unknown ? keyof E : never;
+type EventField<E, K extends PropertyKey> = E extends unknown
+	? K extends keyof E
+		? E[K]
+		: never
+	: never;
+
+/**
+ * Every payload field a machine-table guard or action may read, derived
+ * from the event union itself: each key maps to the union of the types
+ * it carries across events. The table wires each function to the events
+ * that carry its fields, so every read is optional: a rewired table
+ * degrades to a no-op instead of a crash.
+ */
+type MergeEventPayload = {
+	[K in Exclude<EventKeys<MergeEvent>, "type">]?: EventField<MergeEvent, K>;
+};
+
+type YChangedType = Parameters<Y.Transaction["changed"]["has"]>[0];
+
+const payload = (event: MergeEvent): MergeEventPayload =>
+	event as MergeEventPayload;
+
+/**
+ * What the machine's invoked services resolve with. The interpreter
+ * returns each result inside a done.invoke envelope whose data field
+ * the table's guards and actions read.
+ */
+type MergeServiceResult =
+	| RecoverLCAResult
+	| {
+		success?: boolean;
+		forked?: boolean;
+		awaitingProvider?: boolean;
+		superseded?: boolean;
+		awaitingLocalEnrollment?: boolean;
+		awaitingDiskForLCA?: boolean;
+		lcaUnavailable?: boolean;
+		clean?: boolean;
+		noop?: boolean;
+		wasConflict?: boolean;
+		type?: "release" | "destroy";
+		disk?: RecoverLCADisk;
+		newLCA?: LCACandidate;
+		remoteUpdate?: Uint8Array;
+		updates?: Uint8Array;
+		needsDiskWrite?: boolean;
+		needsSync?: boolean;
+		patches?: PositionedChange[];
+		merged?: string;
+		mergedContent?: string;
+		baseText?: string;
+		localText?: string;
+		diskText?: string;
+		conflictRegions?: ConflictRegion[];
+		reason?: string;
+		detail?: Record<string, unknown>;
+	};
+
+/** The service result payloads, mapped the same way as the event fields. */
+type MergeEventDataPayload = {
+	[K in EventKeys<MergeServiceResult>]?: EventField<MergeServiceResult, K>;
+};
+
+/** An event's object result payload; string-valued data reads as absent. */
+const dataOf = (event: MergeEvent): MergeEventDataPayload | undefined => {
+	const data = payload(event).data;
+	return typeof data === "object" && data !== null
+		? (data)
+		: undefined;
+};
+
+export class MergeHSM implements MachineHSM, SyncBridgeHost, SyncMachine {
+	// Current state path
+	private _statePath: StatePath = "unloaded";
+
+	// Teardown plumbing. Resource cleanup is driven by the state machine itself
+	// (destroy() routes through UNLOAD -> the cleanup invoke -> the terminal
+	// "destroyed" state). The lifetime captures the intent edge: ending it aborts
+	// in-flight persistence I/O and externally granted waiters (awaitState/
+	// awaitAsync handed to view plugins, BackgroundSync, etc.) that the machine
+	// cannot reach. The terminal edge (statePath === "destroyed") is owned by the
+	// machine and awaited via _destroyPromise.
+	private _lifetime = new Lifetime();
+	private _destroyedReason: Error | null = null;
+	private _destroyPromise: Promise<void> | null = null;
+
+	private _guid: string;
+	private _getPath: () => string;
+	private _lca: LCAState | null = null;
+	// An invoke result's LCA held until the executor confirms the paired disk
+	// write. The baseline never advances past confirmed disk content: an idle
+	// write can be skipped (editor lock, teardown) with no failure signal, and
+	// an eagerly committed LCA then poisons every later three-way base with
+	// content the file never carried.
+	private _pendingDiskConfirmLCA: {
+		lca: LCAState;
+		priorLocalSnapshot: Uint8Array | null;
+		priorRemoteSnapshot: Uint8Array | null;
+	} | null = null;
+	private _disk: MergeMetadata | null = null;
+	private _localSnapshot: Uint8Array | null = null;
+	private _remoteSnapshot: Uint8Array | null = null;
+	private _error: Error | undefined;
+	private _deferredConflict:
+		| { diskHash: string; localHash: string }
+		| undefined;
+
+	// Fork: snapshot of localDoc state before disk edit ingestion (idle mode)
+	private _fork: Fork | null = null;
+
+	// Whether the current fork has already logged a reconcile attempt with no
+	// remote replica attached. Instance-only (never persisted with the fork):
+	// the warning fires once per fork so a stranded fork is diagnosable from
+	// the log without flooding it on every poll.
+	private _warnedForkAwaitingReplica = false;
+
+	// "After" snapshot of each disk ingestion within the current fork.
+	// Each ingestDisk call pushes one entry, giving 1:1 correspondence
+	// with CapturedOp entries from OpCapture. Cleared when the fork is cleared.
+	private _ingestionTexts: string[] = [];
+	// Bridge: manages CRDT op flow between localDoc and remoteDoc
+	private _bridge: SyncBridge;
+
+	// Live reference to the editor view for reading the dirty flag
+	private _editorViewRef: EditorViewRef | null = null;
+
+	// Obsidian file lifecycle tracking (from workspace events)
+	private _obsidianFileOpen: boolean = false;
+
+	// YDocs
+	private localDoc: Y.Doc | null = null; // Alive in idle + active mode; null when unloaded/hibernated
+	private remoteDoc: Y.Doc | null; // Lazily provided, managed externally. Null when hibernated.
+	// Merge metadata normally arrives before local persistence is attached, but
+	// active-entry races allow it to arrive afterward. Hold all deleted content
+	// until that metadata tells the GC filter which baseline must remain
+	// rewindable.
+	private _persistenceStateLoaded = false;
+	private _lcaGcPinCache: {
+		encoded: Uint8Array;
+		decoded: Y.Snapshot | null;
+	} | null = null;
+
+	// Persisted client ID for localDoc across lock cycles.
+	// Reusing the same client ID prevents content duplication when IDB is empty
+	// (the same content enrolled with different client IDs appears as duplicates).
+	private _localDocClientID: number | null = null;
+
+	// Pending disk contents for merge (used in idle mode)
+	private pendingDiskContents: string | null = null;
+	private pendingDiskHash: string | null = null;
+	private pendingDiskSource: PendingDiskSource | null = null;
+	private pendingRecoverLCADisk: RecoverLCADisk | null = null;
+	private _needsDiskContentLoad = false;
+	private _restoredForkNeedsDiskRead = false;
+
+	// Editor content from ACQUIRE_LOCK event, used for merge during reconciliation
+	private pendingEditorContent: string | null = null;
+
+	// Active conflict resolution session. Built when conflict detected;
+	// cleared when resolved or superseded by a fresh sync. Read via
+	// `getConflictData()`.
+	private _conflict: Conflict | null = null;
+
+	// Track previous sync status for change detection
+	private lastSyncStatus: SyncStatusType = "synced";
+
+	// Pending updates for idle mode auto-merge (received via REMOTE_UPDATE)
+	private pendingIdleUpdates: Uint8Array | null = null;
+
+	// Consecutive idle retry count — used for backoff when drain rate < queue rate
+	private idleRetryCount = 0;
+
+	// Newest server head received via SERVER_AHEAD. Plain machine memory, not
+	// resettable context: it survives hibernation with the shell, so the
+	// machine — not a fleet table cleared on reconnect — owns what the server
+	// last claimed to hold.
+	private _serverHead: YjsSnapshot | null = null;
+
+	// A SERVER_AHEAD arrived while the machine could not act on it; drained by
+	// the next state whose entry can act.
+	private _serverHeadPending = false;
+
+	// Last local-ahead flush attempt. In-memory only — hibernation resets it,
+	// so a woken document may retry immediately; the limit paces repeated warm
+	// attempts against a server that refuses our ops.
+	private _localAheadAttemptAt: number | null = null;
+
+	// Minimum spacing between local-ahead flush attempts for a warm document.
+	private static readonly LOCAL_AHEAD_RETRY_INTERVAL_MS = 5 * 60_000;
+
+	// Consecutive superseded idle reconciliations. A superseded outcome (the
+	// world moved mid-operation) re-enters idle.loading to re-classify; this
+	// counter bounds that loop so a livelock surfaces as a visible error instead
+	// of spinning. Reset on any convergence to idle.synced.
+	private _consecutiveSupersessions = 0;
+	private _supersessionHistory: number[] = [];
+
+	// Whether the stored _error is retryable. Transport-caused actor exceptions
+	// are retryable and re-arm on new information; corrupt-state, invariant, and
+	// supersession-bound-exhausted failures are permanent.
+	private _errorRetryable = false;
+
+	// Generous bound (single digits) on consecutive supersessions before an idle
+	// reconciliation is treated as a permanent error rather than re-classified.
+	private static readonly IDLE_SUPERSESSION_BOUND = 8;
+
+	// Substrings that mark an idle-invoke exception as transport-caused, and so
+	// retryable. Matched case-insensitively against the error name and message.
+	private static readonly TRANSPORT_ERROR_SIGNATURES = [
+		"disconnect",
+		"socket",
+		"connection reset",
+		"connection closed",
+		"connection lost",
+		"not connected",
+		"network",
+		"websocket",
+		"token refresh",
+		"provider not synced",
+		"offline",
+		"econnreset",
+		"epipe",
+	];
+
+	// Persisted/enrolled local head. A resident localDoc may only refresh this
+	// after its persistence load has completed and matched this head.
+	private _enrolledLocalSnapshot: Uint8Array | null = null;
+	private _localDocSnapshotSafe = false;
+
+	// Persistence for localDoc (alive in idle + active mode; null when unloaded/hibernated)
+	private localPersistence: IYDocPersistence | null = null;
+
+	// Last known editor text (for drift detection)
+	private lastKnownEditorText: string | null = null;
+	/**
+	 * Recent distinct whole-buffer editor replacements, oldest first. Three
+	 * entries cover a detached save followed by two further view echoes during
+	 * the bind window; a fourth distinct set evicts the oldest. Repeated equal
+	 * sets refresh recency without consuming provenance capacity.
+	 */
+	private recentIngestedEditorReplacementTexts: string[] = [];
+	private static readonly INGESTED_REPLACEMENT_HISTORY_LIMIT = 3;
+
+	// Y.Text observer for converting remote deltas to positioned changes
+	private localTextObserver:
+		| ((event: Y.YTextEvent, tr: Y.Transaction) => void)
+		| null = null;
+	private localFrontmatterObserver:
+		| ((event: Y.YMapEvent<unknown>, tr: Y.Transaction) => void)
+		| null = null;
+	private readonly frontmatterMapItemIds = new Map<string, string>();
+
+	// Y.Map("frontmatter") observer: tracks whether a remote update touched the map.
+	// Repair is only valid when the remote client also populates the Y.Map.
+	private _remoteFrontmatterMapUpdated = false;
+
+	// Frontmatter keys whose text value changed while the folder was
+	// disconnected. Their map write is withheld: a value minted from text
+	// that has not merged with the server would be a fresh LWW operation
+	// that can win over a live peer's newer edit and, through repair,
+	// silently revert that edit for everyone. Until the drain at provider
+	// sync, these keys stay text-authoritative — map overlays and repairs
+	// skip them — so the user's own edit is not reverted either. The set
+	// survives lock cycles and connectivity bounces; only a drain or the
+	// document's teardown clears it.
+	private readonly _deferredFrontmatterKeys = new Set<string>();
+
+	// Observables (per spec)
+	private readonly _effects = new SimpleObservable<MergeEffect>();
+	private readonly _stateChanges = new SimpleObservable<MergeState>();
+
+	// Push-based transition callback for recording bridge
+	private _onTransition?: (info: { from: StatePath; to: StatePath; event: MergeEvent; effects: MergeEffect[] }) => void;
+	private _pendingEffects: MergeEffect[] | null = null;
+
+	// Listeners for detailed transition diagnostics.
+	private stateChangeListeners: Array<
+		(from: StatePath, to: StatePath, event: MergeEvent) => void
+	> = [];
+
+	// Configuration
+	private timeProvider: TimeProvider;
+	private hashFn: (contents: string) => Promise<string>;
+	private vaultId: string;
+	private _createPersistence: CreatePersistence;
+	private _persistenceMetadata?: PersistenceMetadata;
+	private _diskLoader: DiskLoader;
+	private _isProviderSynced: () => boolean;
+	private _isFolderConnected: () => boolean;
+	private _captureOpts: CaptureOpts | null;
+	private _replayMode: boolean;
+
+	// Whether PROVIDER_SYNCED has been received during the current lock cycle
+	private _providerSynced = false;
+
+	// Async operation tracking with cancellation support
+	private _asyncOps = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+
+	// Declarative machine interpreter state
+	private _activeInvoke: ActiveInvoke | null = null;
+	private _cleanupType: 'unload' | 'release' | null = null;
+	private _cleanupWasConflict = false;
+	private _interpreterConfig: InterpreterConfig = createInterpreterConfig();
+
+	// Network connectivity status (does not block state transitions)
+	private _isOnline: boolean = false;
+
+	// Obsidian's frontmatter primitives (injected). Using Obsidian's own
+	// parseYaml, stringifyYaml, and getFrontMatterInfo keeps our reconstructed
+	// text byte-identical to what Obsidian writes, so we never fight its saves.
+	private _yaml: FrontMatterPrimitives | null = null;
+
+	getOpCapture(): OpCapture | null {
+		return this.localPersistence?.opCapture ?? null;
+	}
+
+	private crdtLog = curryLog("[MergeHSM:CRDT]", "debug");
+	private idleMergeLog = curryLog("[MergeHSM:IdleMerge]", "log");
+	private hsmDebug = curryLog("[MergeHSM]", "debug");
+	private hsmWarn = curryLog("[MergeHSM]", "warn");
+	private hsmError = curryLog("[MergeHSM]", "error");
+
+	// Events like REMOTE_UPDATE and DISK_CHANGED are accumulated during loading
+	// and replayed after mode transition (to idle.* or active.*)
+	private _accumulatedEvents: Array<
+		| { type: "REMOTE_UPDATE"; update: Uint8Array; affectsText?: boolean }
+		| { type: "DISK_CHANGED"; contents: string; mtime: number; hash: string }
+		| { type: "CM6_CHANGE"; changes: unknown[]; docText: string; userEvent?: string; viewId?: string }
+	> = [];
+
+	// Mode decision during loading state (null = not decided, 'idle' or 'active')
+	private _modeDecision: "idle" | "active" | null = null;
+
+	// Track if entering active mode from diverged state for conflict handling
+	private _enteringFromDiverged: boolean = false;
+
+	// Machine edit rewind: pending vault.process() edits awaiting remote match
+	private _pendingMachineEdits: PendingMachineEdit[] = [];
+	private _machineEditDrainWaiters: Set<() => void> = new Set();
+	private _suppressLocalObserver = false;
+	private _localDocDispatchOriginView: string | undefined;
+
+
+	constructor(config: MergeHSMConfig) {
+		this.timeProvider = config.timeProvider ?? new DefaultTimeProvider();
+		this.hashFn = config.hashFn ?? defaultHashFn;
+		this._guid = config.guid;
+		this._getPath = config.getPath;
+		this.vaultId = config.vaultId;
+		this.remoteDoc = config.remoteDoc;
+		this._createPersistence = config.createPersistence;
+		this._persistenceMetadata = config.persistenceMetadata;
+		this._diskLoader = config.diskLoader;
+		this._bridge = new SyncBridge(this);
+		this._isProviderSynced = config.isProviderSynced ?? (() => this._bridge.providerSynced);
+		this._isFolderConnected = config.isFolderConnected ?? (() => this._isOnline);
+		this._replayMode = config.replayMode ?? false;
+		this._yaml = config.yaml ?? null;
+		this._captureOpts = {
+			scope: "contents",
+			trackedOrigins: new Set([DISK_ORIGIN, MACHINE_EDIT_ORIGIN]),
+			captureTimeout: 0,
+		};
+		this._interpreterConfig = createInterpreterConfig({
+			guards: this.buildGuards(),
+			actions: this.buildActions(),
+			invokeSources: this.buildInvokeSources(),
+		});
+
+		// Resource-contract debugging implies strict machine validation: verify
+		// every guard, action, and invoke source referenced by the machine
+		// definition is actually bound before any event is processed.
+		if (flags().enableHSMResourceContracts) {
+			const errors = validateMachine(MACHINE, this._interpreterConfig);
+			if (errors.length > 0) {
+				this.hsmError("Machine validation failed", errors);
+				throw new Error(
+					`MergeHSM machine validation failed:\n${errors.join("\n")}`,
+				);
+			}
+		}
+	}
+
+	private setPendingDiskContents(
+		contents: string,
+		source: PendingDiskSource,
+		hash: string | null = null,
+	): void {
+		this.pendingDiskContents = contents;
+		this.pendingDiskSource = source;
+		this.pendingDiskHash = hash;
+	}
+
+	private clearPendingDiskContents(): void {
+		this.pendingDiskContents = null;
+		this.pendingDiskSource = null;
+		this.pendingDiskHash = null;
+	}
+
+	// Returns null when a baseline was captured, otherwise the name of the
+	// precondition that refused — so callers on paths where refusal means the
+	// baseline is lost for good can surface it instead of failing silently.
+	private capturePendingDiskLCA(
+		contents: string,
+		options: { allowViewData?: boolean } = {},
+	): string | null {
+		if (this._fork) return "fork-active";
+		if (this._conflict) return "conflict-active";
+		if (!this.localDoc) return "no-local-doc";
+		if (!this._disk) return "no-disk-identity";
+		if (
+			this.pendingDiskSource !== "disk-event" &&
+			!(options.allowViewData && this.pendingDiskSource === "view-data")
+		) {
+			return this.pendingDiskSource === null
+				? "no-pending-disk-source"
+				: `pending-disk-source-${this.pendingDiskSource}`;
+		}
+		if (this.pendingDiskContents === null) return "no-pending-disk-contents";
+		if (this.pendingDiskContents !== contents) return "pending-disk-contents-mismatch";
+		if (this.pendingDiskHash === null) return "no-pending-disk-hash";
+		if (this.pendingDiskHash !== this._disk.hash) return "pending-disk-hash-stale";
+
+		if (this.localDoc.getText("contents").toString() !== contents) {
+			return "local-doc-text-mismatch";
+		}
+
+		this._setLCA({
+			contents,
+			meta: { hash: this.pendingDiskHash, mtime: this._disk.mtime },
+			snapshot: snapshotFromDoc(this.localDoc).snapshot,
+		});
+		this.clearPendingDiskContents();
+		this.emitPersistState();
+		return null;
+	}
+
+	private clearSettledDiskContents(): void {
+		if (this._statePath === "idle.synced" && !this._fork && !this._conflict) {
+			this.clearPendingDiskContents();
+		}
+	}
+
+	private refreshLocalSnapshotFromDoc(): Uint8Array | null {
+		if (this.localDoc) {
+			this._localSnapshot = snapshotFromDoc(this.localDoc).snapshot;
+			if (this._localDocClientID === null) {
+				this._localDocClientID = this.localDoc.clientID;
+			}
+		}
+		return this._localSnapshot;
+	}
+
+	private rememberEnrolledLocalHead(
+		snapshot: Uint8Array | null | undefined,
+	): void {
+		this._enrolledLocalSnapshot = snapshot ?? null;
+	}
+
+	private clearEnrolledLocalHead(): void {
+		this.rememberEnrolledLocalHead(null);
+		this._localDocSnapshotSafe = false;
+	}
+
+	private markLocalDocSnapshotSafeIfLoadedHeadMatches(): boolean {
+		if (!this.localDoc || this.localPersistence?.synced !== true) {
+			this._localDocSnapshotSafe = false;
+			return false;
+		}
+
+		if (this._enrolledLocalSnapshot) {
+			try {
+				if (
+					snapshotsEqual(
+						snapshotFromDoc(this.localDoc),
+						{ snapshot: this._enrolledLocalSnapshot },
+					)
+				) {
+					this._localDocSnapshotSafe = true;
+					return true;
+				}
+			} catch {
+				this._localDocSnapshotSafe = false;
+				return false;
+			}
+		}
+
+		this._localDocSnapshotSafe = false;
+		return false;
+	}
+
+	captureLocalHeadForPersistence(): void {
+		if (!this.localDoc || !this._localDocSnapshotSafe) return;
+
+		this._enrolledLocalSnapshot = snapshotFromDoc(this.localDoc).snapshot;
+	}
+
+	getLocalHeadForPersistence(): {
+		localSnapshot: Uint8Array | null;
+	} {
+		return { localSnapshot: this._enrolledLocalSnapshot };
+	}
+
+	private hasEnrolledLocalCRDT(): boolean {
+		if (this.localPersistence?.synced !== true) return false;
+		if (!this.localPersistence.hasUserData()) return false;
+		const localSnapshot = this.refreshLocalSnapshotFromDoc();
+		if (!localSnapshot) return false;
+		try {
+			return !snapshotIsEmpty({ snapshot: localSnapshot });
+		} catch {
+			return false;
+		}
+	}
+
+	private canRecoverMissingLocalCRDTFromRemote(): boolean {
+		if (this._lca || this._fork || this._conflict) return false;
+		if (!this.localDoc || !this.remoteDoc) return false;
+		if (!this.localPersistence || this.localPersistence.synced !== true) return false;
+		if (this.localPersistence.hasUserData()) return false;
+		if (!isEmptyDoc(this.localDoc)) return false;
+		return !isEmptyDoc(this.remoteDoc);
+	}
+
+	private shouldWakeLCARecoveryAfterPersistenceSynced(hasContent = this.localPersistence?.hasUserData() ?? false): boolean {
+		if (!this._statePath.startsWith("idle.")) return false;
+		if (this._statePath === "idle.conflict" || this._statePath === "idle.recoverLCA") return false;
+		if (this._lca || this._fork || this._conflict) return false;
+		if (!this.localDoc || this.localPersistence?.synced !== true) return false;
+		if (!hasContent && !this.canRecoverMissingLocalCRDTFromRemote()) return false;
+		if (hasContent && !this.hasEnrolledLocalCRDT()) return false;
+		return this.hasLCARecoveryPendingWork();
+	}
+
+	private hasLCARecoveryPendingWork(): boolean {
+		if (this._lca || this._fork || this._conflict) return false;
+		return (
+			this.pendingDiskContents !== null ||
+			this.pendingIdleUpdates !== null ||
+			this.pendingRecoverLCADisk !== null
+		);
+	}
+
+	private noLCACanSettleAsSyncedAtLoad(): boolean {
+		if (this._fork || this._conflict) return false;
+		if (this.pendingDiskContents !== null || this.pendingIdleUpdates !== null) return false;
+		if (this.remoteDoc && !isEmptyDoc(this.remoteDoc)) return false;
+		if (this.localPersistence && !this.localPersistence.synced) return false;
+		return !this.hasEnrolledLocalCRDT();
+	}
+
+	private canRecoverLCAWithPendingDisk(providerSyncedEvent = false): boolean {
+		if (this._lca || this._fork || this._conflict) return false;
+		if (!this.localDoc || !this.remoteDoc) return false;
+		if (!this.localPersistence || this.localPersistence.synced !== true) return false;
+		if (!providerSyncedEvent && !this._providerSynced && !this._isProviderSynced()) return false;
+		if (this.pendingDiskContents === null || this._disk === null) return false;
+		return this.hasEnrolledLocalCRDT() || this.canRecoverMissingLocalCRDTFromRemote();
+	}
+
+	private prepareRecoverLCAFromPendingDisk(): void {
+		if (this.pendingDiskContents === null || this._disk === null) return;
+		this.pendingRecoverLCADisk = {
+			content: this.pendingDiskContents,
+			hash: this.pendingDiskHash ?? this._disk.hash,
+			mtime: this._disk.mtime,
+		};
+	}
+
+	// Rebuild a compacted LCA body from the attached docs. A doc whose
+	// complete snapshot equals the LCA's snapshot holds precisely the
+	// operations the baseline was captured from, so its text IS the baseline
+	// text. When neither doc sits at the baseline, a doc that has moved past
+	// it still contains it: localDoc's gcFilter pins every deleted item that
+	// was visible at the LCA snapshot precisely so the baseline can be
+	// rebuilt point-in-time here. The restore verifies its own result and
+	// yields nothing when garbage-collected history would make the rebuilt
+	// text inexact. localDoc is preferred; remoteDoc is an equally valid
+	// source when localDoc is absent.
+	private hydrateLCAContentsFromMatchingDoc(): void {
+		if (!this._lca || this._lca.contents !== null) return;
+		const baseline = { snapshot: this._lca.snapshot };
+		for (const doc of [this.localDoc, this.remoteDoc]) {
+			if (!doc) continue;
+			try {
+				if (!snapshotsEqual(snapshotFromDoc(doc), baseline)) {
+					continue;
+				}
+			} catch {
+				continue;
+			}
+			this._lca = {
+				...this._lca,
+				contents: doc.getText("contents").toString(),
+			};
+			return;
+		}
+		if (this.localDoc) {
+			const contents = restoreTextAtSnapshot(this.localDoc, baseline, "contents");
+			if (contents !== null) {
+				this._lca = { ...this._lca, contents };
+				return;
+			}
+		}
+		// While local persistence is still syncing, localDoc has not made its
+		// claim on the baseline yet — do not let a restoration from remoteDoc
+		// preempt it.
+		if (this.lcaContentsWaitingOnLocalPersistence()) return;
+		if (this.remoteDoc) {
+			const contents = restoreTextAtSnapshot(this.remoteDoc, baseline, "contents");
+			if (contents !== null) {
+				this._lca = { ...this._lca, contents };
+			}
+		}
+	}
+
+	private lcaContentsWaitingOnLocalPersistence(): boolean {
+		return (
+			this._lca !== null &&
+			this._lca.contents === null &&
+			this.localDoc !== null &&
+			this.localPersistence !== null &&
+			!this.localPersistence.synced
+		);
+	}
+
+	private describeResourceContext(context: string): string {
+		return (
+			`context=${context} guid=${this._guid} path=${this.path} ` +
+			`state=${this._statePath} residency=${this.localDoc ? "awake" : "hibernated"} ` +
+			`localDoc=${!!this.localDoc} remoteDoc=${!!this.remoteDoc} ` +
+			`lcaMetadata=${!!this._lca} lcaContents=${this._lca?.contents !== null && this._lca?.contents !== undefined} ` +
+			`pendingDiskContents=${this.pendingDiskContents !== null} fork=${!!this._fork} conflict=${!!this._conflict}`
+		);
+	}
+
+	private assertMachineResources(context: string): void {
+		if (!flags().enableHSMResourceContracts) return;
+		const contract = MACHINE[this._statePath]?.resources;
+		if (!contract) return;
+		if (contract.lcaContents === "present" && this._lca?.contents === null) {
+			this.hydrateLCAContentsFromMatchingDoc();
+		}
+
+		const errors: string[] = [];
+		const residency = this.localDoc ? "awake" : "hibernated";
+		if (contract.residency && !contract.residency.includes(residency)) {
+			errors.push(`residency expected ${contract.residency.join("|")} got ${residency}`);
+		}
+
+		this.checkResourcePresence(errors, "localDoc", contract.localDoc, this.localDoc !== null);
+		this.checkResourcePresence(errors, "remoteDoc", contract.remoteDoc, this.remoteDoc !== null);
+		this.checkResourcePresence(errors, "lcaMetadata", contract.lcaMetadata, this._lca !== null);
+		const lcaContentsContract = this.lcaContentsWaitingOnLocalPersistence()
+			? "optional"
+			: contract.lcaContents;
+		this.checkResourcePresence(
+			errors,
+			"lcaContents",
+			lcaContentsContract,
+			this._lca?.contents !== null && this._lca?.contents !== undefined,
+		);
+		this.checkResourcePresence(
+			errors,
+			"pendingDiskContents",
+			contract.pendingDiskContents,
+			this.pendingDiskContents !== null,
+		);
+		this.checkResourcePresence(errors, "fork", contract.fork, this._fork !== null);
+		this.checkResourcePresence(errors, "conflict", contract.conflict, this._conflict !== null);
+
+		if (errors.length === 0) return;
+
+		const message = `[HSM resource contract] ${errors.join("; ")} | ${this.describeResourceContext(context)}`;
+		this.hsmError(message);
+	}
+
+	private checkResourcePresence(
+		errors: string[],
+		resource: string,
+		expected: ResourcePresence | undefined,
+		actual: boolean,
+	): void {
+		if (expected === "present" && !actual) {
+			errors.push(`${resource} expected present`);
+		} else if (expected === "absent" && actual) {
+			errors.push(`${resource} expected absent`);
+		}
+	}
+
+	private requireLocalDoc(context: string): Y.Doc | null {
+		if (this.localDoc) return this.localDoc;
+		this.hsmError(`[HSM resource guard] localDoc missing | ${this.describeResourceContext(context)}`);
+		return null;
+	}
+
+	private requireRemoteDoc(context: string): Y.Doc | null {
+		if (this.remoteDoc) return this.remoteDoc;
+		this.hsmError(`[HSM resource guard] remoteDoc missing | ${this.describeResourceContext(context)}`);
+		return null;
+	}
+
+	private requireLcaContents(context: string): string | null {
+		if (!this._lca) {
+			this.hsmError(`[HSM resource guard] LCA metadata missing | ${this.describeResourceContext(context)}`);
+			return null;
+		}
+		if (this._lca.contents === null) {
+			this.hydrateLCAContentsFromMatchingDoc();
+		}
+		if (this._lca.contents === null) {
+			this.hsmError(`[HSM resource guard] LCA contents missing | ${this.describeResourceContext(context)}`);
+			return null;
+		}
+		return this._lca.contents;
+	}
+
+	private requirePendingDiskContents(context: string): string | null {
+		if (this.pendingDiskContents !== null) return this.pendingDiskContents;
+		this.hsmError(`[HSM resource guard] pendingDiskContents missing | ${this.describeResourceContext(context)}`);
+		return null;
+	}
+
+	prepareForHibernate(): void {
+		this.captureLocalHeadForPersistence();
+		this.clearSettledDiskContents();
+		// The attempt clock paces repeated warm attempts only: a woken
+		// document may retry its local-ahead flush immediately.
+		this._localAheadAttemptAt = null;
+		if (
+			this._statePath !== "idle.synced" ||
+			this._fork ||
+			this._conflict ||
+			this.pendingIdleUpdates !== null ||
+			!this._lca
+		) {
+			return;
+		}
+		this.emitPersistState();
+		this._lca = {
+			...this._lca,
+			contents: null,
+		};
+		this.lastKnownEditorText = null;
+	}
+
+	private hasFreshPendingDiskContents(): boolean {
+		if (this.pendingDiskContents === null) return false;
+		if (this.pendingDiskSource === "view-data") return true;
+		if (this.pendingDiskHash === null || this._disk === null) return false;
+		return this.pendingDiskHash === this._disk.hash;
+	}
+
+	private discardSupersededPendingDiskContents(): void {
+		if (this.pendingDiskContents === null) return;
+		if (this.pendingDiskHash === null || this._disk === null) return;
+		if (this.pendingDiskHash === this._disk.hash) return;
+		this.clearPendingDiskContents();
+	}
+
+	private getPendingDiskTextForMerge(): string | null {
+		if (this.hasFreshPendingDiskContents()) {
+			return this.pendingDiskContents!;
+		}
+		return null;
+	}
+
+	private needsDiskContentAtLoad(): boolean {
+		if (!this._lca || this._conflict) return false;
+		if (!this._disk) return true;
+		if (this._fork) {
+			return (
+				this._restoredForkNeedsDiskRead &&
+				!this.hasSessionFreshDiskContents()
+			);
+		}
+		if (this._needsDiskContentLoad) return true;
+		return this.hasDiskChangedSinceLCA() && !this.hasFreshPendingDiskContents();
+	}
+
+	private hasSessionFreshDiskContents(): boolean {
+		return (
+			this.pendingDiskSource === "disk-event" &&
+			this.pendingDiskContents !== null &&
+			this.pendingDiskHash !== null &&
+			this.pendingDiskHash === this._disk?.hash
+		);
+	}
+
+	/**
+	 * Fold a session observation of the file into the load-time disk belief.
+	 *
+	 * The persisted record describes the file as it was when this document
+	 * last settled. If the file was rewritten while the plugin was not
+	 * running, only an observation made in this session can reveal it — so
+	 * the load-time guards must see that observation before they can conclude
+	 * anything, including "in sync". Comparing the persisted record against
+	 * itself always says "unchanged", which is why this arrives on the same
+	 * event rather than as a separate report the guards can run without.
+	 *
+	 * Identity only: this compares the recorded modification time and hash of
+	 * one path. It never inspects or compares document content.
+	 */
+	private applyObservedDiskAtLoad(
+		observed?: { mtime: number; hash?: string } | null,
+	): void {
+		if (!observed) return;
+		const persisted = this._disk;
+		// With no persisted record there is nothing to contradict, and
+		// needsDiskContentAtLoad() already requires a read when _disk is null.
+		if (!persisted) return;
+		if (
+			observed.mtime === persisted.mtime &&
+			(observed.hash === undefined || observed.hash === persisted.hash)
+		) {
+			return;
+		}
+		if (typeof observed.hash === "string") {
+			// The observation is complete: it identifies the current bytes.
+			this._disk = { hash: observed.hash, mtime: observed.mtime };
+			this._needsDiskContentLoad = false;
+			return;
+		}
+		// Modification time moved but the current bytes are unknown. The file
+		// must be read before any load-time verdict is reached.
+		this._needsDiskContentLoad = true;
+	}
+
+	// ===========================================================================
+	// Public API
+	// ===========================================================================
+
+	get path(): string {
+		return this._getPath();
+	}
+
+	get guid(): string {
+		return this._guid;
+	}
+
+	get state(): MergeState {
+		return {
+			guid: this._guid,
+			path: this.path,
+			lca: this._lca,
+			disk: this._disk,
+			localSnapshot: this._localSnapshot,
+			remoteSnapshot: this._remoteSnapshot,
+			statePath: this._statePath,
+			error: this._error,
+			errorRetryable: this._error ? this._errorRetryable : undefined,
+			deferredConflict: this._deferredConflict,
+			fork: this._fork,
+			isOnline: this._isOnline,
+			pendingEditorContent: this.pendingEditorContent ?? undefined,
+			lastKnownEditorText: this.lastKnownEditorText ?? undefined,
+		};
+	}
+
+	send(event: MergeEvent): void {
+		if (this._statePath === "destroyed") return;
+		// During teardown only the machine's own lifecycle events (UNLOAD and
+		// invoke completions) are allowed through; external events are dropped.
+		if (!this._lifetime.active && !this.isTeardownProgressEvent(event)) return;
+		const fromState = this._statePath;
+		const captureEffects = !!this._onTransition;
+		const savedEffects = this._pendingEffects;
+		if (captureEffects) this._pendingEffects = [];
+		this.handleEvent(event);
+		this.retireDeferredConflictWhenReconciled();
+		if (!this._activeInvoke) {
+			this.assertMachineResources(`after ${event.type}`);
+		}
+		const toState = this._statePath;
+		const myEffects = this._pendingEffects;
+		this._pendingEffects = savedEffects;
+		if (captureEffects && myEffects) {
+			this._onTransition!({ from: fromState, to: toState, event, effects: myEffects });
+		}
+		// Always notify even if statePath unchanged — subscribers rely on
+		// property changes (e.g. diskMtime) that can occur without transitions.
+		this.notifyStateChange(fromState, toState, event);
+	}
+
+	private async runHeadlessApiMutation(
+		event: MergeEvent,
+		mutate: () => void | Promise<void>,
+	): Promise<void> {
+		const fromState = this._statePath;
+		const captureEffects = !!this._onTransition;
+		const savedEffects = this._pendingEffects;
+		let mutationCompleted = false;
+		if (captureEffects) this._pendingEffects = [];
+		try {
+			await mutate();
+			mutationCompleted = true;
+		} finally {
+			const toState = this._statePath;
+			const myEffects = this._pendingEffects;
+			this._pendingEffects = savedEffects;
+			if (mutationCompleted) {
+				if (captureEffects && myEffects) {
+					this._onTransition!({ from: fromState, to: toState, event, effects: myEffects });
+				}
+				this.notifyStateChange(fromState, toState, event);
+			}
+		}
+	}
+
+	matches(statePath: string): boolean {
+		return (
+			this._statePath === statePath ||
+			this._statePath.startsWith(statePath + ".")
+		);
+	}
+
+	/**
+	 * Check if the HSM is in active mode (editor open, lock acquired).
+	 */
+	isActive(): boolean {
+		return this._statePath.startsWith("active.");
+	}
+
+	hasFork(): boolean {
+		return this._fork !== null;
+	}
+
+	/**
+	 * Check if the HSM is in idle mode (no editor, lightweight state).
+	 */
+	isIdle(): boolean {
+		return this._statePath.startsWith("idle.");
+	}
+
+	/**
+	 * Check if the network is currently connected.
+	 * Does not affect state transitions; local edits always work offline.
+	 */
+	get isOnline(): boolean {
+		return this._isOnline;
+	}
+
+	/** Whether sync between localDoc and remoteDoc is paused. */
+	get isLocalOnly(): boolean {
+		return this._bridge.isLocalOnly;
+	}
+
+	/** Number of local edits accumulated while the sync gate is closed. */
+	get pendingOutbound(): number {
+		return this._bridge.pendingOutbound;
+	}
+
+	/** Number of remote edits accumulated while the sync gate is closed. */
+	get pendingInbound(): number {
+		return this._bridge.pendingInbound;
+	}
+
+	/**
+	 * Toggle local-only mode. When enabled, ops accumulate in pending counters
+	 * instead of flowing between localDoc and remoteDoc. When disabled, pending
+	 * ops are flushed immediately (unless a fork is active).
+	 */
+	setLocalOnly(value: boolean): void {
+		this._bridge.setLocalOnly(value);
+	}
+
+	/**
+	 * Check if Obsidian has the file open (based on workspace events).
+	 * Used as a fail-closed interlock for disk writes.
+	 */
+	get isObsidianFileOpen(): boolean {
+		return this._obsidianFileOpen;
+	}
+
+	getLocalDoc(): Y.Doc | null {
+		return this.localDoc;
+	}
+
+	needsFullStateForActiveEntry(): boolean {
+		if (!this._lca || this._lca.contents !== null) return false;
+		this.hydrateLCAContentsFromMatchingDoc();
+		return this._lca.contents === null;
+	}
+
+	async awaitPersistenceReady(): Promise<void> {
+		if (!this.localPersistence) {
+			await this.awaitState((statePath) => statePath !== "loading");
+		}
+		if (this.localPersistence && !this.localPersistence.synced) {
+			await this.awaitLocalPersistenceWhenSynced();
+		}
+	}
+
+	hasPersistenceUserData(): boolean {
+		return this.localPersistence?.hasUserData() ?? false;
+	}
+
+	async getPersistenceServerSynced(): Promise<boolean> {
+		const persistence:
+			| (IYDocPersistence & { getServerSynced?: () => Promise<boolean> })
+			| null = this.localPersistence;
+		return (await persistence?.getServerSynced?.()) ?? false;
+	}
+
+	async markPersistenceServerSynced(): Promise<void> {
+		const persistence:
+			| (IYDocPersistence & { markServerSynced?: () => Promise<void> })
+			| null = this.localPersistence;
+		await persistence?.markServerSynced?.();
+	}
+
+	/**
+	 * Get the length of the local document content.
+	 * localDoc is always alive in idle mode, so this returns immediately.
+	 */
+	async getLocalDocLength(): Promise<number> {
+		if (this.localDoc) {
+			return this.localDoc.getText("contents").toString().length;
+		}
+		return 0;
+	}
+
+	/**
+	 * Current conflict snapshot. Returns null when the file is clean.
+	 *
+	 * Returns the active resolution session if one is in progress. For
+	 * transient `idle.diverged`, this can still derive a read-only snapshot
+	 * from `_lca` + docs. Parked idle conflicts hold `_conflict` in
+	 * `idle.conflict`.
+	 */
+	getConflictData(_options?: { fresh?: boolean }): ConflictData | null {
+		if (this._conflict) return this._conflict.toData();
+		// Do not derive conflicts outside idle.diverged. In states like
+		// idle.localAhead, remoteDoc may be intentionally unsynced and transient
+		// derivations can produce false conflicts that poison future transitions.
+		if (this._statePath !== "idle.diverged") return null;
+		if (!this._lca) return null;
+		this.assertMachineResources("before getConflictData");
+		if (!this.localDoc || !this.remoteDoc) return null;
+		const localDoc = this.requireLocalDoc("getConflictData");
+		const remoteDoc = this.requireRemoteDoc("getConflictData");
+		const base = this.requireLcaContents("getConflictData");
+		if (!localDoc || !remoteDoc || base === null) return null;
+		const ours = localDoc.getText("contents").toString();
+		const theirs = remoteDoc.getText("contents").toString();
+		const { hasConflict, regions } = computeConflict(base, ours, theirs);
+		if (!hasConflict) return null;
+		return new Conflict({ base, ours, theirs, regions }).toData();
+	}
+
+	/**
+	 * Whether the server's copy of this document may be taken as its starting
+	 * point: enrolled as its common ancestor, and written over its file.
+	 *
+	 * Stated as a whitelist, deliberately. Asking instead which states are
+	 * dangerous gets two things wrong: it waves through every state the
+	 * machine gains later, and — the reason this is written the way it is —
+	 * it waves through the states the machine passes through while it is
+	 * still working on a divergence. A recompute out of a parked conflict
+	 * clears the conflict record on the way, and can come to rest carrying
+	 * only the fork. At that point neither the state name nor the conflict
+	 * record says that the device's own writing is the only unreconciled
+	 * copy of the note, and it still is.
+	 *
+	 * Exactly two shapes qualify:
+	 *
+	 * - A document with no history of its own: still loading, or still being
+	 *   classified, with no ancestor recorded. That is what a genuine first
+	 *   download meets. Once an ancestor is recorded the machine has history
+	 *   it has not finished comparing against the file, so the answer is no
+	 *   until it has.
+	 * - A document the machine has settled with nothing outstanding on this
+	 *   device: `idle.synced`, or `idle.remoteAhead` where the server is
+	 *   ahead but neither the file nor the local copy has moved since the
+	 *   ancestor. This is also the shape a completed enrollment produces, so
+	 *   the last check before an ordinary download's write still passes.
+	 *
+	 * Everything else is refused, including a destroyed or unloading machine,
+	 * and anything with the file open for editing.
+	 *
+	 * Answered from machine state alone: no document, disk, or remote text is
+	 * read or compared. That makes it safe as a precondition for operations
+	 * that destroy what is on disk.
+	 */
+	get acceptsRemoteEnrollment(): boolean {
+		// Records of work that exists only on this device. Taking the server's
+		// copy as the ancestor and writing it over the file discards every one
+		// of them and leaves nothing behind saying they were ever there.
+		if (this._conflict !== null) return false;
+		if (this._fork !== null) return false;
+		if (this._deferredConflict !== undefined) return false;
+		if (this.pendingDiskContents !== null) return false;
+
+		switch (this._statePath) {
+			case "unloaded":
+			case "loading":
+			case "idle.loading":
+				return this._lca === null;
+			case "idle.synced":
+			case "idle.remoteAhead":
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	/**
+	 * Retire the record that a difference was outstanding when the user walked
+	 * away from it.
+	 *
+	 * That record is written when a note carrying a conflict is closed or the
+	 * app quits with one open, and it survives restarts by design — it is the
+	 * only durable evidence that the divergence happened. Nothing ever retired
+	 * it, which was harmless while nothing read it. Now that it refuses the
+	 * server's copy, never retiring it means a note that has long since been
+	 * reconciled goes on refusing a fresh copy for the rest of its life, while
+	 * reading as fully synced.
+	 *
+	 * Once the machine has settled against an ancestor with nothing outstanding
+	 * on this device — no conflict, no unpublished fork, no disk contents still
+	 * to be reconciled — the difference the record describes demonstrably no
+	 * longer exists, so the record is retired and the note can take a copy from
+	 * the server again. Decided from machine state alone: no content is read or
+	 * compared.
+	 */
+	private retireDeferredConflictWhenReconciled(): void {
+		if (this._deferredConflict === undefined) return;
+		if (this._statePath !== "idle.synced") return;
+		if (this._conflict !== null) return;
+		if (this._fork !== null) return;
+		if (this.pendingDiskContents !== null) return;
+		// Without an ancestor nothing has been reconciled against anything, so
+		// a settled-looking state is not evidence.
+		if (this._lca === null) return;
+
+		this._deferredConflict = undefined;
+		this.hsmDebug(
+			`deferred conflict retired: the note reconciled | guid=${this._guid}`,
+		);
+		this.emitPersistState();
+	}
+
+	getConflictInfoSnapshot(): ConflictInfoSnapshot {
+		return toConflictInfoSnapshot({
+			path: this.path,
+			guid: this._guid,
+			statePath: this._statePath,
+			conflictData: this.getConflictData(),
+		});
+	}
+
+	private materializeIdleConflict(): Conflict | null {
+		if (this._conflict) return this._conflict;
+		const init = this.buildIdleConflictInit();
+		if (!init) {
+			this.hsmError(
+				`unable to materialize idle conflict | ${this.describeResourceContext("materializeIdleConflict")}`,
+			);
+			return null;
+		}
+		this._conflict = new Conflict(init);
+		this.pendingIdleUpdates = null;
+		this.emitPersistState();
+		return this._conflict;
+	}
+
+	private materializeRecoverLCAConflict(): Conflict | null {
+		if (this._conflict) {
+			this.emitPersistState();
+			return this._conflict;
+		}
+		const init = this.buildRecoverLCAConflictInit();
+		if (!init) {
+			this.hsmError(
+				`unable to materialize recover-LCA conflict | ${this.describeResourceContext("materializeRecoverLCAConflict")}`,
+			);
+			return null;
+		}
+		this._conflict = new Conflict(init);
+		this.pendingIdleUpdates = null;
+		this.clearPendingDiskContents();
+		this.emitPersistState();
+		return this._conflict;
+	}
+
+	private canMaterializeIdleConflict(): boolean {
+		return this._conflict !== null || this.buildIdleConflictInit() !== null;
+	}
+
+	private canMaterializeRecoverLCAConflict(): boolean {
+		return this._conflict !== null || this.buildRecoverLCAConflictInit() !== null;
+	}
+
+	private getLCAContentsForConflictInit(): string | null {
+		if (!this._lca) return null;
+		if (this._lca.contents === null) {
+			this.hydrateLCAContentsFromMatchingDoc();
+		}
+		return this._lca.contents;
+	}
+
+	private buildIdleConflictInit(): ConflictInit | null {
+		if (!this._lca && !this.hasEnrolledLocalCRDT()) return null;
+		const localDoc = this.localDoc;
+		if (!localDoc) return null;
+		const localText = localDoc.getText("contents").toString();
+		if (this.isNoLCAEmptyEnrollment(localDoc)) return null;
+
+		const remoteText = this.remoteDoc?.getText("contents").toString() ?? null;
+		const diskText = this.pendingDiskContents ?? this.pendingRecoverLCADisk?.content ?? null;
+		const base = this.getLCAContentsForConflictInit();
+
+		if (base !== null && remoteText !== null) {
+			const result = computeConflict(base, localText, remoteText);
+			if (result.hasConflict) {
+				return {
+					base,
+					ours: localText,
+					theirs: remoteText,
+					oursLabel: "Local",
+					theirsLabel: "Remote",
+					regions: result.regions,
+				};
+			}
+		}
+
+		if (diskText !== null && diskText !== localText) {
+			return this.buildTwoWayConflictInit(
+				localText,
+				diskText,
+				"Local",
+				"Local file",
+				base ?? localText,
+			);
+		}
+
+		if (remoteText !== null && remoteText !== localText) {
+			return this.buildTwoWayConflictInit(
+				localText,
+				remoteText,
+				"Local",
+				"Remote",
+				base ?? localText,
+			);
+		}
+
+		return null;
+	}
+
+	private isNoLCAEmptyEnrollment(localDoc: Y.Doc): boolean {
+		return !this._lca && isEmptyDoc(localDoc) && (!this.remoteDoc || isEmptyDoc(this.remoteDoc));
+	}
+
+	private buildRecoverLCAConflictInit(): ConflictInit | null {
+		if (!this._lca && !this.hasEnrolledLocalCRDT()) return null;
+		const localText = this.localDoc?.getText("contents").toString();
+		if (localText === undefined) return null;
+		const remoteText = this.remoteDoc?.getText("contents").toString() ?? null;
+		const diskText = this.pendingRecoverLCADisk?.content ?? this.pendingDiskContents;
+
+		if (
+			diskText !== null &&
+			remoteText !== null &&
+			diskText !== remoteText &&
+			localText !== remoteText
+		) {
+			return this.buildTwoWayConflictInit(
+				diskText,
+				remoteText,
+				"Local",
+				"Remote",
+				localText,
+			);
+		}
+
+		if (remoteText !== null && remoteText !== localText) {
+			return this.buildTwoWayConflictInit(
+				localText,
+				remoteText,
+				"Local",
+				"Remote",
+				localText,
+			);
+		}
+		if (diskText !== null && diskText !== localText) {
+			return this.buildTwoWayConflictInit(
+				localText,
+				diskText,
+				"Local",
+				"Local file",
+				localText,
+			);
+		}
+
+		return null;
+	}
+
+	private buildTwoWayConflictInit(
+		ours: string,
+		theirs: string,
+		oursLabel: string,
+		theirsLabel: string,
+		base: string,
+	): ConflictInit | null {
+		if (ours === theirs) return null;
+		return {
+			base,
+			ours,
+			theirs,
+			oursLabel,
+			theirsLabel,
+			regions: computeTwoWayConflictRegions(ours, theirs),
+		};
+	}
+
+	async resolveConflictContents(contents: string): Promise<StatePath> {
+		if (this._statePath === "idle.diverged" || this._statePath === "idle.conflict") {
+			await this.resolveConflictHeadless(contents);
+			return this._statePath;
+		}
+		if (this._statePath === "active.conflict.bannerShown") {
+			this.send({ type: "OPEN_DIFF_VIEW" });
+		}
+		this.send({ type: "RESOLVE", contents });
+		return this._statePath;
+	}
+
+	async resolveConflictHunk(
+		hunkId: string,
+		resolution: ResolveHunkEvent["resolution"],
+	): Promise<StatePath> {
+		if (typeof hunkId !== "string") {
+			throw new Error(`Hunk id must be a string on ${this.path}`);
+		}
+		const conflictData = this.getConflictData();
+		if (!conflictData?.conflictRegions) {
+			throw new Error(`No active conflict on ${this.path}`);
+		}
+		findConflictRegionOffset(conflictData.conflictRegions, hunkId);
+
+		if (this._statePath === "idle.diverged" || this._statePath === "idle.conflict") {
+			await this.resolveHunkHeadless(hunkId, resolution);
+			return this._statePath;
+		}
+		if (this._statePath === "active.conflict.bannerShown") {
+			this.send({ type: "OPEN_DIFF_VIEW" });
+		}
+		this.send({ type: "RESOLVE_HUNK", hunkId, resolution });
+		return this._statePath;
+	}
+
+	async resolveConflictHeadless(contents: string): Promise<void> {
+		if (this._statePath !== "idle.diverged" && this._statePath !== "idle.conflict") {
+			throw new Error(`resolveConflictHeadless requires idle.diverged or idle.conflict, got ${this._statePath}`);
+		}
+		if (!this.getConflictData()) {
+			throw new Error("resolveConflictHeadless requires an active idle conflict");
+		}
+		const localDoc = this.requireLocalDoc("resolveConflictHeadless");
+		const remoteDoc = this.requireRemoteDoc("resolveConflictHeadless");
+		if (!localDoc || !remoteDoc) {
+			throw new Error("resolveConflictHeadless requires localDoc and remoteDoc");
+		}
+
+		const hash = await this.hashFn(contents);
+		const mtime = this.timeProvider.now();
+		const event: ResolveEvent = { type: "RESOLVE", contents };
+
+		await this.runHeadlessApiMutation(event, () => {
+			const resolvedText = this.applyResolvedConflict(contents, { dispatchEditor: false });
+			if (!this.localDoc) {
+				throw new Error("resolveConflictHeadless requires localDoc");
+			}
+			const snapshot = snapshotFromDoc(this.localDoc).snapshot;
+			this._localSnapshot = snapshot;
+			this._remoteSnapshot = snapshot;
+			this._setLCA({
+				contents: resolvedText,
+				meta: { hash, mtime },
+				snapshot,
+			});
+			this._disk = { hash, mtime };
+			this.emitWriteDisk(resolvedText, hash, mtime);
+			this.setStatePath("idle.synced");
+			this.emitPersistState();
+		});
+	}
+
+	async resolveHunkHeadless(
+		hunkId: string,
+		resolution: ResolveHunkEvent["resolution"],
+	): Promise<void> {
+		if (this._statePath !== "idle.diverged" && this._statePath !== "idle.conflict") {
+			throw new Error(`resolveHunkHeadless requires idle.diverged or idle.conflict, got ${this._statePath}`);
+		}
+		const localDoc = this.requireLocalDoc("resolveHunkHeadless");
+		const remoteDoc = this.requireRemoteDoc("resolveHunkHeadless");
+		if (!localDoc || !remoteDoc) {
+			throw new Error("resolveHunkHeadless requires localDoc and remoteDoc");
+		}
+		if (!this.materializeIdleConflict()) {
+			throw new Error("resolveHunkHeadless requires an active idle conflict");
+		}
+
+		const event: ResolveHunkEvent = { type: "RESOLVE_HUNK", hunkId, resolution };
+		await this.runHeadlessApiMutation(event, () => {
+			this.applyConflictHunkResolution(event, {
+				dispatchEditor: false,
+				autoFinalize: false,
+			});
+		});
+
+		if (this._conflict?.isFullyResolved) {
+			const finalContent = this.localDoc?.getText("contents").toString();
+			if (finalContent === undefined) {
+				throw new Error("resolveHunkHeadless requires localDoc");
+			}
+			await this.resolveConflictHeadless(finalContent);
+		}
+	}
+
+	private readCurrentEditorText(): string | null {
+		if (this._editorViewRef) {
+			try {
+				const actual = this._editorViewRef.getViewData();
+				this.lastKnownEditorText = actual;
+				return actual;
+			} catch {
+				// Fall through to cached state.
+			}
+		}
+		return this.lastKnownEditorText ?? this.pendingEditorContent;
+	}
+
+	/**
+	 * Rebind the HSM to the current editor view after the editor is recreated.
+	 */
+	attachEditorView(editorViewRef: EditorViewRef, currentText?: string): void {
+		this._editorViewRef = editorViewRef;
+		if (currentText !== undefined) {
+			this.lastKnownEditorText = currentText;
+		}
+	}
+
+	captureEditorText(contents: string): void {
+		this.lastKnownEditorText = contents;
+	}
+
+	getRecentIngestedEditorReplacementTexts(): readonly string[] {
+		return this.recentIngestedEditorReplacementTexts;
+	}
+
+	getRemoteDoc(): Y.Doc | null {
+		return this.remoteDoc;
+	}
+
+	/**
+	 * Set or replace the remote YDoc. Used by MergeManager to provide
+	 * a remoteDoc when waking from hibernation.
+	 */
+	setRemoteDoc(doc: Y.Doc | null): void {
+		const oldDoc = this.remoteDoc;
+		this.remoteDoc = doc;
+		if (!doc) {
+			this._bridge.providerSynced = false;
+			this._providerSynced = false;
+		}
+		// Re-wire the SyncBridge inbound handler when remoteDoc changes.
+		// Without this, the handler stays on the old doc and inbound updates
+		// from the new provider are not queued (only caught by the safety net).
+		if (doc && doc !== oldDoc) {
+			this._bridge.rewireRemoteDoc();
+		}
+	}
+
+	// ===========================================================================
+	// SyncBridgeHost Implementation
+	// ===========================================================================
+
+	/** @internal Used by SyncBridge */
+	emitEffect(effect: MergeEffect): void {
+		this._pendingEffects?.push(effect);
+		this._effects.emit(effect);
+	}
+
+	/** @internal Used by SyncBridge */
+	emitStateChange(): void {
+		this._stateChanges.emit(this.state);
+	}
+
+	/** @internal Used by SyncBridge */
+	getPendingMachineEdits(): ReadonlyArray<{
+		fn: (data: string) => string;
+		expectedText: string;
+		captureMark: number;
+		registeredAt: number;
+	}> {
+		return this._pendingMachineEdits;
+	}
+
+	/** @internal Used by SyncBridge */
+	matchMachineEdit(remoteText: string): typeof this._pendingMachineEdits[number] | null {
+		return this._matchMachineEdit(remoteText);
+	}
+
+	/** @internal Used by SyncBridge */
+	removeMachineEdit(entry: { captureMark: number }): void {
+		const idx = this._pendingMachineEdits.findIndex(
+			e => e.captureMark === entry.captureMark,
+		);
+		if (idx >= 0) {
+			this._pendingMachineEdits.splice(idx, 1);
+			this.notifyMachineEditDrainWaiters();
+		}
+	}
+
+	/** @internal Used by SyncBridge */
+	computeDiffChanges(from: string, to: string): PositionedChange[] {
+		return computeDiffMatchPatchChanges(from, to);
+	}
+
+	/** @internal Used by SyncBridge */
+	applyChangesToLocalDoc(changes: PositionedChange[]): void {
+		if (!this.localDoc || changes.length === 0) return;
+		const ytext = this.localDoc.getText("contents");
+		this.localDoc.transact(() => {
+			this.applyChangesToYText(ytext, changes);
+		});
+	}
+
+	/** @internal Used by SyncBridge */
+	isSuppressLocalObserver(): boolean {
+		return this._suppressLocalObserver;
+	}
+
+	/** @internal Used by SyncBridge */
+	setSuppressLocalObserver(value: boolean): void {
+		this._suppressLocalObserver = value;
+	}
+
+	private withLocalObserverSuppressed<T>(fn: () => T): T {
+		const wasSuppressed = this._suppressLocalObserver;
+		this._suppressLocalObserver = true;
+		try {
+			return fn();
+		} finally {
+			this._suppressLocalObserver = wasSuppressed;
+		}
+	}
+
+	/**
+	 * Wait for any in-progress cleanup to complete.
+	 * Returns immediately if no cleanup is in progress.
+	 * Used by MergeManager to ensure state transitions complete before returning.
+	 */
+	async awaitCleanup(): Promise<void> {
+		await this.awaitAsync('cleanup');
+	}
+
+	/**
+	 * Wait for any pending idle auto-merge operation to complete.
+	 * Returns immediately if no auto-merge is in progress.
+	 */
+	async awaitIdleAutoMerge(): Promise<void> {
+		await this.awaitAsync('idle-merge');
+	}
+
+	/**
+	 * Wait for any pending fork reconciliation to complete.
+	 * Returns immediately if no fork-reconcile is in progress.
+	 */
+	async awaitForkReconcile(): Promise<void> {
+		await this.awaitAsync('fork-reconcile');
+	}
+
+	/**
+	 * Register a machine edit (vault.process) for deferred sync with rewind.
+	 *
+	 * Pre-computes the expected result text and bookmarks OpCapture so that
+	 * when matching remote ops arrive, the local ops can be reversed
+	 * (rewound) instead of producing duplicates.
+	 *
+	 * @param fn - The text transform function from vault.process()
+	 */
+	async registerMachineEdit(fn: (data: string) => string): Promise<void> {
+		// Active mode: existing behavior (machine-edit deferral via SyncBridge)
+		if (this._statePath === "active.tracking") {
+			if (!this.localDoc) return;
+			const ytext = this.localDoc.getText("contents");
+			const currentText = ytext.toString();
+
+			let expectedText: string;
+			try {
+				expectedText = fn(currentText);
+			} catch {
+				return;
+			}
+
+			// fn is a no-op for this file — skip registration
+			if (expectedText === currentText) return;
+
+			const opCapture = this.getOpCapture();
+			const captureMark = opCapture?.mark() ?? 0;
+
+			this._pendingMachineEdits.push({
+				fn,
+				expectedText,
+				captureMark,
+				registeredAt: this.timeProvider.now(),
+				teardownCompletion: this.buildMachineEditTeardownCompletion(
+					currentText,
+					expectedText,
+				),
+			});
+
+			this.hsmDebug(
+				`registerMachineEdit | guid=${this._guid} | ` +
+				`expectedLen=${expectedText.length} | captureMark=${captureMark} | ` +
+				`pendingCount=${this._pendingMachineEdits.length}`
+			);
+
+			// Schedule expiry check at TTL + 100ms
+			const MACHINE_EDIT_TTL = 5000;
+			this.timeProvider.setTimeout(() => {
+				this.expireMachineEdits();
+			}, MACHINE_EDIT_TTL + 100);
+			return;
+		}
+
+		// Idle mode: pre-create fork to gate remote ops.
+		// Two phases: (1) set fork synchronously using LCA to gate REMOTE_UPDATE
+		// via hasFork, (2) await persistence sync so OpCapture is functional,
+		// then set the real captureMark.
+		if (!this._statePath.startsWith("idle.") || this._fork || !this._lca) return;
+
+		if (this._lca.contents === null && !this.localDoc) {
+			this.ensureLocalDocForIdle();
+			if (this.localPersistence && !this.localPersistence.synced) {
+				await this.awaitLocalPersistenceWhenSynced();
+			}
+			if (!this._statePath.startsWith("idle.") || this._fork || !this._lca) return;
+		}
+
+		const baseText = this.requireLcaContents("registerMachineEdit idle");
+		if (baseText === null) return;
+
+		let expectedText: string;
+		try {
+			expectedText = fn(baseText);
+		} catch {
+			return;
+		}
+		if (expectedText === baseText) return;
+
+		// Phase 1: synchronous. Create localDoc + localPersistence, set fork
+		// with placeholder captureMark. hasFork gates REMOTE_UPDATE immediately.
+		this.ensureLocalDocForIdle();
+
+		this._fork = {
+			base: baseText,
+			localSnapshot: this._lca.snapshot,
+			remoteSnapshot: this.remoteDoc
+				? snapshotFromDoc(this.remoteDoc).snapshot
+				: this._remoteSnapshot ?? emptySnapshot(),
+			origin: 'machine-edit',
+			created: this.timeProvider.now(),
+			captureMark: 0,
+			machineEditFn: fn,
+		};
+
+		// Phase 2: async. Wait for IDB to load so OpCapture is wired to a
+		// populated doc. Then set the real captureMark and localSnapshot.
+		if (this.localPersistence && !this.localPersistence.synced) {
+			await this.awaitLocalPersistenceWhenSynced();
+		}
+
+		// Guard: state may have changed during the await
+		if (!this._fork || !this.localDoc) return;
+
+		this._fork.captureMark = this.getOpCapture()?.mark() ?? 0;
+		this._fork.localSnapshot = snapshotFromDoc(this.localDoc).snapshot;
+
+		this.hsmDebug(
+			`registerMachineEdit (idle fork) | guid=${this._guid} | ` +
+			`state=${this._statePath} | captureMark=${this._fork.captureMark}`
+		);
+	}
+
+	/**
+	 * Wait for the HSM to reach a state matching the given predicate.
+	 * Returns immediately if already in a matching state.
+	 *
+	 * @param predicate - Function that returns true when the desired state is reached
+	 */
+	async awaitState(predicate: (statePath: string) => boolean): Promise<void> {
+		if (predicate(this._statePath)) {
+			return;
+		}
+		// Destroy drives the machine to the terminal "destroyed" state and cancels
+		// these waiters; a predicate not yet satisfied never will be. Reject so
+		// external waiters (view plugins, BackgroundSync) do not hang.
+		if (this.isDestroyed()) {
+			throw this.destroyedReason();
+		}
+
+		const signal = this._lifetime.signal;
+		return new Promise<void>((resolve, reject) => {
+			let unsubscribe: (() => void) | null = null;
+			let settled = false;
+			const cleanup = () => {
+				unsubscribe?.();
+				unsubscribe = null;
+				signal.removeEventListener("abort", onAbort);
+			};
+			const finish = (fn: () => void) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				fn();
+			};
+			const onAbort = () => {
+				finish(() => reject(this.destroyedReason()));
+			};
+
+			signal.addEventListener("abort", onAbort, { once: true });
+			unsubscribe = this.stateChanges.subscribe((state) => {
+				if (predicate(state.statePath)) {
+					finish(resolve);
+				} else if (state.statePath === "destroyed") {
+					finish(() => reject(this.destroyedReason()));
+				}
+			});
+		});
+	}
+
+	/**
+	 * Wait for the HSM to reach an idle state.
+	 * Returns immediately if already in idle state.
+	 * Used to ensure HSM is ready before acquiring lock.
+	 */
+	async awaitIdle(): Promise<void> {
+		return this.awaitState((s) => s.startsWith("idle."));
+	}
+
+	/**
+	 * Wait for the HSM to reach active.tracking state.
+	 * Returns immediately if already in active.tracking.
+	 * Used after sending ACQUIRE_LOCK to wait for lock acquisition to complete.
+	 * Safe to call from loading state.
+	 */
+	async awaitActive(): Promise<void> {
+		// Resolve for post-entering active states only. The entering substates
+		// (awaitingPersistence, reconciling) must complete before
+		// acquireLock() returns, so that ProviderIntegration and other setup can
+		// safely use localDoc.
+		return this.awaitState(
+			(s) =>
+				s.startsWith("active.") &&
+				!s.startsWith("active.entering.") &&
+				s !== "active.entering" &&
+				s !== "active.loading",
+		);
+	}
+
+	/**
+	 * Enroll remote CRDT bytes into localDoc. Does not set LCA.
+	 */
+	async initializeFromRemote(
+		updateBytes: Uint8Array,
+	): Promise<boolean> {
+		await this.ensurePersistence();
+		const persistence = this.localPersistence;
+		if (!persistence?.initializeFromRemote || !this.hasUsableLocalDoc()) {
+			return false;
+		}
+
+		const didInitialize = await persistence.initializeFromRemote(
+			updateBytes,
+			this.remoteDoc,
+		);
+
+		if (didInitialize) {
+			if (!this.hasUsableLocalDoc()) {
+				return false;
+			}
+			const localSnapshot = snapshotFromDoc(this.localDoc!).snapshot;
+			this._localSnapshot = localSnapshot;
+			this.rememberEnrolledLocalHead(localSnapshot);
+			this._localDocSnapshotSafe = true;
+			this.emitPersistState();
+		}
+
+		return didInitialize;
+	}
+
+	/**
+	 * Snapshot the current localDoc as the LCA.
+	 */
+	async setLCA(): Promise<void> {
+		if (!this.localDoc) return;
+		const content = this.localDoc.getText("contents").toString();
+		const hash = await this.hashFn(content);
+		this._setLCA({
+			contents: content,
+			meta: { hash, mtime: Date.now() },
+			snapshot: snapshotFromDoc(this.localDoc).snapshot,
+		});
+		this.emitPersistState();
+	}
+
+	/**
+	 * Cold-answerable server-head comparison. Answers from the machine's own
+	 * basis — the live localDoc head when warm, persisted meta (the local
+	 * head, or the LCA head for a clean hibernated document whose own head
+	 * was compacted away) when cold — with no materialization and no
+	 * persistence loads. "current" proves convergence with the head; "ahead"
+	 * proves divergence in either direction (the machine resolves direction
+	 * when it acts); "unknown" means no basis exists — no basis for
+	 * skipping, so callers treat it as ahead.
+	 */
+	compareServerHead(head: YjsSnapshot): "ahead" | "current" | "unknown" {
+		const basis = this.serverCompareBasis();
+		if (!basis) return "unknown";
+		try {
+			return snapshotsEqual(head, basis) ? "current" : "ahead";
+		} catch {
+			return "unknown";
+		}
+	}
+
+	/** Work-relevant state for the shared sync-machine contract. */
+	getWorkState(): SyncWorkState {
+		return {
+			userLock: this.isActive(),
+			workPending: this._serverHeadPending,
+			baseline: this._lca !== null,
+		};
+	}
+
+	/**
+	 * Record the newest server head without acting on it. The live provider
+	 * session that observed the head performs its own convergence; this only
+	 * keeps the machine's retained head fresh for later comparisons.
+	 */
+	noteServerHead(head: YjsSnapshot): void {
+		this._serverHead = head;
+	}
+
+	/**
+	 * Compare the newest server head this machine has heard against its own
+	 * basis. "unknown" when no head has been received; sweeps treat it as
+	 * work.
+	 */
+	compareRetainedServerHead(): "ahead" | "current" | "unknown" {
+		return this._serverHead
+			? this.compareServerHead(this._serverHead)
+			: "unknown";
+	}
+
+	/**
+	 * A seed update for a freshly created remote replica: the localDoc
+	 * bounded by the retained server head, so the seed cannot introduce
+	 * local-only CRDT state.
+	 */
+	getRemoteDocSeedUpdate(): Uint8Array | null {
+		if (!this._serverHead || !this.localDoc) return null;
+		return seedUpdateBoundedByHead(this.localDoc, this._serverHead);
+	}
+
+	/**
+	 * Get the current sync status for this document.
+	 */
+	getSyncStatus(): SyncStatus {
+		return {
+			guid: this._guid,
+			status: this.computeSyncStatusType(),
+			diskMtime: this._disk?.mtime ?? 0,
+			localSnapshot: this._localSnapshot ?? emptySnapshot(),
+			remoteSnapshot: this._remoteSnapshot ?? emptySnapshot(),
+		};
+	}
+
+	/**
+	 * Try to establish the initial LCA for an upgraded/no-LCA document after a
+	 * sync/download job has made remote state available. This is intentionally
+	 * conservative: it only captures a baseline from a Yjs snapshot that is
+	 * provably equal to, or an ancestor of, the synced remote document.
+	 */
+	async bootstrapLCAFromDisk(disk: {
+		content: string;
+		hash: string;
+		mtime: number;
+	}): Promise<boolean> {
+		if (this._lca) return true;
+
+		await this.ensurePersistence();
+		if (this._lca) return true;
+
+		if (!this.remoteDoc) {
+			this.crdtLog(`bootstrapLCA skipped | guid=${this._guid} reason=missing-remote-doc`);
+			return false;
+		}
+
+		if (!this.hasEnrolledLocalCRDT() && !this.canRecoverMissingLocalCRDTFromRemote()) {
+			this.crdtLog(`bootstrapLCA skipped | guid=${this._guid} reason=local-crdt-not-enrolled`);
+			return false;
+		}
+
+		this.send({ type: "RECOVER_LCA", disk });
+		await this.awaitAsync("recover-lca");
+		return this._lca !== null || this.getSyncStatus().status !== "pending";
+	}
+
+	/**
+	 * Ensure localDoc and localPersistence exist, awaiting persistence sync.
+	 */
+	private async ensurePersistence(): Promise<void> {
+		if (!this.localDoc) {
+			this.localDoc = this.createLocalDoc();
+			this._localDocSnapshotSafe = false;
+			if (this._localDocClientID !== null) {
+				this.localDoc.clientID = this._localDocClientID;
+			}
+		}
+		if (!this.localPersistence) {
+			this.localPersistence = this._createPersistence(
+				this.vaultId,
+				this.localDoc,
+				this._captureOpts,
+			);
+		}
+		const persistence = this.localPersistence;
+		await this.awaitLocalPersistenceSynced();
+		if (this.localPersistence === persistence) {
+			this.refreshLocalSnapshotFromDoc();
+		}
+	}
+
+	private async awaitLocalPersistenceSynced(
+		signal?: AbortSignal,
+	): Promise<void> {
+		const persistence = this.localPersistence;
+		if (!persistence || persistence.synced) return;
+
+		await new Promise<void>((resolve, reject) => {
+			let settled = false;
+			const abortSignal = signal ?? this._lifetime.signal;
+			const cleanup = () => {
+				abortSignal.removeEventListener("abort", abort);
+			};
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				resolve();
+			};
+			const fail = (error: unknown) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				reject(error instanceof Error ? error : new Error(String(error)));
+			};
+			const abort = () => {
+				fail(this._destroyedReason ?? new Error("operation aborted"));
+			};
+
+			if (abortSignal.aborted) {
+				abort();
+				return;
+			}
+			abortSignal.addEventListener("abort", abort, { once: true });
+
+			try {
+				persistence.once("synced", finish);
+			} catch (error) {
+				fail(error);
+				return;
+			}
+			persistence.whenSynced.then(finish, fail);
+		});
+	}
+
+	private async awaitLocalPersistenceWhenSynced(
+		signal?: AbortSignal,
+	): Promise<void> {
+		const persistence = this.localPersistence;
+		if (!persistence || persistence.synced) return;
+		await this.awaitAbortable(persistence.whenSynced, signal ?? this._lifetime.signal);
+	}
+
+	private async awaitAbortable<T>(
+		promise: Promise<T>,
+		signal: AbortSignal,
+	): Promise<T> {
+		if (signal.aborted) {
+			throw this._destroyedReason ?? new Error("operation aborted");
+		}
+
+		return new Promise<T>((resolve, reject) => {
+			let settled = false;
+			const cleanup = () => {
+				signal.removeEventListener("abort", abort);
+			};
+			const finish = (fn: () => void) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				fn();
+			};
+			const abort = () => {
+				finish(() => reject(this._destroyedReason ?? new Error("operation aborted")));
+			};
+
+			signal.addEventListener("abort", abort, { once: true });
+			promise.then(
+				(value) => finish(() => resolve(value)),
+				(error: Error) => finish(() => reject(error)),
+			);
+		});
+	}
+
+	private hasUsableLocalDoc(): boolean {
+		return !!this.localDoc && this.localDoc.store != null;
+	}
+
+	/**
+	 * Initialize document with content if not already initialized.
+	 * Lazily loads disk content via diskLoader only when initialization is needed.
+	 * Sets LCA after initialization for merge tracking.
+	 *
+	 * @returns true if initialization happened, false if already initialized
+	 */
+	async initializeWithContent(): Promise<boolean> {
+		await this.ensurePersistence();
+
+		// Cache diskLoader result so we don't read disk twice
+		let cachedDiskContent: {
+			content: string;
+			hash: string;
+			mtime: number;
+		} | null = null;
+		const cachingLoader = async () => {
+			if (!cachedDiskContent) {
+				cachedDiskContent = await this._diskLoader();
+			}
+			return cachedDiskContent;
+		};
+
+		// Use persistence's initializeWithContent which checks origin in same IDB session
+		const didEnroll = await this.localPersistence!.initializeWithContent!(cachingLoader);
+		if (didEnroll) {
+			// This transaction created the document, so its disk text is the
+			// causal baseline. Returning clients wait for provider sync before
+			// deriving a missing map from reconciled text.
+			this.seedFrontmatterMapFromCurrentText(true);
+		}
+
+		if (didEnroll && cachedDiskContent) {
+			// Enrollment happened - set LCA to match initial content
+			const { content, hash, mtime } = cachedDiskContent;
+			this.sendEnrollmentComplete({
+				contents: content,
+				hash,
+				mtime,
+				snapshot: snapshotFromDoc(this.localDoc!).snapshot,
+			});
+		}
+
+		return didEnroll;
+	}
+
+	async completeInitialEnrollmentFromDisk(disk: {
+		content: string;
+		hash: string;
+		mtime: number;
+	}): Promise<boolean> {
+		if (this._lca) return true;
+		await this.ensurePersistence();
+		if (this._lca) return true;
+		if (!this.localDoc || !this.hasEnrolledLocalCRDT()) return false;
+
+		const localText = this.localDoc.getText("contents").toString();
+		if (localText !== disk.content) {
+			this.hsmWarn(
+				`initial enrollment LCA skipped: disk/local mismatch | ` +
+					`guid=${this._guid} state=${this._statePath} ` +
+					`diskLen=${disk.content.length} localLen=${localText.length}`,
+			);
+			return false;
+		}
+
+		this.sendEnrollmentComplete({
+			contents: disk.content,
+			hash: disk.hash,
+			mtime: disk.mtime,
+			snapshot: snapshotFromDoc(this.localDoc).snapshot,
+		});
+		return this._lca !== null;
+	}
+
+	private captureCleanInitialLCA(disk: {
+		content: string;
+		hash: string;
+		mtime: number;
+	}): boolean {
+		if (this._lca) return true;
+		if (!this.localDoc || !this.hasEnrolledLocalCRDT()) return false;
+
+		const localText = this.localDoc.getText("contents").toString();
+		if (localText !== disk.content) {
+			this.hsmWarn(
+				`clean initial LCA skipped: disk/local mismatch | ` +
+					`guid=${this._guid} state=${this._statePath} ` +
+					`diskLen=${disk.content.length} localLen=${localText.length}`,
+			);
+			return false;
+		}
+
+		const snapshot = snapshotFromDoc(this.localDoc).snapshot;
+		this._setLCA({
+			contents: disk.content,
+			meta: { hash: disk.hash, mtime: disk.mtime },
+			snapshot,
+		});
+		if (!this._lca) return false;
+
+		this.rememberEnrolledLocalHead(snapshot);
+		this._localDocSnapshotSafe = true;
+		this._disk = { hash: disk.hash, mtime: disk.mtime };
+		this._localSnapshot = snapshot;
+		if (this.remoteDoc) {
+			this._remoteSnapshot = snapshotFromDoc(this.remoteDoc).snapshot;
+		}
+		this.emitPersistState();
+		return true;
+	}
+
+	async completeInitialEnrollmentFromRemote(content: string): Promise<boolean> {
+		if (this._lca) return true;
+		await this.ensurePersistence();
+		if (this._lca) return true;
+		// Re-asked after the await: work that arrived while persistence was
+		// loading must not be settled by an enrollment that started before it.
+		// Completing here would take the ancestor from the server and leave
+		// whatever this device had outstanding with nothing recording it.
+		if (!this.acceptsRemoteEnrollment) {
+			this.hsmWarn(
+				`initial remote enrollment refused: the document is not in a state that accepts one | ` +
+					`guid=${this._guid} state=${this._statePath}`,
+			);
+			return false;
+		}
+		if (!this.localDoc || !this.hasEnrolledLocalCRDT()) return false;
+
+		const localText = this.localDoc.getText("contents").toString();
+		if (localText !== content) {
+			this.hsmWarn(
+				`initial remote enrollment LCA skipped: remote/local mismatch | ` +
+					`guid=${this._guid} state=${this._statePath} ` +
+					`remoteLen=${content.length} localLen=${localText.length}`,
+			);
+			return false;
+		}
+
+		const hash = await this.hashFn(content);
+		// Re-asked after the await: a disk change that arrived while the hash
+		// was computing must not be settled by an enrollment that started
+		// before it. Completing here would take the ancestor from the server,
+		// record the enrollment's own hash and mtime as the disk's, and erase
+		// the only record that the file had already moved on.
+		if (!this.acceptsRemoteEnrollment) {
+			this.hsmWarn(
+				`initial remote enrollment refused after hashing: the document is no longer in a state that accepts one | ` +
+					`guid=${this._guid} state=${this._statePath}`,
+			);
+			return false;
+		}
+		this.sendEnrollmentComplete({
+			contents: content,
+			hash,
+			mtime: this.timeProvider.now(),
+			snapshot: snapshotFromDoc(this.localDoc).snapshot,
+		});
+		return this._lca !== null;
+	}
+
+	private sendEnrollmentComplete(input: {
+		contents: string;
+		hash: string;
+		mtime: number;
+		snapshot: Uint8Array;
+	}): void {
+		this.send({
+			type: "ENROLLMENT_COMPLETE",
+			lca: {
+				contents: input.contents,
+				meta: { hash: input.hash, mtime: input.mtime },
+				snapshot: input.snapshot,
+			},
+			localSnapshot: input.snapshot,
+			remoteSnapshot: this.remoteDoc
+				? snapshotFromDoc(this.remoteDoc).snapshot
+				: null,
+		});
+	}
+
+	/**
+	 * Check for drift between editor and localDoc, correcting if needed.
+	 * Returns true if drift was detected and corrected.
+	 *
+	 * When actualEditorText is provided, it is used instead of the cached
+	 * lastKnownEditorText. This is important because lastKnownEditorText
+	 * is only updated via CM6_CHANGE events — if a change bypasses that
+	 * path (e.g. Obsidian's metadata renderer calling setViewData), the
+	 * cached value will be stale.
+	 */
+	checkAndCorrectDrift(actualEditorText?: string): boolean {
+		if (this._statePath !== "active.tracking") {
+			return false;
+		}
+
+		if (!this.localDoc) {
+			return false;
+		}
+
+		const editorText = actualEditorText ?? this.lastKnownEditorText;
+		if (editorText === null) {
+			return false;
+		}
+
+		// Update cached value if caller provided actual editor text
+		if (actualEditorText !== undefined) {
+			this.lastKnownEditorText = actualEditorText;
+		}
+
+		// Compare against raw Y.Text — the Y.Map may be stale if edits
+		// arrived through paths that didn't call syncFrontmatterToMap.
+		const yjsText = this.localDoc.getText("contents").toString();
+
+		if (editorText === yjsText) {
+			return false; // No drift
+		}
+
+		// Drift detected — this indicates a bug in the sync pipeline.
+		// Log diagnostics so the root cause can be investigated.
+		this.send({
+			type: "DRIFT_CHECK",
+			editorLen: editorText.length,
+			yjsLen: yjsText.length,
+			delta: editorText.length - yjsText.length,
+		});
+		this.logDrift(editorText, yjsText);
+
+		this.send({
+			type: "MERGE_CONFLICT",
+			origin: "drift",
+			base: yjsText,
+			ours: yjsText,
+			theirs: editorText,
+			oursLabel: "Remote",
+			theirsLabel: "Local",
+			conflictRegions: [],
+		});
+
+		return true;
+	}
+
+	/**
+	 * Log drift diagnostic to both relay log and HSM recording.
+	 * Captures editor text, CRDT text, and the diff for debugging.
+	 */
+	private logDrift(editorText: string, yjsText: string): void {
+		const driftLog = curryLog(`[MergeHSM:DRIFT:${this._guid}]`, "warn");
+		driftLog(
+			`Editor and localDoc diverged during active.tracking. ` +
+			`Editor: ${editorText.length} chars, localDoc: ${yjsText.length} chars, ` +
+			`delta: ${editorText.length - yjsText.length} chars. ` +
+			`Correcting editor to match localDoc.`,
+		);
+
+		// Write structured diagnostic to HSM recording file (standard format)
+		recordHSMEntry({
+			ns: "mergeHSM",
+			ts: new Date().toISOString(),
+			guid: this._guid,
+			path: this.path,
+			event: "DRIFT_DETECTED",
+			from: this._statePath,
+			to: this._statePath,
+			editorLength: editorText.length,
+			yjsLength: yjsText.length,
+			editorPreview: editorText.substring(0, 200),
+			yjsPreview: yjsText.substring(0, 200),
+		});
+	}
+
+	/**
+	 * Observable of effects emitted by the HSM (per spec).
+	 */
+	get effects(): IObservable<MergeEffect> {
+		return this._effects;
+	}
+
+	/**
+	 * Observable of state changes (per spec).
+	 */
+	get stateChanges(): IObservable<MergeState> {
+		return this._stateChanges;
+	}
+
+	/**
+	 * Subscribe to effects (convenience method, equivalent to effects.subscribe).
+	 */
+	subscribe(listener: (effect: MergeEffect) => void): () => void {
+		return this._effects.subscribe(listener);
+	}
+
+	/** Record a successful executor write without routing idle bookkeeping through the machine. */
+	confirmDiskWrite(identity: { hash: string; mtime: number }): void {
+		if (this._statePath === "destroyed") return;
+		if (this._statePath === "active.tracking") {
+			this.send({ type: "SAVE_COMPLETE", ...identity });
+			return;
+		}
+		this.updateDiskFromConfirmedWrite(identity);
+		this.commitPendingLCAOnDiskConfirm(identity);
+	}
+
+	/**
+	 * Send the current localDoc text to a newly attached editor view.
+	 * Only valid once active mode has finished reconciling and localDoc is
+	 * authoritative for all open editors.
+	 */
+	bootstrapEditorView(viewId: string, currentText?: string): void {
+		if (this._statePath !== "active.tracking") {
+			return;
+		}
+		if (!this.localDoc) {
+			return;
+		}
+
+		const localText = this.localDoc.getText("contents").toString();
+		if (currentText !== undefined && currentText === localText) {
+			return;
+		}
+
+		this.emitEffect({
+			type: "SET_CM6",
+			targetView: viewId,
+			text: localText,
+		});
+	}
+
+	/**
+	 * Subscribe to state changes with detailed transition information.
+	 */
+	onStateChange(
+		listener: (from: StatePath, to: StatePath, event: MergeEvent) => void,
+	): () => void {
+		this.stateChangeListeners.push(listener);
+		return () => {
+			const index = this.stateChangeListeners.indexOf(listener);
+			if (index >= 0) {
+				this.stateChangeListeners.splice(index, 1);
+			}
+		};
+	}
+
+	// ===========================================================================
+	// MachineHSM Interface (for declarative interpreter)
+	// ===========================================================================
+
+	get statePath(): StatePath {
+		return this._statePath;
+	}
+
+	/**
+	 * Transition to a new state path. Called by the interpreter during
+	 * transition execution. Updates statePath and emits STATUS_CHANGED
+	 * if the sync status category changes.
+	 */
+	setStatePath(target: StatePath): void {
+		const oldStatus = this.lastSyncStatus;
+		// Converging to idle.synced means the note is reconciled: drop any
+		// materialized conflict/error so a stale conflict cannot surface a phantom
+		// "Open to resolve" row (which resolveConflict no-ops in idle.synced) or
+		// trip the idle.synced resource contract on every later transition.
+		// Convergence exits (fork-reconcile, idle-merge) reach idle.synced through
+		// here, not only the DISK_CHANGED recompute that runs clearConflictForRecompute.
+		if (target === "idle.synced") {
+			this._conflict = null;
+			this._error = undefined;
+		}
+		// Entering active.tracking is the active path's convergence point: every
+		// external route into it (clean two-way merge, successful three-way
+		// merge, conflict resolution or dismissal) supersedes a stored idle-mode
+		// error, so drop it — otherwise a document that failed idle
+		// reconciliation and then healed through the active path keeps
+		// reporting the stale error indefinitely. Internal self-transitions
+		// (e.g. the ERROR self-loop that stores a fresh error while tracking)
+		// never reach setStatePath, so errors stored while tracking survive.
+		if (target === "active.tracking") {
+			this._error = undefined;
+			this._errorRetryable = false;
+		}
+		this._statePath = target;
+
+		const newStatus = this.computeSyncStatusType();
+		if (oldStatus !== newStatus) {
+			this.lastSyncStatus = newStatus;
+			this.emitEffect({
+				type: "STATUS_CHANGED",
+				guid: this._guid,
+				status: this.getSyncStatus(),
+			});
+		}
+	}
+
+	getActiveInvoke(): ActiveInvoke | null {
+		return this._activeInvoke;
+	}
+
+	setActiveInvoke(invoke: ActiveInvoke | null): void {
+		// Sync with _asyncOps so awaitIdleAutoMerge()/awaitCleanup() continue to work
+		if (this._activeInvoke) {
+			this._asyncOps.delete(this._activeInvoke.id);
+		}
+		this._activeInvoke = invoke;
+		if (invoke && invoke.promise) {
+			const promise = invoke.promise.finally(() => {
+				// Clean up from _asyncOps when promise settles
+				const current = this._asyncOps.get(invoke.id);
+				if (current?.controller === invoke.controller) {
+					this._asyncOps.delete(invoke.id);
+				}
+				if (this._activeInvoke?.controller === invoke.controller) {
+					this._activeInvoke = null;
+				}
+			});
+			this._asyncOps.set(invoke.id, { controller: invoke.controller, promise });
+		}
+	}
+
+	isDestroyed(): boolean {
+		return !this._lifetime.active;
+	}
+
+	onDestroyed(listener: () => void): () => void {
+		return this._lifetime.onEnded(() => listener());
+	}
+
+	private destroyedReason(): Error {
+		if (!this._destroyedReason) {
+			this._destroyedReason = new Error(`MergeHSM destroyed: ${this._guid}`);
+		}
+		return this._destroyedReason;
+	}
+
+	private isTeardownProgressEvent(event: MergeEvent): boolean {
+		const type = event.type;
+		return (
+			type === "UNLOAD" ||
+			type.startsWith("done.invoke.") ||
+			type.startsWith("error.invoke.")
+		);
+	}
+
+	destroy(): void {
+		if (this.isDestroyed()) return;
+		const reason = this.destroyedReason();
+
+		// Persist best-effort while localDoc is still alive.
+		if (this.localDoc) {
+			try {
+				this.emitPersistState();
+			} catch (error) {
+				this.hsmError(`Error persisting state during destroy: ${describeError(error)}`);
+			}
+		}
+
+		// Stop any non-cleanup invoke so stale merges stop touching localDoc. A
+		// running cleanup invoke is left alone so the machine can route it onward.
+		for (const [id, op] of Array.from(this._asyncOps.entries())) {
+			if (id === "cleanup") continue;
+			op.controller.abort();
+			this._asyncOps.delete(id);
+		}
+		if (this._activeInvoke && this._activeInvoke.id !== "cleanup") {
+			this._activeInvoke.controller.abort();
+			this._activeInvoke = null;
+		}
+
+		// Resource teardown is owned by the state machine: drive it to the
+		// terminal "destroyed" state, whose cleanup invoke runs destroyLocalDoc.
+		// Assign the promise before ending the lifetime so terminal-edge listeners
+		// (onEnded waiters that await awaitCleanupSettled) observe a real promise.
+		this._destroyPromise = this.driveToDestroyed()
+			.catch((error) => {
+				this.hsmError(`Error during destroy teardown: ${error}`);
+			})
+			.then(() => {
+				this._effects.clear();
+				this._stateChanges.clear();
+				this.stateChangeListeners = [];
+				this._onTransition = undefined;
+				this._pendingEffects = null;
+			});
+
+		// Intent edge: abort in-flight waiters/persistence I/O and notify
+		// onEnded listeners. Done last so driveToDestroyed's synchronous UNLOAD
+		// (a teardown-progress event) is not dropped by the send() gate.
+		this._lifetime.end(reason);
+	}
+
+	private async driveToDestroyed(): Promise<void> {
+		if (this._statePath === "destroyed") return;
+		// A cleanup invoke may already be running (e.g. a release from a prior
+		// RELEASE_LOCK). The machine ignores events while "unloading", so let it
+		// settle first, then issue UNLOAD — the ended lifetime routes the unload
+		// cleanup to the terminal "destroyed" state.
+		if (this._statePath === "unloading") {
+			await this.awaitStatePath((s) => s !== "unloading");
+		}
+		this.send({ type: "UNLOAD" });
+		await this.awaitStatePath((s) => s === "destroyed");
+	}
+
+	// Raw state wait for teardown. Unlike awaitState() it never rejects on
+	// teardown — it resolves only when the predicate holds — because it drives
+	// the machine toward the terminal state instead of awaiting from outside.
+	private awaitStatePath(
+		predicate: (statePath: string) => boolean,
+	): Promise<void> {
+		if (predicate(this._statePath)) return Promise.resolve();
+		return new Promise<void>((resolve) => {
+			const unsubscribe = this.stateChanges.subscribe((state) => {
+				if (predicate(state.statePath)) {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+	}
+
+	// ===========================================================================
+	// Declarative Machine: Guards, Actions, Invoke Sources
+	// ===========================================================================
+
+	private buildGuards(): Record<string, GuardFn> {
+		return {
+			// Idle state determination (for always transitions in idle.loading)
+			allSyncedAtLoad: () => {
+				if (this.needsDiskContentAtLoad()) return false;
+				if (!this._lca) {
+					return this.noLCACanSettleAsSyncedAtLoad();
+				}
+				return !this.hasLocalChangedSinceLCA() && !this.hasDiskChangedSinceLCA() && !this.hasRemoteChangedSinceLCA();
+			},
+			localAheadAtLoad: () => {
+				// Persisted fork means we were in localAhead before — go straight
+				// back after this session has read and ingested the current disk.
+				if (this._fork) return !this.needsDiskContentAtLoad();
+				if (this.needsDiskContentAtLoad()) return false;
+				if (!this._lca) {
+					if (this.pendingIdleUpdates !== null || (this.remoteDoc && !isEmptyDoc(this.remoteDoc))) return false;
+					return this.hasEnrolledLocalCRDT();
+				}
+				return this.hasLocalChangedSinceLCA() && !this.hasDiskChangedSinceLCA() && !this.hasRemoteChangedSinceLCA();
+			},
+			restoredForkHasFreshDiskContents: () =>
+				this._fork !== null && this.hasSessionFreshDiskContents(),
+			shouldWakeLCARecoveryAfterPersistenceSynced: (_hsm, event) =>
+				this.shouldWakeLCARecoveryAfterPersistenceSynced(payload(event).hasContent === true),
+			noLCADiskConflictAtLoad: () => {
+				if (this._lca || this.pendingDiskContents === null) return false;
+				if (!this.localDoc || !this.hasEnrolledLocalCRDT()) return false;
+				return this.localDoc.getText("contents").toString() !== this.pendingDiskContents;
+			},
+			canRecoverLCAWithPendingDisk: (_hsm, event) =>
+				this.canRecoverLCAWithPendingDisk(
+					event.type === "PROVIDER_SYNCED" ||
+						event.type === "DOWNLOAD_COMPLETE",
+				),
+			remoteAheadAtLoad: () => {
+				if (this.needsDiskContentAtLoad()) return false;
+				if (!this._lca) return false;
+				return this.hasRemoteChangedSinceLCA() && !this.hasDiskChangedSinceLCA() && !this.hasLocalChangedSinceLCA();
+			},
+			diskAheadAtLoad: () => {
+				if (!this._lca) return false;
+				return this.hasDiskChangedSinceLCA() && !this.hasRemoteChangedSinceLCA() && !this.hasLocalChangedSinceLCA() && this.hasFreshPendingDiskContents();
+			},
+			diskContentsNeededAtLoad: () => {
+				return this.needsDiskContentAtLoad();
+			},
+			divergedAtLoad: () => {
+				return this._lca !== null;
+			},
+
+			// DISK_CHANGED: check if disk event matches LCA (using event hash, not stored _disk)
+			diskMatchesLCA: (_hsm, event) => {
+				if (!this._lca) return false;
+				return this._lca.meta.hash === payload(event).hash;
+			},
+
+			// Idle event guards (for REMOTE_UPDATE candidates)
+			diskChangedSinceLCA: () => this.hasDiskChangedSinceLCA(),
+			diskContentsNeededBeforeRemoteMerge: () =>
+				this._lca !== null && this._disk === null,
+			diskMatchesConvergedDocs: (_hsm, event) => {
+				const e = payload(event);
+				if (typeof e.contents !== "string") return false;
+				if (this._fork || !this.localDoc || !this.remoteDoc) return false;
+				if (!yjsDocsEqual(this.localDoc, this.remoteDoc)) return false;
+				return this.localDoc.getText("contents").toString() === e.contents;
+			},
+			providerSyncedRemoteAhead: () => this.providerSyncedRemoteAhead(),
+			providerSyncNeedsForkReconcileRestart: () =>
+				!this._providerSynced || this._activeInvoke?.id !== "fork-reconcile",
+			remoteOrLocalAhead: () =>
+				this.hasRemoteChangedSinceLCA() || this._statePath === "idle.localAhead",
+
+			// Invoke completion guards
+			mergeSucceeded: (_hsm, event) => dataOf(event)?.success === true,
+			forkWasCreated: (_hsm, event) => dataOf(event)?.forked === true,
+			awaitingProvider: (_hsm, event) => dataOf(event)?.awaitingProvider === true,
+
+			// Outcome classification: the reconcile completed but the world moved
+			// during it (a remote update landed mid-operation), so the result is
+			// stale. Re-enter idle.loading to re-classify while the loop stays within
+			// its bound; past the bound the livelock becomes a real error.
+			mergeSuperseded: (_hsm, event) => dataOf(event)?.superseded === true,
+			supersededWithinBound: (_hsm, event) =>
+				dataOf(event)?.superseded === true
+				&& this._consecutiveSupersessions < MergeHSM.IDLE_SUPERSESSION_BOUND,
+
+			// A retryable stored error re-arms on new information; a permanent one
+			// keeps the idle.error self-loop trap.
+			errorIsRetryable: () => this._errorRetryable === true,
+
+			// Loop-back guards: merge succeeded but new data arrived during the await
+			mergeSucceededAndRemotePending: (_hsm, event) =>
+				dataOf(event)?.success === true && this.pendingIdleUpdates !== null,
+			mergeSucceededButMorePending: (_hsm, event) =>
+				dataOf(event)?.success === true
+				&& (this.pendingIdleUpdates !== null || this.pendingDiskContents !== null),
+			awaitingLocalEnrollment: (_hsm, event) => dataOf(event)?.awaitingLocalEnrollment === true,
+			awaitingDiskForLCA: (_hsm, event) => dataOf(event)?.awaitingDiskForLCA === true,
+			lcaUnavailable: (_hsm, event) => dataOf(event)?.lcaUnavailable === true,
+			hasPendingIdleWork: () =>
+				this.pendingIdleUpdates !== null || this.pendingDiskContents !== null,
+			hasPendingMachineEdits: () => this._pendingMachineEdits.length > 0,
+
+			// Fork guard: stay in localAhead when remote updates arrive during fork reconciliation
+			hasFork: () => this._fork !== null,
+			canMaterializeIdleConflict: () => this.canMaterializeIdleConflict(),
+			canMaterializeRecoverLCAConflict: () => this.canMaterializeRecoverLCAConflict(),
+
+			// === Cleanup guards ===
+			cleanupWasConflict: (_hsm, event) => {
+				const data = dataOf(event);
+				return data?.type === 'release' && data?.wasConflict === true;
+			},
+			cleanupWasReleaseLock: (_hsm, event) => {
+				return dataOf(event)?.type === 'release';
+			},
+			cleanupWasDestroy: (_hsm, event) => {
+				return dataOf(event)?.type === 'destroy';
+			},
+
+			// === Active entering/tracking guards ===
+			persistenceHasContent: (_hsm, event) => payload(event).hasContent === true,
+			hasPreexistingConflict: () => this._conflict !== null,
+			hasNoLCA: () => this._lca === null,
+			activeReconcileBaseReady: () => !this.needsFullStateForActiveEntry(),
+			persistenceHasContentAndActiveBaseReady: (_hsm, event) =>
+				payload(event).hasContent === true && !this.needsFullStateForActiveEntry(),
+			canRecoverLCA: () =>
+				this._lca === null &&
+				this._fork === null &&
+				this._conflict === null &&
+				this.remoteDoc !== null &&
+				(this.hasEnrolledLocalCRDT() || this.canRecoverMissingLocalCRDTFromRemote()),
+			isRecoveryMode: () => this._lca === null,
+			recoverLCASynced: (_hsm, event) =>
+				dataOf(event)?.kind === "synced",
+			recoverLCARemoteAhead: (_hsm, event) =>
+				dataOf(event)?.kind === "remoteAhead",
+			recoverLCADiverged: (_hsm, event) =>
+				dataOf(event)?.kind === "diverged",
+
+			// === Active merge invoke guards ===
+			threeWayMergeSucceeded: (_hsm, event) => dataOf(event)?.success === true,
+			threeWayMergeConflict: (_hsm, event) => dataOf(event)?.success === false,
+			twoWayMergeClean: (_hsm, event) => dataOf(event)?.clean === true,
+			twoWayMergeConflict: (_hsm, event) => dataOf(event)?.clean === false,
+		};
+	}
+
+	private storeUnresolvedIdleError(event: MergeEvent, retryable: boolean): void {
+		const data = dataOf(event);
+		const detail = data === undefined
+			? "no invoke result"
+			: JSON.stringify({
+				success: data?.success,
+				kind: data?.kind,
+				reason: data?.reason,
+				awaitingProvider: data?.awaitingProvider,
+				forked: data?.forked,
+			});
+		const error = new Error(
+			"Unable to continue idle reconciliation",
+		);
+		this._error = error;
+		// Only fork-reconcile's unresolved outcome is transient. Unrecognized
+		// idle-merge and recover-LCA outcomes stay permanent so retries cannot
+		// mask an invariant failure.
+		this._errorRetryable = retryable;
+		this.hsmError(`${error.message} (${detail}) | ${this.describeResourceContext("storeUnresolvedIdleError")}`);
+	}
+
+	// The idle merge declared its baseline unusable: the LCA is missing, or
+	// its compacted body could not be rebuilt — no attached doc sits at the
+	// baseline, and none contains a verifiable point-in-time restoration of
+	// it. Distinct from the generic unresolved outcome so the stored error
+	// names the real blocker.
+	private storeLcaUnavailableError(): void {
+		const error = new Error(
+			"Unable to continue idle reconciliation: LCA unavailable",
+		);
+		this._error = error;
+		// No retry can conjure the baseline; the permanent idle.error trap
+		// holds until new information re-arms recovery.
+		this._errorRetryable = false;
+		this.hsmError(`${error.message} | ${this.describeResourceContext("storeLcaUnavailableError")}`);
+	}
+
+	private buildActions(): Record<string, ActionFn> {
+		return {
+			// === Idle loading ===
+			ensureLocalDocForIdle: () => this.ensureLocalDocForIdle(),
+
+			// === Remote/Disk data ===
+			storeRecoverLCADisk: (_hsm, event) => {
+				const e = payload(event);
+				this.pendingRecoverLCADisk = (e.disk as RecoverLCADisk | undefined) ?? {
+					content: e.contents!,
+					hash: e.hash!,
+					mtime: e.mtime!,
+				};
+			},
+			prepareRecoverLCAFromPendingDisk: () => {
+				this.prepareRecoverLCAFromPendingDisk();
+			},
+			clearRecoverLCARequest: () => {
+				this.pendingRecoverLCADisk = null;
+			},
+			materializeRecoverLCAConflict: (_hsm, event) => {
+				const result = dataOf(event) as RecoverLCAResult | undefined;
+				if (result?.kind === "declined") {
+					this.hsmWarn(
+						`recoverLCA declined to conflict | guid=${this._guid} reason=${result.reason} ` +
+						`detail=${JSON.stringify(result.detail ?? {})}`,
+					);
+				}
+				this.materializeRecoverLCAConflict();
+			},
+			applyRecoverLCAResult: (_hsm, event) => {
+				const result = dataOf(event) as RecoverLCAResult | undefined;
+				this.pendingRecoverLCADisk = null;
+				if (!result) return;
+
+				if (result.kind === "declined") {
+					this.hsmWarn(
+						`recoverLCA declined | guid=${this._guid} reason=${result.reason} ` +
+						`detail=${JSON.stringify(result.detail ?? {})}`,
+					);
+					return;
+				}
+
+				this._localSnapshot = result.localSnapshot;
+				this._remoteSnapshot = result.remoteSnapshot;
+				this._disk = { hash: result.disk.hash, mtime: result.disk.mtime };
+				this._conflict = null;
+
+				if (result.kind === "synced") {
+					this.pendingIdleUpdates = null;
+					this.clearPendingDiskContents();
+					this._setLCA(result.newLCA);
+				} else if (result.kind === "remoteAhead") {
+					this.pendingIdleUpdates = result.pendingIdleUpdates ?? null;
+					this.clearPendingDiskContents();
+					this._setLCA(result.newLCA);
+				} else {
+					this.pendingIdleUpdates = result.pendingIdleUpdates ?? null;
+					if (result.pendingDiskContents !== undefined) {
+						this.setPendingDiskContents(
+							result.pendingDiskContents,
+							"disk-event",
+							result.disk.hash,
+						);
+					}
+					if (result.newLCA) {
+						this._setLCA(result.newLCA);
+					}
+				}
+
+				this.emitPersistState();
+			},
+			applyRemoteToRemoteDoc: (_hsm, event) => {
+				const update = payload(event).update as Uint8Array;
+				if (!update || update.byteLength === 0) return;
+				if (this.remoteDoc) {
+					Y.applyUpdate(this.remoteDoc, update, this.remoteDoc);
+					this._remoteSnapshot = snapshotFromDoc(this.remoteDoc).snapshot;
+				} else {
+					// No replica in memory: advance the tracked remote head from the
+					// update's own metadata — its covered insert clocks and delete set.
+					try {
+						const updateHead = snapshotMetaFromUpdate(update);
+						this._remoteSnapshot = this._remoteSnapshot
+							? mergeSnapshotHeads({ snapshot: this._remoteSnapshot }, updateHead).snapshot
+							: updateHead.snapshot;
+					} catch (e) {
+						this.hsmError(`Dropping unparseable remote update for ${this._guid} (${update.byteLength} bytes): ${describeError(e)}`);
+					}
+				}
+			},
+			storePendingRemoteUpdate: (_hsm, event) => {
+				const update = payload(event).update as Uint8Array;
+				if (this.pendingIdleUpdates) {
+					this.pendingIdleUpdates = Y.mergeUpdates([this.pendingIdleUpdates, update]);
+				} else {
+					this.pendingIdleUpdates = update;
+				}
+			},
+			storeDiskMetadata: (_hsm, event) => {
+				const e = payload(event);
+				this._disk = { hash: e.hash!, mtime: e.mtime! };
+				this.setPendingDiskContents(e.contents!, "disk-event", e.hash);
+				this._needsDiskContentLoad = false;
+			},
+			storeDiskMetadataForLoad: (_hsm, event) => {
+				const e = payload(event);
+				if (typeof e.hash === "string") {
+					this._disk = { hash: e.hash, mtime: e.mtime! };
+					this._needsDiskContentLoad = false;
+					return;
+				}
+				this._needsDiskContentLoad = true;
+			},
+			storeLoadedDiskContents: (_hsm, event) => {
+				const disk = dataOf(event)?.disk;
+				if (!disk) return;
+				this._needsDiskContentLoad = false;
+				this._disk = { hash: disk.hash, mtime: disk.mtime };
+				if (this._fork) {
+					// A restored fork's localDoc reflects the prior session. Preserve the
+					// session-fresh disk bytes so they are ingested before reconciliation.
+					this.setPendingDiskContents(disk.content, "disk-event", disk.hash);
+					return;
+				}
+				if (
+					this._lca &&
+					!this._fork &&
+					this._lca.meta.hash === disk.hash &&
+					!this.hasLocalChangedSinceLCA() &&
+					!this.hasRemoteChangedSinceLCA()
+				) {
+					this._setLCA({
+						...this._lca,
+						contents: this._lca.contents ?? disk.content,
+						meta: { ...this._lca.meta, mtime: disk.mtime },
+					});
+				}
+				if (this._lca?.meta.hash === disk.hash) {
+					this.clearPendingDiskContents();
+					return;
+				}
+				this.setPendingDiskContents(disk.content, "disk-event", disk.hash);
+			},
+			updateLCAMtime: (_hsm, event) => {
+				const e = payload(event);
+				if (this._lca && !this._fork && this._lca.meta.hash === e.hash) {
+					this._setLCA({
+						...this._lca,
+						meta: { ...this._lca.meta, mtime: e.mtime! },
+					});
+					this.clearPendingDiskContents();
+					this.emitPersistState();
+				}
+			},
+
+			// === Idle merge completion ===
+			applyIdleMergeResult: (_hsm, event) => {
+				const result = dataOf(event);
+				this.idleMergeLog(`[idle-merge-debug] ${this._guid} applyIdleMergeResult: success=${result?.success} noop=${result?.noop} hasMergedContent=${result?.mergedContent !== undefined} hasUpdates=${!!result?.updates} hasRemoteUpdate=${!!result?.remoteUpdate} localDoc=${!!this.localDoc}`);
+				if (!result?.success || result.noop) return;
+
+				if (
+					result.remoteUpdate &&
+					result.mergedContent !== undefined &&
+					this.localDoc
+				) {
+					this.applyRemoteStateThenMergedContent(
+						result.remoteUpdate,
+						result.mergedContent,
+					);
+				} else if (result.updates && this.localDoc) {
+					// Remote-ahead: apply CRDT updates to real localDoc
+					this._bridge.syncToLocal(result.updates);
+				} else if (result.mergedContent !== undefined && this.localDoc) {
+					// Three-way: apply merged content via diff
+					this.applyContentToLocalDoc(result.mergedContent);
+				}
+
+				// Write merged content to disk
+				if (result.mergedContent !== undefined && result.needsDiskWrite !== false) {
+					// With no disk observation, there is nothing proving that a write is
+					// safe. Keep disk bookkeeping unknown until a real read/event lands.
+					if (this._disk !== null) {
+						this.emitWriteDisk(
+							result.mergedContent,
+							result.newLCA?.meta?.hash,
+							result.newLCA?.meta?.mtime,
+						);
+					}
+				}
+
+				// Sync to remote (three-way merge)
+				if (result.needsSync && this.localDoc) {
+					const update = Y.encodeStateAsUpdate(this.localDoc);
+					this._bridge.syncToRemote(update);
+				}
+			},
+			resetIdleRetryCount: () => {
+				this.idleRetryCount = 0;
+				// Convergence clears the supersession bookkeeping and any error the
+				// re-classify/re-arm loops were working through — reaching this action
+				// means the note settled.
+				this._consecutiveSupersessions = 0;
+				this._supersessionHistory = [];
+				this._error = undefined;
+				this._errorRetryable = false;
+			},
+			clearSettledDiskContents: () => {
+				this.clearSettledDiskContents();
+			},
+			requestHibernate: () => {
+				this.emitEffect({ type: "REQUEST_HIBERNATE", guid: this._guid });
+			},
+			materializeIdleConflict: () => {
+				this.materializeIdleConflict();
+			},
+			clearConflictForRecompute: () => {
+				this._conflict = null;
+				this._error = undefined;
+			},
+			storeInvokeError: (_hsm, event) => {
+				const data = dataOf(event);
+				const error =
+					data instanceof Error
+						? data
+						: new Error(typeof data === "string" ? data : "invoke failed");
+				this._error = error;
+				// A missing backing file can race folder materialization/deletion, while
+				// transport failures can race provider reconnects. Both re-arm on new
+				// information; unrecognized failures remain permanent so retries cannot
+				// mask corrupt state or broken invariants.
+				this._errorRetryable =
+					error instanceof DiskFileNotFoundError || this.isTransportError(error);
+				this.hsmError(
+					`idle invoke failed | guid=${this._guid} state=${this._statePath} retryable=${this._errorRetryable} error=${error.message}`,
+				);
+			},
+			countSupersession: () => {
+				this._consecutiveSupersessions++;
+				this._supersessionHistory.push(this.timeProvider.now());
+			},
+			storeSupersededError: () => {
+				const error = new Error(
+					`Idle reconciliation superseded ${this._consecutiveSupersessions} times without converging`,
+				);
+				this._error = error;
+				// The bound exists to convert livelock into a visible error, so this
+				// is permanent: a REMOTE_UPDATE must not silently re-arm it.
+				this._errorRetryable = false;
+				this.hsmError(`${error.message} | ${this.describeResourceContext("storeSupersededError")}`);
+			},
+			rearmRetryableError: () => {
+				// New information reached a retryable idle.error: drop the stored error
+				// so re-entering idle.loading is clean and a fresh failure classifies
+				// from scratch.
+				this._error = undefined;
+				this._errorRetryable = false;
+			},
+			storeUnresolvedIdleError: (_hsm, event) => {
+				this.storeUnresolvedIdleError(event, false);
+			},
+			storeRetryableUnresolvedIdleError: (_hsm, event) => {
+				this.storeUnresolvedIdleError(event, true);
+			},
+			storeLcaUnavailableError: () => {
+				this.storeLcaUnavailableError();
+			},
+			scheduleIdleRetry: () => {
+				this.idleRetryCount++;
+				// Backoff: immediate for first 3 retries, then exponential up to 5s.
+				// This prevents hot-looping when updates arrive faster than we can drain.
+				const delay = this.idleRetryCount <= 3 ? 0 : Math.min(2 ** (this.idleRetryCount - 3) * 250, 5000);
+				const sendRetry = () => {
+					if (this.pendingIdleUpdates !== null || this.pendingDiskContents !== null) {
+						this.send({ type: 'IDLE_RETRY' });
+					}
+				};
+				if (delay === 0) {
+					queueMicrotask(sendRetry);
+				} else {
+					this.timeProvider.setTimeout(sendRetry, delay);
+				}
+			},
+			updateLCAFromInvokeResult: (_hsm, event) => {
+				const result = dataOf(event);
+				if (result?.newLCA) {
+					// WRITE_DISK is only an emitted request here. Disk metadata and
+					// a disk-bearing LCA advance when the executor directly confirms
+					// that the write finished.
+					this.commitLCAWithDiskConfirmation(result.newLCA);
+					this.emitPersistState();
+				}
+			},
+
+			// === ACQUIRE_LOCK from idle ===
+			storeEditorContent: (_hsm, event) => {
+				const e = payload(event);
+				this._editorViewRef = e.editorViewRef ?? null;
+				if (this._statePath.startsWith("idle.")) {
+					this._enteringFromDiverged =
+						this._statePath === "idle.diverged" ||
+						this._statePath === "idle.conflict";
+				}
+				this._providerSynced = false;
+				this._bridge.providerSynced = false;
+			},
+
+			// === Lifecycle ===
+			beginUnload: () => {
+				this._cleanupType = 'unload';
+			},
+			initializeFromLoad: (_hsm, event) => {
+				const e = payload(event);
+				this._guid = e.guid!;
+				this._modeDecision = null;
+				this._accumulatedEvents = [];
+				this._persistenceStateLoaded = false;
+				this._lcaGcPinCache = null;
+				this._disk = null;
+				this._remoteSnapshot = null;
+				this._needsDiskContentLoad = false;
+				this._restoredForkNeedsDiskRead = false;
+				this.clearEnrolledLocalHead();
+			},
+			storeError: (_hsm, event) => {
+				this._error = payload(event).error;
+			},
+			storePersistenceData: (_hsm, event) => {
+				const e = payload(event);
+				const localSnapshot = e.localSnapshot ?? null;
+				this.rememberEnrolledLocalHead(localSnapshot);
+				if (e.disk !== undefined) {
+					this._disk = e.disk ?? null;
+				}
+				this.applyObservedDiskAtLoad(e.observedDisk);
+				if (e.deferredConflict !== undefined) {
+					this._deferredConflict = e.deferredConflict ?? undefined;
+				}
+				if (e.lca && (!this._lca || (this._lca.contents === null && e.lca.contents !== null))) {
+					// Trusted restoration path: persisted LCA was captured by a
+					// prior session under the same invariant, so compacted metadata
+					// can be rehydrated from the full persisted record directly.
+					this._lca = e.lca;
+					this._lcaGcPinCache = null;
+				}
+				this._persistenceStateLoaded = true;
+				this.collectUnpinnedLocalDeletes();
+				if (localSnapshot) {
+					this._localSnapshot = localSnapshot;
+				}
+				// Restore fork from persisted state
+				if (e.fork !== undefined) {
+					this._fork = e.fork ?? null;
+					this._restoredForkNeedsDiskRead = this._fork !== null;
+				}
+			},
+			storeEnrollmentComplete: (_hsm, event) => {
+				const e = event as EnrollmentCompleteEvent;
+				this._setLCA(e.lca);
+				if (!this._lca) return;
+				if (this.localDoc && this.localPersistence?.synced === true) {
+					this.rememberEnrolledLocalHead(snapshotFromDoc(this.localDoc).snapshot);
+					this._localDocSnapshotSafe = true;
+				} else {
+					this.rememberEnrolledLocalHead(e.localSnapshot);
+					this._localDocSnapshotSafe = false;
+				}
+				this._disk = {
+					hash: e.lca.meta.hash,
+					mtime: e.lca.meta.mtime,
+				};
+				this._localSnapshot = e.localSnapshot;
+				if (e.remoteSnapshot !== undefined) {
+					this._remoteSnapshot = e.remoteSnapshot;
+				}
+			},
+			initIdleMode: () => {
+				this._modeDecision = "idle";
+			},
+			persistSettledState: () => {
+				if (!this._lca && !this._disk && !this._fork && !this._deferredConflict) return;
+				this.emitPersistState();
+			},
+			processAccumulatedForIdle: () => {
+				// Extract accumulated REMOTE_UPDATE data into pendingIdleUpdates.
+				// The update was already applied to remoteDoc during loading (by applyRemoteToRemoteDoc),
+				// but it needs to be in pendingIdleUpdates for the idle merge to use.
+				for (const event of this._accumulatedEvents) {
+					if (event.type === 'REMOTE_UPDATE') {
+						const update = payload(event).update as Uint8Array;
+						if (this.pendingIdleUpdates) {
+							this.pendingIdleUpdates = Y.mergeUpdates([this.pendingIdleUpdates, update]);
+						} else {
+							this.pendingIdleUpdates = update;
+						}
+					}
+					// DISK_CHANGED data already stored by storeDiskMetadata during loading
+				}
+				this._accumulatedEvents = [];
+			},
+
+			// === Active conflict/merging actions ===
+			trackEditorText: (_hsm, event) => {
+				const e = payload(event);
+				if (e.docText !== undefined) {
+					this.lastKnownEditorText = e.docText;
+				}
+			},
+			resolveConflict: (_hsm, event) => {
+				const contents = payload(event).contents as string;
+				this.applyResolvedConflict(contents, { dispatchEditor: true });
+			},
+			storeConflictData: (_hsm, event) => {
+				const e = payload(event);
+				const regions = e.conflictRegions ?? [];
+				this._conflict = new Conflict({
+					base: e.base!,
+					ours: e.ours!,
+					theirs: e.theirs!,
+					oursLabel: e.oursLabel ?? "Remote",
+					theirsLabel: e.theirsLabel ?? "Local file",
+					regions,
+				});
+			},
+			storeDeferredConflict: () => {
+				this._deferredConflict = {
+					diskHash: this._disk?.hash ?? "",
+					localHash: "",
+				};
+				this.emitPersistState();
+				// Async local hash computation (fire-and-forget)
+				this.computeLocalHash()
+					.then((localHash) => {
+						if (this._deferredConflict) {
+							this._deferredConflict.localHash = localHash;
+							this.emitPersistState();
+						}
+					})
+					.catch((err) => {
+						this.send({
+							type: "ERROR",
+							error: err instanceof Error ? err : new Error(String(err)),
+						});
+					});
+			},
+			resolveHunk: (_hsm, event) => {
+				this.handleResolveHunk(event as ResolveHunkEvent);
+			},
+			beginReleaseLock: () => {
+				// Capture definitive editor content before releasing the ref
+				// only while Obsidian still reports the file as open. After
+				// onUnloadFile, view refs may be recycled or cleared; that
+				// lifecycle hook captures the final text explicitly.
+				if (this._editorViewRef && this._obsidianFileOpen) {
+					this.lastKnownEditorText = this._editorViewRef.getViewData();
+				}
+				this._editorViewRef = null;
+				this._cleanupWasConflict = this._statePath.includes("conflict");
+				this._cleanupType = 'release';
+				this._bridge.providerSynced = false;
+				if (this._fork) {
+					this.emitEffect({ type: "REQUEST_PROVIDER_SYNC", guid: this._guid });
+				}
+			},
+
+			// === Active entering/tracking actions ===
+			accumulateRemoteUpdate: (_hsm, event) => {
+				const update = payload(event).update as Uint8Array;
+				const affectsText = payload(event).affectsText;
+				const existingIdx = this._accumulatedEvents.findIndex(
+					(e) => e.type === "REMOTE_UPDATE",
+				);
+				if (existingIdx >= 0) {
+					const existing = this._accumulatedEvents[existingIdx] as {
+						type: "REMOTE_UPDATE";
+						update: Uint8Array;
+						affectsText?: boolean;
+					};
+					const mergedAffectsText =
+						existing.affectsText === true || affectsText === true
+							? true
+							: existing.affectsText === false && affectsText === false
+								? false
+								: undefined;
+					this._accumulatedEvents[existingIdx] = {
+						type: "REMOTE_UPDATE",
+						update: Y.mergeUpdates([existing.update, update]),
+						...(mergedAffectsText !== undefined ? { affectsText: mergedAffectsText } : {}),
+					};
+				} else {
+					this._accumulatedEvents.push({
+						type: "REMOTE_UPDATE",
+						update,
+						...(affectsText !== undefined ? { affectsText } : {}),
+					});
+				}
+			},
+			accumulateCM6Change: (_hsm, event) => {
+				const e = payload(event);
+				if (e.docText !== undefined) {
+					this.lastKnownEditorText = e.docText;
+				}
+				if (e.userEvent === "set") {
+					// setViewData wholesale-replaces the editor (e.g. Properties
+					// panel, preview-mode toggles). Prior accumulated CM6_CHANGEs
+					// describe deltas against the pre-replace buffer — their
+					// from/to indices no longer align — drop them.
+					this._accumulatedEvents = this._accumulatedEvents.filter(
+						(ev) => ev.type !== "CM6_CHANGE",
+					);
+				}
+				this._accumulatedEvents.push({
+					type: "CM6_CHANGE",
+					changes: e.changes!,
+					docText: e.docText!,
+					userEvent: e.userEvent,
+					viewId: e.viewId,
+				});
+			},
+			accumulateDiskChanged: (_hsm, event) => {
+				const e = payload(event);
+				this._accumulatedEvents = this._accumulatedEvents.filter(
+					(ev) => ev.type !== "DISK_CHANGED",
+				);
+				this._accumulatedEvents.push({
+					type: "DISK_CHANGED",
+					contents: e.contents!,
+					mtime: e.mtime!,
+					hash: e.hash!,
+				});
+			},
+			createYDocs: () => this.createYDocs(),
+			applyRemoteToLocalIfNeeded: () => this.applyRemoteToLocalIfNeeded(),
+			clearEnteringState: () => {
+				this._enteringFromDiverged = false;
+				this.pendingEditorContent = null;
+			},
+			mergeRemoteToLocal: () => this._bridge.flushInbound(),
+			seedFrontmatterMap: () => this.seedFrontmatterMapFromCurrentText(),
+			drainFrontmatterMap: () => this.drainFrontmatterMapIfSynced(),
+			repairFrontmatter: () => this.repairFrontmatterFromMap(),
+			absorbTextPreservingRemoteUpdate: (_hsm, event) =>
+				this.absorbTextPreservingRemoteUpdate(event),
+			assertConvergence: () => this._bridge.assertConvergence(),
+			replayAccumulatedEvents: () => this.replayAccumulatedEvents(),
+			applyThreeWayMergeResult: (_hsm, event) => {
+				const data = dataOf(event);
+				if (!data || !this.localDoc) return;
+
+				this.applyContentToLocalDoc(data.merged!);
+				this._bridge.flushOutbound();
+
+				// Dispatch editor patches only when the editor's current text
+				// (diskText, since reconciling started from disk) differs from
+				// the merged result. If disk already matched merged, the editor
+				// is already showing the correct content.
+				if (data.patches && data.patches.length > 0 && data.diskText !== data.merged) {
+					const editorPatches = computeEditorDiffChanges(data.diskText!, data.merged!);
+					if (editorPatches.length > 0) {
+						this.emitEffect({ type: "DISPATCH_CM6", changes: editorPatches });
+					}
+				}
+
+				this.clearPendingDiskContents();
+				this.pendingEditorContent = null;
+			},
+			storeThreeWayConflict: (_hsm, event) => {
+				const data = dataOf(event)!;
+				this._conflict = new Conflict({
+					base: data.baseText!,
+					ours: data.localText!,
+					theirs: data.diskText!,
+					oursLabel: "Remote",
+					theirsLabel: "Local file",
+					regions: data.conflictRegions ?? [],
+				});
+			},
+			storeThreeWayError: (_hsm, event) => {
+				const error = payload(event).data;
+				const message = formatUserFacingError(error, "Merge failed");
+				this.hsmError(`three-way merge failed: ${message}`);
+				this._error = errorFromUnknown(error, "Merge failed");
+				const localText = this.localDoc?.getText("contents").toString() ?? "";
+				const diskText = this.pendingDiskContents ?? this.lastKnownEditorText ?? "";
+				this._conflict = new Conflict({
+					base: this._lca?.contents ?? localText,
+					ours: localText,
+					theirs: diskText,
+					oursLabel: "Remote",
+					theirsLabel: "Local file",
+					regions: [],
+				});
+			},
+			applyTwoWayCleanMerge: (_hsm, event) => {
+				const data = dataOf(event);
+				if (!data || !this.localDoc) return;
+
+				// localDoc already contains remoteDoc state (merged in the invoke);
+				// disk matches local. Sync to remote and clear residual state.
+				if (!this._lca && data.disk) {
+					this.captureCleanInitialLCA(data.disk);
+				}
+				this._bridge.syncToRemote(Y.encodeStateAsUpdate(this.localDoc));
+				this._bridge.clearOutboundQueue();
+				this.lastKnownEditorText = data.localText!;
+				this._fork = null;
+				this._ingestionTexts = [];
+				this._conflict = null;
+				this.clearPendingDiskContents();
+				this.pendingEditorContent = null;
+			},
+			storeTwoWayConflict: (_hsm, event) => {
+				const data = dataOf(event)!;
+				// The invoke loaded the file to compare against, so its disk
+				// identity — content, hash, and mtime together — is confirmed
+				// even when no disk event preceded the conflict. Record all of
+				// it now: a resolution that picks the on-disk text produces no
+				// later save or disk event, and the capture path refuses unless
+				// the confirmed content and hash are both on hand. When nothing
+				// primed the pending disk state before the merge, the invoke's
+				// own read is the priming.
+				if (data.disk) {
+					this._disk = { hash: data.disk.hash, mtime: data.disk.mtime };
+					if (this.pendingDiskContents === null) {
+						this.setPendingDiskContents(
+							data.disk.content,
+							"disk-event",
+							data.disk.hash,
+						);
+					} else if (this.pendingDiskContents === data.disk.content) {
+						this.pendingDiskHash = data.disk.hash;
+					}
+				}
+				this._conflict = new Conflict({
+					base: data.localText!,
+					ours: data.localText!,
+					theirs: data.diskText!,
+					oursLabel: "Remote",
+					theirsLabel: "Local file",
+					regions: data.conflictRegions ?? [],
+				});
+			},
+			storeTwoWayError: (_hsm, event) => {
+				const error = payload(event).data;
+				const message = formatUserFacingError(error, "Merge failed");
+				this.hsmError(`two-way merge failed: ${message}`);
+				this._error = errorFromUnknown(error, "Merge failed");
+				const localText = this.localDoc?.getText("contents").toString() ?? "";
+				const diskText = this.pendingDiskContents ?? this.lastKnownEditorText ?? "";
+				this._conflict = new Conflict({
+					base: localText,
+					ours: localText,
+					theirs: diskText,
+					oursLabel: "Remote",
+					theirsLabel: "Local file",
+					regions: [],
+				});
+			},
+			applyCM6ToLocalDoc: (_hsm, event) => {
+				const e = payload(event);
+				// Obsidian delivers a sibling save echo as an unannotated full-buffer
+				// set. Preserve the accepted snapshot so attachment can distinguish
+				// already-delivered input from a live render target that later moved.
+				if (e.userEvent === "set" && typeof e.docText === "string") {
+					this.recentIngestedEditorReplacementTexts = [
+						...this.recentIngestedEditorReplacementTexts.filter(
+							(text) => text !== e.docText,
+						),
+						e.docText,
+					].slice(-MergeHSM.INGESTED_REPLACEMENT_HISTORY_LIMIT);
+				}
+				let contentAlreadyApplied = false;
+				let machineEditIdx = -1;
+				if (this.localDoc) {
+					const ytext = this.localDoc.getText("contents");
+					const ytextStr = ytext.toString();
+					const prevEditor = this.lastKnownEditorText;
+					if (typeof e.docText === "string") {
+						this.trackMachineEditTeardownProgress(
+							ytextStr,
+							e.changes as PositionedChange[],
+							e.docText,
+						);
+					}
+					if (prevEditor !== null && ytextStr !== prevEditor) {
+						// Frontmatter drift detected — no action needed currently
+					}
+
+					machineEditIdx = this._pendingMachineEdits.findIndex(
+						(me) => me.expectedText === e.docText,
+					);
+					// A sibling view can report the same logical edit through an
+					// unannotated Obsidian transaction after another view has
+					// already applied it. Its positioned changes are relative to
+					// the sibling's older buffer, so applying them again would
+					// duplicate content and start a view-to-view feedback loop.
+					// Machine edits still need their own operation identity even
+					// when their visible text is already present.
+					contentAlreadyApplied =
+						machineEditIdx < 0 &&
+						typeof e.docText === "string" &&
+						e.docText === ytextStr;
+				}
+				this.lastKnownEditorText = e.docText!;
+				if (contentAlreadyApplied) {
+					return;
+				}
+				let observerWillDispatch = false;
+				if (this.localDoc) {
+					// Check if this CM6 change matches a pending machine edit
+					if (machineEditIdx >= 0) {
+						// Machine edit: apply via a temp proxy Y.Doc so the
+						// items get the proxy's clientID, not localDoc's. This
+						// decouples user edits from machine edits at the state
+						// vector level — non-adjacent user edits flow to
+						// remoteDoc immediately even while the machine edit
+						// is deferred. Ops carry MACHINE_EDIT_ORIGIN so
+						// OpCapture tracks them; when the same edit echoes
+						// back via remote sync, SyncBridge.flushInbound's
+						// matchMachineEdit path cancel()s them idempotently
+						// (flipping the deleted flag rather than creating new
+						// items) so no duplication occurs. Do NOT short-circuit
+						// this branch for userEvent === "set" — Properties-panel
+						// and preview-mode edits go through vault.process →
+						// registerMachineEdit → setViewData, which requires
+						// the machine-edit capture to prevent peer-side
+						// duplication that concatenates independently inserted copies.
+						this._bridge.currentMachineEditMark =
+							this._pendingMachineEdits[machineEditIdx].captureMark;
+						this._localDocDispatchOriginView = e.viewId;
+						observerWillDispatch = true;
+
+						const proxyDoc = new Y.Doc();
+						try {
+							Y.applyUpdate(proxyDoc, Y.encodeStateAsUpdate(this.localDoc));
+
+							const proxyText = proxyDoc.getText("contents");
+							if (e.userEvent === "set" && e.docText !== undefined) {
+								// CM6 from/to indices on a "set" event reference the
+								// pre-buffer, which may be stale relative to localDoc.
+								// Ingest via docText DMP'd against the proxy's current
+								// state so ops are bounded to valid offsets.
+								const currentText = proxyText.toString();
+								if (currentText !== e.docText) {
+									const dmp = new diff_match_patch();
+									const diffs = dmp.diff_main(currentText, e.docText);
+									dmp.diff_cleanupSemantic(diffs);
+									proxyDoc.transact(() => {
+										let cursor = 0;
+										for (const [operation, text] of diffs) {
+											switch (operation) {
+												case 1:
+													proxyText.insert(cursor, text);
+													cursor += text.length;
+													break;
+												case 0:
+													cursor += text.length;
+													break;
+												case -1:
+													proxyText.delete(cursor, text.length);
+													break;
+											}
+										}
+									});
+								}
+							} else {
+								proxyDoc.transact(() => {
+									this.applyChangesToYText(proxyText, e.changes!);
+								});
+							}
+
+							const diff = Y.encodeStateAsUpdate(
+								proxyDoc,
+								Y.encodeStateVector(this.localDoc),
+							);
+							const previousText = this.localDoc.getText("contents").toString();
+							this.localDoc.transact(() => {
+								Y.applyUpdate(this.localDoc!, diff, MACHINE_EDIT_ORIGIN);
+								this.syncFrontmatterToMap(previousText);
+							}, MACHINE_EDIT_ORIGIN);
+						} finally {
+							proxyDoc.destroy();
+							this._localDocDispatchOriginView = undefined;
+							this._bridge.currentMachineEditMark = null;
+						}
+					} else if (e.userEvent === "set") {
+						// setViewData with no matching machine edit: ingest via
+						// docText DMP'd against current localDoc. The from/to
+						// indices on "set" events reference the CM6 pre-buffer
+						// and can be stale, so we can't use them directly.
+						if (e.docText !== undefined) {
+							this.applyContentToLocalDoc(e.docText);
+						}
+					} else {
+						// Normal user edit: apply directly to localDoc
+						const ytext = this.localDoc.getText("contents");
+						const previousText = ytext.toString();
+						this.localDoc.transact(() => {
+							this.applyChangesToYText(ytext, e.changes!);
+							this.syncFrontmatterToMap(previousText);
+						}, this);
+					}
+				}
+
+				if (!observerWillDispatch) {
+					// Broadcast to sibling views. The originView tag lets the
+					// source integration skip its own dispatch (it already has
+					// the edit from user typing).
+					this.emitEffect({
+						type: "DISPATCH_CM6",
+						changes: e.changes!,
+						originView: e.viewId,
+					});
+				}
+
+				// Always flush — the queue handles filtering
+				this._bridge.flushOutbound();
+			},
+			updateDiskFromSave: (_hsm, event) => {
+				const e = payload(event);
+				this.updateDiskFromConfirmedWrite({ mtime: e.mtime!, hash: e.hash! });
+				this.commitPendingLCAOnDiskConfirm({ mtime: e.mtime!, hash: e.hash! });
+			},
+			storeDiskMetadataOnly: (_hsm, event) => {
+				const e = payload(event);
+				this._disk = { hash: e.hash!, mtime: e.mtime! };
+				this.setPendingDiskContents(e.contents!, "disk-event", e.hash);
+				this._needsDiskContentLoad = false;
+
+				this.capturePendingDiskLCA(e.contents!);
+			},
+			flushPendingToRemote: () => {
+				this._isOnline = true;
+				if (this.localDoc) {
+					this._bridge.flushOutbound();
+				}
+			},
+			setOffline: () => {
+				this._isOnline = false;
+				this._providerSynced = false;
+				this._bridge.providerSynced = false;
+			},
+			markProviderSynced: () => {
+				this._providerSynced = true;
+				this._bridge.providerSynced = true;
+			},
+			rememberServerAhead: (_hsm, event) => {
+				this._serverHead = (event as ServerAheadEvent).head;
+				this._serverHeadPending = true;
+			},
+			actOnServerAhead: (_hsm, event) => {
+				const head = (event as ServerAheadEvent).head;
+				this._serverHead = head;
+				this._serverHeadPending = false;
+				this.actOnServerHead(head);
+			},
+			// The evidence variant for states parked on unresolved work
+			// (diverged disk, retryable error): head equality proves nothing
+			// there — resolution needs the remote replica's content — so the
+			// signal always requests the session that delivers it.
+			actOnServerAheadEvidence: (_hsm, event) => {
+				this._serverHead = (event as ServerAheadEvent).head;
+				this._serverHeadPending = false;
+				this.emitEffect({ type: "ENQUEUE_SYNC", guid: this._guid });
+			},
+			drainServerAhead: () => {
+				if (!this._serverHeadPending || !this._serverHead) return;
+				this._serverHeadPending = false;
+				this.actOnServerHead(this._serverHead);
+			},
+			drainServerAheadEvidence: () => {
+				if (!this._serverHeadPending) return;
+				this._serverHeadPending = false;
+				this.emitEffect({ type: "ENQUEUE_SYNC", guid: this._guid });
+			},
+			maybeSignalPersistenceSyncedForRecovery: () => {
+				this.maybeSignalPersistenceReady("event");
+			},
+			clearForkAndUpdateLCA: (_hsm, event) => {
+				this._fork = null;
+				this._warnedForkAwaitingReplica = false;
+				this._ingestionTexts = [];
+				this.pendingIdleUpdates = null;
+				const result = dataOf(event);
+				if (result?.newLCA) {
+					this.commitLCAWithDiskConfirmation(result.newLCA);
+				}
+				// Flush pending inbound/outbound through the queue drain path
+				this._bridge.flush();
+				this._bridge.resetPendingCounters();
+				this.emitPersistState();
+			},
+			prepareIdleConflictFromFork: () => {
+				// Restore pendingDiskContents from localDoc (which has the disk-ingested
+				// content) so the conflict resolver and diagnostics retain the user's
+				// local file side after fork reconciliation finds a conflict.
+				const diskText = this.localDoc?.getText("contents").toString();
+				if (diskText != null) {
+					this.setPendingDiskContents(diskText, "derived", this._disk?.hash ?? null);
+				} else {
+					this.clearPendingDiskContents();
+				}
+				// Keep the fork alive — it gates flushOutbound and holds the
+				// captureMark needed to reverse disk ops during conflict resolution.
+				// Clear pending remote updates — fork reconciliation already
+				// evaluated them via diff3 and found a conflict.
+				this.pendingIdleUpdates = null;
+				this.emitPersistState();
+			},
+			ingestDiskToLocalDoc: () => {
+				if (this.pendingDiskContents !== null) {
+					this.applyContentToLocalDoc(this.pendingDiskContents, DISK_ORIGIN);
+					this._ingestionTexts.push(this.pendingDiskContents);
+					this._restoredForkNeedsDiskRead = false;
+				}
+			},
+			reconcileForkInActive: () => {
+				// Reconcile fork when PROVIDER_SYNCED arrives in active mode
+				if (!this._fork || !this.localDoc || !this.remoteDoc) {
+					return;
+				}
+				// remoteDoc is authoritative for fork reconciliation only after provider sync.
+				if (!this._isProviderSynced()) {
+					return;
+				}
+
+				const fork = this._fork;
+				const localContent = this.localDoc.getText("contents").toString();
+
+				// Check if remote has changed since fork using remoteDoc's actual
+				// snapshot (not the cached _remoteSnapshot, which may be stale if
+				// updates arrived via provider sync rather than REMOTE_UPDATE).
+				const remoteChanged = snapshotHasOpsMissingFrom(
+					snapshotFromDoc(this.remoteDoc),
+					{ snapshot: fork.remoteSnapshot },
+				);
+
+				if (!remoteChanged) {
+					// Remote unchanged — disk edit is confirmed safe, drop captured ops
+					const opCapture = this.getOpCapture();
+					if (opCapture && fork.captureMark != null) {
+						const diskOps = opCapture.sinceByOrigin(fork.captureMark, DISK_ORIGIN);
+						this.withLocalObserverSuppressed(() => {
+							opCapture.drop(diskOps);
+						});
+					}
+
+					const snapshot = snapshotFromDoc(this.localDoc).snapshot;
+					const diffUpdate = Y.encodeStateAsUpdate(
+						this.localDoc,
+						Y.encodeStateVector(this.remoteDoc),
+					);
+					if (diffUpdate.length > 0) {
+						this._bridge.syncToRemote(diffUpdate);
+					}
+					this._bridge.clearOutboundQueue();
+
+					// Clear fork and update LCA
+					this._fork = null;
+					this._ingestionTexts = [];
+					this._setLCA({
+						contents: localContent,
+						meta: { hash: "", mtime: this.timeProvider.now() },
+						snapshot,
+					});
+					this._localSnapshot = snapshot;
+					this._remoteSnapshot = snapshot;
+					this._bridge.resetPendingCounters();
+					this.emitPersistState();
+					this.patchLCAHash(localContent);
+					// The sync-point frontmatter reconcile waited for the fork.
+					this.seedFrontmatterMapFromCurrentText();
+					return;
+				}
+
+				// Remote changed — need three-way merge
+				const remoteContent = this.remoteDoc.getText("contents").toString();
+				const mergeResult = performThreeWayMerge(fork.base, localContent, remoteContent);
+
+				if (!mergeResult.success) {
+					// Conflict detected — clear fork tracking and surface it to the user.
+					// pendingInbound/Outbound are reset because the fork gate is lifting;
+					// conflict resolution will re-sync both sides via resolveWith* actions.
+					this._fork = null;
+					this._ingestionTexts = [];
+					this._bridge.resetPendingCounters();
+
+					// Drop captured disk ops — conflict resolution supersedes them.
+					const opCapture = this.getOpCapture();
+					if (opCapture && fork.captureMark != null) {
+						const diskOps = opCapture.sinceByOrigin(fork.captureMark, DISK_ORIGIN);
+						this.withLocalObserverSuppressed(() => {
+							opCapture.drop(diskOps);
+						});
+					}
+
+					this.send({
+						type: "MERGE_CONFLICT",
+						base: fork.base,
+						ours: localContent,
+						theirs: remoteContent,
+						conflictRegions: mergeResult.conflictRegions,
+					});
+					return;
+				}
+
+				// Cancel all disk ops — fork gates outbound sync so no peer
+				// has seen them. The merged result will be applied fresh via DMP.
+				this.withLocalObserverSuppressed(() => {
+					const opCapture = this.getOpCapture();
+					if (opCapture && fork.captureMark != null) {
+						const diskOps = opCapture.sinceByOrigin(fork.captureMark, DISK_ORIGIN);
+						opCapture.cancel(diskOps);
+					}
+
+					const remoteUpdate = Y.encodeStateAsUpdate(
+						this.remoteDoc!,
+						Y.encodeStateVector(this.localDoc!),
+					);
+					this.applyRemoteStateThenMergedContent(
+						remoteUpdate,
+						mergeResult.merged,
+					);
+				});
+
+				// Dispatch granular changes to editor if content changed
+				const editorContent = this.readCurrentEditorText() ?? localContent;
+				if (mergeResult.merged !== editorContent) {
+					const changes = computeEditorDiffChanges(editorContent, mergeResult.merged);
+					if (changes.length > 0) {
+						this.emitEffect({ type: "DISPATCH_CM6", changes });
+					}
+				}
+				this.lastKnownEditorText = mergeResult.merged;
+
+				// Clear fork and update LCA
+				const snapshot = snapshotFromDoc(this.localDoc).snapshot;
+				this._fork = null;
+				this._ingestionTexts = [];
+				this._setLCA({
+					contents: mergeResult.merged,
+					meta: { hash: "", mtime: this.timeProvider.now() },
+					snapshot,
+				});
+				this._localSnapshot = snapshot;
+				this._remoteSnapshot = snapshot;
+				this._bridge.resetPendingCounters();
+				this.emitPersistState();
+				this.patchLCAHash(mergeResult.merged);
+
+				// Sync merged result to remote
+				this._bridge.syncToRemote(Y.encodeStateAsUpdate(this.localDoc));
+				this._bridge.clearOutboundQueue();
+				// The sync-point frontmatter reconcile waited for the fork.
+				this.seedFrontmatterMapFromCurrentText();
+			},
+
+		};
+	}
+
+	private buildInvokeSources(): Record<string, InvokeSourceFn> {
+		if (this._replayMode) {
+			// In replay mode, invoke sources return never-resolving promises.
+			// Recorded done.invoke.* events drive transitions explicitly.
+			const neverResolve = () => new Promise<never>(() => {});
+			return {
+				'idle-merge': neverResolve,
+				'recover-lca': neverResolve,
+				'fork-reconcile': neverResolve,
+				'cleanup': neverResolve,
+				'three-way-merge': neverResolve,
+				'two-way-merge': neverResolve,
+			};
+		}
+		return {
+			'load-disk-contents': async (_hsm, signal) => {
+				this.assertMachineResources("before load-disk-contents");
+				const disk = await this._diskLoader();
+				if (signal.aborted) return { success: false };
+				return { success: true, disk };
+			},
+			'three-way-merge': async (_hsm, signal) => {
+				this.assertMachineResources("before three-way-merge");
+				if (this.localPersistence && !this.localPersistence.synced) {
+					await this.awaitLocalPersistenceWhenSynced(signal);
+					if (signal.aborted) return { success: false };
+				}
+				const localDoc = this.requireLocalDoc("three-way-merge");
+				if (!localDoc) {
+					throw new Error('three-way-merge: localDoc not available');
+				}
+				const baseText = this.requireLcaContents("three-way-merge");
+				if (baseText === null) {
+					throw new Error('three-way-merge: LCA contents not available');
+				}
+
+				// Use cached disk contents if DISK_CHANGED already landed;
+				// otherwise read from disk. Defaulting to "" here would let
+				// diff3 interpret missing disk info as "file wiped" and
+				// produce a whole-file-delete conflict on reload.
+				const pendingDisk = this.getPendingDiskTextForMerge();
+				let diskText: string;
+				if (pendingDisk !== null) {
+					diskText = pendingDisk;
+				} else {
+					const diskContent = await this._diskLoader();
+					if (signal.aborted) return { success: false };
+					diskText = diskContent.content;
+				}
+
+				const localText = localDoc.getText('contents').toString();
+				const mergeResult = performThreeWayMerge(baseText, localText, diskText);
+				if (signal.aborted) return { success: false };
+
+				if (mergeResult.success) {
+					return {
+						success: true,
+						merged: mergeResult.merged,
+						patches: mergeResult.patches,
+						baseText,
+						localText,
+						diskText,
+					};
+				}
+				return {
+					success: false,
+					conflictRegions: mergeResult.conflictRegions,
+					baseText,
+					localText,
+					diskText,
+				};
+			},
+			'two-way-merge': async (_hsm, signal) => {
+				this.assertMachineResources("before two-way-merge");
+				if (this.localPersistence && !this.localPersistence.synced) {
+					await this.awaitLocalPersistenceWhenSynced(signal);
+					if (signal.aborted) return { success: false };
+				}
+				const localDoc = this.requireLocalDoc("two-way-merge");
+				if (!localDoc) {
+					throw new Error('two-way-merge: localDoc not available');
+				}
+
+				// Recovery-mode (no LCA) entry point. Merge remoteDoc → localDoc
+				// first so "ours" reflects the full CRDT state, then compare
+				// against disk.
+				if (this.remoteDoc) {
+					const update = Y.encodeStateAsUpdate(
+						this.remoteDoc,
+						Y.encodeStateVector(localDoc),
+					);
+					if (update.byteLength > 0) {
+						this._bridge.syncToLocal(update);
+					}
+				}
+
+				const pendingDisk = this.getPendingDiskTextForMerge();
+				let diskText: string;
+				let disk: { content: string; hash: string; mtime: number } | null = null;
+				if (pendingDisk !== null) {
+					diskText = pendingDisk;
+					if (this.pendingDiskHash !== null && this._disk !== null) {
+						disk = {
+							content: pendingDisk,
+							hash: this.pendingDiskHash,
+							mtime: this._disk.mtime,
+						};
+					} else {
+						const loadedDisk = await this._diskLoader();
+						if (signal.aborted) return { success: false };
+						if (loadedDisk.content === pendingDisk) {
+							disk = loadedDisk;
+						}
+					}
+				} else {
+					disk = await this._diskLoader();
+					if (signal.aborted) return { success: false };
+					diskText = disk.content;
+				}
+
+				const localText = localDoc.getText('contents').toString();
+				if (signal.aborted) return { success: false };
+
+				if (localText === diskText) {
+					return { clean: true, localText, disk };
+				}
+				return {
+					clean: false,
+					localText,
+					diskText,
+					disk,
+					conflictRegions: computeTwoWayConflictRegions(localText, diskText),
+				};
+			},
+			'idle-merge': async (_hsm, signal) => {
+				// Entry action ensureLocalDocForIdle creates localDoc +
+				// persistence. Await persistence sync before merging
+				// (e.g. after waking from hibernation).
+				if (this.localPersistence && !this.localPersistence.synced) {
+					await this.awaitLocalPersistenceWhenSynced(signal);
+					if (signal.aborted) return { success: false };
+				}
+				this.hydrateLCAContentsFromMatchingDoc();
+				this.assertMachineResources("before idle-merge");
+
+				// Dispatch to the right merge based on which idle state spawned the invoke.
+				// The interpreter spawns invokes on state entry, so _statePath is
+				// the state that declared the invoke.
+				switch (this._statePath) {
+					case 'idle.remoteAhead':
+						return this.invokeIdleRemoteAutoMerge(signal);
+					case 'idle.diskAhead':
+						return this.invokeIdleDiskAutoMerge(signal);
+					case 'idle.diverged':
+						return this.invokeIdleThreeWayAutoMerge(signal);
+					default:
+						return Promise.resolve({ success: false });
+				}
+			},
+			'recover-lca': async (_hsm, signal) => {
+				this.assertMachineResources("before recover-lca");
+				if (this.localPersistence && !this.localPersistence.synced) {
+					await this.awaitLocalPersistenceWhenSynced(signal);
+					if (signal.aborted) {
+						return { kind: "declined", reason: "aborted" } satisfies RecoverLCAResult;
+					}
+				}
+				this.assertMachineResources("after recover-lca persistence");
+				return this.invokeRecoverLCA(signal);
+			},
+			'fork-reconcile': async (_hsm, signal) => {
+				if (this.localPersistence && !this.localPersistence.synced) {
+					await this.awaitLocalPersistenceWhenSynced(signal);
+					if (signal.aborted) return { success: false };
+				}
+				this.assertMachineResources("before fork-reconcile");
+				return this.invokeForkReconcile(signal);
+			},
+			'cleanup': async (_hsm, signal) => {
+				const cleanupType = this._cleanupType;
+				this._cleanupType = null;
+
+				if (cleanupType === 'release') {
+					const wasConflict = this._cleanupWasConflict;
+					this._cleanupWasConflict = false;
+					try {
+						await this.drainPendingMachineEditsForRelease(signal);
+						await this.deactivateEditor();
+					} catch (err) {
+						this.hsmError(`Error during release lock cleanup: ${describeError(err)}`);
+					}
+					return { type: 'release', wasConflict };
+				}
+
+				try {
+					await this.destroyLocalDoc();
+				} catch (err) {
+					this.hsmError(`Error during unload cleanup: ${describeError(err)}`);
+				}
+				// An ended lifetime routes the unloading state to the terminal
+				// "destroyed" state (cleanupWasDestroy guard) instead of "unloaded".
+				return this._lifetime.active
+					? { type: 'unload' }
+					: { type: 'destroy' };
+			},
+		};
+	}
+
+	// ===========================================================================
+	// Invoke Source Implementations (async operations)
+	// ===========================================================================
+
+	private async invokeRecoverLCA(signal: AbortSignal): Promise<RecoverLCAResult> {
+		const disk = this.pendingRecoverLCADisk;
+		if (!disk) {
+			return { kind: "declined", reason: "missing-disk" };
+		}
+		if (this._lca) {
+			return { kind: "declined", reason: "already-has-lca" };
+		}
+
+		const localDoc = this.requireLocalDoc("recover LCA");
+		const remoteDoc = this.requireRemoteDoc("recover LCA");
+		if (!localDoc || !remoteDoc) {
+			return { kind: "declined", reason: "missing-docs" };
+		}
+
+		const localText = localDoc.getText("contents").toString();
+		const localSnapshot = snapshotFromDoc(localDoc).snapshot;
+		const remoteText = remoteDoc.getText("contents").toString();
+		const remoteSnapshot = snapshotFromDoc(remoteDoc).snapshot;
+
+		if (signal.aborted) {
+			return { kind: "declined", reason: "aborted" };
+		}
+
+		if (isEmptyDoc(localDoc)) {
+			return this.recoverMissingLocalCRDTFromRemote({
+				disk,
+				remoteDoc,
+				remoteText,
+				remoteSnapshot,
+				signal,
+			});
+		}
+
+		const diskMatchesLocal = localText === disk.content;
+		const diskMatchesRemote = remoteText === disk.content;
+
+		if (yjsDocsEqual(localDoc, remoteDoc)) {
+			if (!diskMatchesLocal) {
+				return {
+					kind: "diverged",
+					disk,
+					localSnapshot,
+					remoteSnapshot: localSnapshot,
+					pendingDiskContents: disk.content,
+				};
+			}
+
+			return {
+				kind: "synced",
+				disk,
+				localSnapshot,
+				remoteSnapshot: localSnapshot,
+				newLCA: {
+					contents: localText,
+					meta: { hash: disk.hash, mtime: disk.mtime },
+					snapshot: localSnapshot,
+				},
+			};
+		}
+
+		if (yjsDocIsAhead(remoteDoc, localDoc)) {
+			// Recovery captures only the proven ancestor. idle.remoteAhead
+			// derives and applies any remote update after the LCA is persisted.
+			const lcaHash = diskMatchesLocal
+				? disk.hash
+				: await this.hashFn(localText);
+			if (signal.aborted) {
+				return { kind: "declined", reason: "aborted" };
+			}
+			const lcaMtime = diskMatchesLocal
+				? disk.mtime
+				: this.timeProvider.now();
+			const newLCA = {
+				contents: localText,
+				meta: { hash: lcaHash, mtime: lcaMtime },
+				snapshot: localSnapshot,
+			};
+
+			if (diskMatchesLocal || diskMatchesRemote) {
+				return {
+					kind: "remoteAhead",
+					disk,
+					newLCA,
+					localSnapshot,
+					remoteSnapshot,
+				};
+			}
+
+			return {
+				kind: "diverged",
+				disk,
+				newLCA,
+				localSnapshot,
+				remoteSnapshot,
+				pendingDiskContents: disk.content,
+			};
+		}
+
+		if (diskMatchesLocal && remoteText === localText && yjsDocIsAhead(localDoc, remoteDoc)) {
+			// Local has extra CRDT state but no text change. Capture the remote
+			// snapshot as the ancestor, then let idle.diverged converge normally.
+			return {
+				kind: "diverged",
+				disk,
+				localSnapshot,
+				remoteSnapshot,
+				newLCA: {
+					contents: localText,
+					meta: { hash: disk.hash, mtime: disk.mtime },
+					snapshot: remoteSnapshot,
+				},
+			};
+		}
+
+		if (diskMatchesLocal && remoteText === localText) {
+			return {
+				kind: "declined",
+				reason: "text-equal-crdt-divergence",
+				detail: {
+					localLength: localText.length,
+					remoteLength: remoteText.length,
+				},
+			};
+		}
+
+		return {
+			kind: "declined",
+			reason: "remote-not-descendant",
+			detail: {
+				diskMatchesLocal,
+				localLength: localText.length,
+				diskLength: disk.content.length,
+				remoteLength: remoteText.length,
+			},
+		};
+	}
+
+	private async recoverMissingLocalCRDTFromRemote(args: {
+		disk: RecoverLCADisk;
+		remoteDoc: Y.Doc;
+		remoteText: string;
+		remoteSnapshot: Uint8Array;
+		signal: AbortSignal;
+	}): Promise<RecoverLCAResult> {
+		const { disk, remoteDoc, remoteText, remoteSnapshot, signal } = args;
+		if (!this.canRecoverMissingLocalCRDTFromRemote()) {
+			return { kind: "declined", reason: "missing-local-crdt" };
+		}
+		if (signal.aborted) {
+			return { kind: "declined", reason: "aborted" };
+		}
+
+		const remoteUpdate = Y.encodeStateAsUpdate(remoteDoc);
+		const didInitialize = await this.initializeFromRemote(remoteUpdate);
+		if (signal.aborted) {
+			return { kind: "declined", reason: "aborted" };
+		}
+		if (!didInitialize && !this.hasEnrolledLocalCRDT()) {
+			return {
+				kind: "declined",
+				reason: "remote-local-initialization-failed",
+				detail: {
+					remoteLength: remoteText.length,
+					updateBytes: remoteUpdate.byteLength,
+				},
+			};
+		}
+
+		const localDoc = this.requireLocalDoc("recover missing local CRDT");
+		if (!localDoc) {
+			return { kind: "declined", reason: "missing-local-doc-after-remote-init" };
+		}
+
+		const localText = localDoc.getText("contents").toString();
+		if (isEmptyDoc(localDoc)) {
+			return {
+				kind: "declined",
+				reason: "remote-local-initialization-empty",
+				detail: {
+					remoteLength: remoteText.length,
+					updateBytes: remoteUpdate.byteLength,
+				},
+			};
+		}
+		const localSnapshot = snapshotFromDoc(localDoc).snapshot;
+		if (
+			localText !== remoteText ||
+			!snapshotsEqual({ snapshot: localSnapshot }, { snapshot: remoteSnapshot })
+		) {
+			return {
+				kind: "declined",
+				reason: "remote-local-mismatch-after-restore",
+				detail: {
+					localLength: localText.length,
+					remoteLength: remoteText.length,
+				},
+			};
+		}
+
+		this.rememberEnrolledLocalHead(localSnapshot);
+		this._localDocSnapshotSafe = true;
+		this._localSnapshot = localSnapshot;
+		const currentRemoteSnapshot = snapshotFromDoc(remoteDoc).snapshot;
+		this._remoteSnapshot = currentRemoteSnapshot;
+
+		if (
+			!snapshotsEqual(
+				{ snapshot: currentRemoteSnapshot },
+				{ snapshot: remoteSnapshot },
+			)
+		) {
+			const lcaHash =
+				disk.content === remoteText
+					? disk.hash
+					: await this.hashFn(remoteText);
+			if (signal.aborted) {
+				return { kind: "declined", reason: "aborted" };
+			}
+			const newLCA = {
+				contents: remoteText,
+				meta: {
+					hash: lcaHash,
+					mtime:
+						disk.content === remoteText
+							? disk.mtime
+							: this.timeProvider.now(),
+				},
+				snapshot: localSnapshot,
+			};
+
+			if (disk.content === remoteText) {
+				return {
+					kind: "remoteAhead",
+					disk,
+					newLCA,
+					localSnapshot,
+					remoteSnapshot: currentRemoteSnapshot,
+				};
+			}
+
+			return {
+				kind: "diverged",
+				disk,
+				newLCA,
+				localSnapshot,
+				remoteSnapshot: currentRemoteSnapshot,
+				pendingDiskContents: disk.content,
+			};
+		}
+
+		if (disk.content === remoteText) {
+			return {
+				kind: "synced",
+				disk,
+				localSnapshot,
+				remoteSnapshot: currentRemoteSnapshot,
+				newLCA: {
+					contents: remoteText,
+					meta: { hash: disk.hash, mtime: disk.mtime },
+					snapshot: localSnapshot,
+				},
+			};
+		}
+
+		const conflictInit = this.buildTwoWayConflictInit(
+			remoteText,
+			disk.content,
+			"Remote",
+			"Local file",
+			remoteText,
+		);
+		if (!conflictInit) {
+			return {
+				kind: "declined",
+				reason: "disk-remote-mismatch-without-conflict",
+				detail: {
+					diskLength: disk.content.length,
+					remoteLength: remoteText.length,
+				},
+			};
+		}
+
+		this._conflict = new Conflict(conflictInit);
+		this._disk = { hash: disk.hash, mtime: disk.mtime };
+		this.pendingIdleUpdates = null;
+		this.clearPendingDiskContents();
+
+		return {
+			kind: "declined",
+			reason: "disk-remote-mismatch-with-missing-local-crdt",
+			detail: {
+				diskLength: disk.content.length,
+				remoteLength: remoteText.length,
+			},
+		};
+	}
+
+	private async invokeIdleRemoteAutoMerge(signal: AbortSignal): Promise<unknown> {
+		const localDoc = this.requireLocalDoc("idle remote merge");
+		if (!localDoc) {
+			this.idleMergeLog(`[idle-merge-debug] ${this._guid} early-exit: localDoc=false`);
+			return { success: false, awaitingProvider: true };
+		}
+
+		let updates = this.pendingIdleUpdates;
+		const updatesWereBuffered = updates !== null;
+		if (!updates) {
+			if (!this.remoteDoc) {
+				this.idleMergeLog(`[idle-merge-debug] ${this._guid} waiting: no pending updates or remoteDoc`);
+				return { success: false, awaitingProvider: true };
+			}
+			const derivedUpdates = Y.encodeStateAsUpdate(
+				this.remoteDoc,
+				Y.encodeStateVector(localDoc),
+			);
+			if (derivedUpdates.byteLength > 0 && !this.updateHasNoChanges(derivedUpdates)) {
+				updates = derivedUpdates;
+			} else {
+				return this.buildSettledRemoteAheadResult(signal, localDoc);
+			}
+		}
+
+		// Block automatic writes when there is no LCA, UNLESS there is no file on
+		// disk. No LCA + no disk file = initial sync from a remote peer (safe to
+		// write). No LCA + disk file exists = up-migration where we must not
+		// silently overwrite what the user has on disk.
+		if (!this._lca && this._disk !== null) {
+			this.idleMergeLog(`[idle-merge-debug] ${this._guid} blocked: no LCA but disk exists`);
+			this.pendingIdleUpdates = null;
+			return { success: false };
+		}
+
+		// Snapshot and clear — new REMOTE_UPDATEs accumulate into fresh buffer
+		this.pendingIdleUpdates = null;
+
+		this.idleMergeLog(`[idle-merge-debug] ${this._guid} updatesLen=${updates.byteLength}`);
+
+		// Compute merge on a temp doc (clone localDoc state + apply updates).
+		// localDoc is NOT mutated — the onDone action applies the result.
+		const tempDoc = new Y.Doc();
+		try {
+			if (updatesWereBuffered && this.updateHasNoChanges(updates)) {
+				return { success: true, newLCA: this._lca, noop: true };
+			}
+			if (yjsUpdateIsNoop(localDoc, updates)) {
+				const settled = await this.buildSettledRemoteAheadResult(signal, localDoc);
+				if ((settled as { success?: boolean }).success === true) {
+					return settled;
+				}
+				return { success: true, newLCA: this._lca, noop: true };
+			}
+
+			Y.applyUpdate(tempDoc, Y.encodeStateAsUpdate(localDoc), this);
+			Y.applyUpdate(tempDoc, updates, this.remoteDoc);
+
+			const mergedContent = tempDoc.getText("contents").toString();
+			this.idleMergeLog(`[idle-merge-debug] ${this._guid} mergedContentLen=${mergedContent.length}`);
+			if (flags().enableDeltaLogging) {
+				this.idleMergeLog(`[idle-merge-debug] ${this._guid} mergedContent=${JSON.stringify(mergedContent)}`);
+			}
+
+			// Check if this remote update carries an edit already applied by
+			// fork-reconcile (machine edit). The LCA was set to the merged
+			// result by fork-reconcile. If any pending machine edit's
+			// expectedText matches the current LCA, the remote CRDT is
+			// delivering the same edit we already have — skip to prevent
+			// CRDT duplication.
+				if (this._lca) {
+					const machineIdx = this._pendingMachineEdits.findIndex(entry =>
+						entry.expectedText === this._lca!.contents
+					);
+					if (machineIdx >= 0) {
+						this._pendingMachineEdits.splice(machineIdx, 1);
+						this.hsmWarn(
+							`idle-merge: skipped duplicate machine edit | guid=${this._guid}`
+						);
+						return { success: true, newLCA: this._lca, noop: true };
+					}
+				}
+
+			const hash = await this.hashFn(mergedContent);
+			if (signal.aborted) return { success: false };
+			const diskWrite = this.diskWritePlanForHash(hash);
+
+			// snapshot: null — filled in from real localDoc after applying updates
+			return {
+				success: true,
+				mergedContent,
+				updates,
+				needsDiskWrite: diskWrite.needsDiskWrite,
+				newLCA: { contents: mergedContent, meta: { hash, mtime: diskWrite.mtime }, snapshot: null },
+			};
+		} finally {
+			tempDoc.destroy();
+		}
+	}
+
+	private updateHasNoChanges(update: Uint8Array): boolean {
+		const decoded = Y.decodeUpdate(update);
+		return decoded.structs.length === 0 && decoded.ds.clients.size === 0;
+	}
+
+	private diskWritePlanForHash(hash: string): { needsDiskWrite: boolean; mtime: number } {
+		if (this._disk?.hash === hash) {
+			return { needsDiskWrite: false, mtime: this._disk.mtime };
+		}
+		return { needsDiskWrite: true, mtime: this.timeProvider.now() };
+	}
+
+	private async buildSettledRemoteAheadResult(
+		signal: AbortSignal,
+		localDoc: Y.Doc,
+	): Promise<unknown> {
+		if (!this.remoteDoc || !yjsDocsEqual(localDoc, this.remoteDoc)) {
+			return { success: false, awaitingProvider: true };
+		}
+
+		const mergedContent = localDoc.getText("contents").toString();
+		const hash = await this.hashFn(mergedContent);
+		if (signal.aborted) return { success: false };
+
+		const snapshot = snapshotFromDoc(localDoc).snapshot;
+		const diskMatches = this._disk?.hash === hash;
+		const newLCA = {
+			contents: mergedContent,
+			meta: {
+				hash,
+				mtime: diskMatches ? this._disk!.mtime : this.timeProvider.now(),
+			},
+			snapshot,
+		};
+
+		if (
+			diskMatches &&
+			this._lca &&
+			this._lca.meta.hash === hash &&
+			snapshotsEqual({ snapshot: this._lca.snapshot }, { snapshot })
+		) {
+			return { success: true, newLCA: this._lca, noop: true };
+		}
+
+		return diskMatches
+			? { success: true, newLCA, noop: true }
+			: { success: true, mergedContent, newLCA };
+	}
+
+	private async invokeIdleDiskAutoMerge(signal: AbortSignal): Promise<unknown> {
+		const localDoc = this.requireLocalDoc("idle disk merge");
+		const diskContent = this.requirePendingDiskContents("idle disk merge");
+		if (!localDoc || diskContent === null) {
+			return { success: false };
+		}
+		if (!this._lca) {
+			return { success: false, lcaUnavailable: true };
+		}
+		const lcaContent = this.requireLcaContents("idle disk merge");
+		if (lcaContent === null) {
+			this.hsmWarn(
+				`idle disk merge: compacted LCA could not hydrate | ` +
+					`guid=${this._guid} state=${this._statePath}`,
+			);
+			return { success: false, lcaUnavailable: true };
+		}
+
+		// If fork was pre-created by registerMachineEdit, reuse it.
+		// Otherwise create one now.
+		if (!this._fork) {
+			const localSnapshot = snapshotFromDoc(localDoc);
+			const remoteSnapshot = this.remoteDoc
+				? snapshotFromDoc(this.remoteDoc)
+				: undefined;
+			// The ancestor must contain only history shared by both sides. Full
+			// snapshot containment includes tombstones, so delete-only offline
+			// work is distinguished from history already held by the replica.
+			const localHoldsUnpublishedWork =
+				!remoteSnapshot || !snapshotContains(remoteSnapshot, localSnapshot);
+			this._fork = {
+				base: localHoldsUnpublishedWork
+					? lcaContent
+					: localDoc.getText("contents").toString(),
+				localSnapshot: localSnapshot.snapshot,
+				remoteSnapshot: this.remoteDoc
+					? remoteSnapshot!.snapshot
+					: this._remoteSnapshot ?? emptySnapshot(),
+				origin: 'disk-edit',
+				created: this.timeProvider.now(),
+				captureMark: this.getOpCapture()?.mark() ?? 0,
+			};
+		}
+
+		// Apply disk content to localDoc using diff-based updates.
+		this.applyContentToLocalDoc(diskContent, DISK_ORIGIN);
+		this._ingestionTexts.push(diskContent);
+		this._bridge.providerSynced = false;
+		this.clearPendingDiskContents();
+		this.emitPersistState();
+
+		// Request provider sync for fork reconciliation
+		this.emitEffect({ type: "REQUEST_PROVIDER_SYNC", guid: this._guid });
+
+		// Return forked: true to signal the machine to transition to idle.localAhead
+		return { success: false, forked: true };
+	}
+
+	private async invokeIdleThreeWayAutoMerge(signal: AbortSignal): Promise<unknown> {
+		// If fork-reconcile already detected a conflict, don't re-attempt the
+		// merge — the conflict data is authoritative and must be surfaced to
+		// the user when they open the file.
+		if (this._conflict) {
+			this.clearPendingDiskContents();
+			this.pendingIdleUpdates = null;
+			return { success: false };
+		}
+		const localDoc = this.requireLocalDoc("idle three-way merge");
+		if (!localDoc) {
+			this.clearPendingDiskContents();
+			this.pendingIdleUpdates = null;
+			return { success: false };
+		}
+		if (!this._lca) {
+			this.pendingIdleUpdates = null;
+			if (!this.remoteDoc) {
+				this.emitEffect({ type: "REQUEST_PROVIDER_SYNC", guid: this._guid });
+				return { success: false, awaitingProvider: true };
+			}
+			if (!this.hasEnrolledLocalCRDT()) {
+				return { success: false, awaitingLocalEnrollment: true };
+			}
+			if (this.pendingDiskContents === null && this.pendingRecoverLCADisk === null) {
+				return { success: false, awaitingDiskForLCA: true };
+			}
+			if (!this._isProviderSynced()) {
+				this.emitEffect({ type: "REQUEST_PROVIDER_SYNC", guid: this._guid });
+				return { success: false, awaitingProvider: true };
+			}
+			return { success: false };
+		}
+		const lcaContent = this.requireLcaContents("idle three-way merge");
+		if (lcaContent === null) {
+			this.clearPendingDiskContents();
+			this.pendingIdleUpdates = null;
+			return { success: false, lcaUnavailable: true };
+		}
+
+		// Read the remote content from remoteDoc. Applying pendingIdleUpdates
+		// to localDoc via raw Y.applyUpdate causes CRDT-level interleaving that
+		// corrupts text when there's a true conflict (e.g. post-fork diverge).
+		// remoteDoc already has all remote updates applied (applyRemoteToRemoteDoc
+		// runs before storePendingRemoteUpdate), so reading its text gives the
+		// correct remote content without the corruption path.
+		// If remoteDoc isn't available yet (e.g. waking from hibernation), bail
+		// out — REMOTE_UPDATE will reenter idle.diverged once the provider syncs.
+		const remoteDoc = this.requireRemoteDoc("idle three-way merge");
+		if (!remoteDoc) {
+			return { success: false, awaitingProvider: true };
+		}
+		const crdtContent = remoteDoc.getText("contents").toString();
+
+		// If the provider hasn't synced yet, remoteDoc may not reflect the
+		// server's CRDT state.  Defer the merge until PROVIDER_SYNCED
+		// delivers the real remote content.
+		if (!this._isProviderSynced()) {
+			return { success: false, awaitingProvider: true };
+		}
+
+		const diskContent = this.pendingDiskContents ?? lcaContent;
+
+		// Snapshot and clear — new events accumulate fresh during await
+		this.pendingIdleUpdates = null;
+		this.clearPendingDiskContents();
+
+		// 3-way merge: lca (base), disk (local changes), crdt (remote changes)
+		const mergeResult = performThreeWayMerge(lcaContent, diskContent, crdtContent);
+
+		if (!mergeResult.success) {
+			// When LCA exists, create a fork so fork-reconcile can attempt
+			// resolution once the provider syncs with authoritative remote state.
+			if (this._lca) {
+				const fork: Fork = {
+					base: lcaContent,
+					localSnapshot: snapshotFromDoc(localDoc).snapshot,
+					remoteSnapshot: snapshotFromDoc(remoteDoc).snapshot,
+					origin: 'three-way-conflict',
+					created: this.timeProvider.now(),
+					captureMark: this.getOpCapture()?.mark() ?? 0,
+				};
+
+				this.applyContentToLocalDoc(diskContent, DISK_ORIGIN);
+				this._fork = fork;
+				this._bridge.providerSynced = false;
+
+				// Request provider sync so connectForForkReconcile creates a
+				// ProviderIntegration and fires PROVIDER_SYNCED once the server
+				// state is loaded into a fresh remoteDoc.
+				this.emitEffect({ type: "REQUEST_PROVIDER_SYNC", guid: this._guid });
+
+				return { success: false, forked: true };
+			}
+			return { success: false };
+		}
+
+		// Preserve the CRDT identities behind the remote side of the successful
+		// text merge. A later remote update remains buffered for the next pass.
+		const remoteUpdate = Y.encodeStateAsUpdate(
+			remoteDoc,
+			Y.encodeStateVector(localDoc),
+		);
+		const hash = await this.hashFn(mergeResult.merged);
+		if (signal.aborted) return { success: false };
+		const diskWrite = this.diskWritePlanForHash(hash);
+
+		// localDoc mutations deferred to onDone action (applyIdleMergeResult).
+		// snapshot is null here — filled in after applying to real localDoc.
+		return {
+			success: true,
+			mergedContent: mergeResult.merged,
+			remoteUpdate,
+			needsSync: true,
+			needsDiskWrite: diskWrite.needsDiskWrite,
+			newLCA: { contents: mergeResult.merged, meta: { hash, mtime: diskWrite.mtime }, snapshot: null },
+		};
+	}
+
+	/**
+	 * Fork reconciliation: three-way merge using fork.base as the common ancestor.
+	 *
+	 * Called when entering idle.localAhead after a fork was created.
+	 * If provider is not synced, returns immediately with awaitingProvider so the
+	 * invoke completes; PROVIDER_SYNCED reenters idle.localAhead which restarts it.
+	 *
+	 * When provider is synced, runs diff3(localDoc, fork.base, remoteDoc):
+	 * - Success: write disk, sync to remote, clear fork, update LCA → idle.synced
+	 * - Conflict: → idle.conflict
+	 */
+	private async invokeForkReconcile(signal: AbortSignal): Promise<unknown> {
+		if (!this._fork) {
+			return { success: true, newLCA: this._lca };
+		}
+
+		if (!this._isProviderSynced()) {
+			// Provider not synced yet — stay in idle.localAhead and wait.
+			// PROVIDER_SYNCED will reenter idle.localAhead, restarting this invoke.
+			return { success: false, awaitingProvider: true };
+		}
+
+		const localDoc = this.requireLocalDoc("fork reconcile");
+		if (!localDoc) {
+			return { success: false };
+		}
+		const remoteDoc = this.remoteDoc;
+		if (!remoteDoc) {
+			// No remote replica is attached — an unmet precondition, not a
+			// failure. Rest in idle.localAhead; the folder poll connects forked
+			// documents, and the resulting PROVIDER_SYNCED restarts this invoke
+			// with the replica present. The rest is a self-transition the
+			// transition log does not record, so leave one trace per fork.
+			if (!this._warnedForkAwaitingReplica) {
+				this._warnedForkAwaitingReplica = true;
+				this.hsmWarn(
+					`fork reconcile awaiting remote replica | guid=${this._guid} ` +
+						`state=${this._statePath} forkOrigin=${this._fork?.origin} ` +
+						`forkCreated=${this._fork?.created}`,
+				);
+			}
+			return { success: false, awaitingProvider: true };
+		}
+
+		const fork = this._fork;
+		const localContent = localDoc.getText("contents").toString();
+
+		// Apply any pending remote updates before reading remoteDoc content
+		if (this.pendingIdleUpdates) {
+			Y.applyUpdate(remoteDoc, this.pendingIdleUpdates, remoteDoc);
+			this.pendingIdleUpdates = null;
+		}
+		const remoteContent = remoteDoc.getText("contents").toString();
+
+		this.hsmDebug('reconcileForkInIdle', JSON.stringify({
+			guid: this._guid, captureMark: fork.captureMark, origin: fork.origin,
+			baseLen: fork.base.length, localLen: localContent.length, remoteLen: remoteContent.length,
+			...(flags().enableDeltaLogging ? { base: fork.base, local: localContent, remote: remoteContent } : {}),
+		}));
+		const currentRemoteSnapshot = snapshotFromDoc(remoteDoc);
+		// A provider replacement can attach a server replica that is behind the
+		// remote head captured with the fork. Missing CRDT history is not a remote
+		// deletion: keep the disk-ingested local side intact and republish it.
+		// The skip requires strict dominance: when each head holds operations the
+		// other lacks, the replica carries genuine concurrent peer progress, and
+		// skipping the merge would republish the local state as a deletion of
+		// that progress.
+		const forkRemoteSnapshot = { snapshot: fork.remoteSnapshot };
+		const remoteDroppedForkState =
+			snapshotHasOpsMissingFrom(forkRemoteSnapshot, currentRemoteSnapshot) &&
+			!snapshotHasOpsMissingFrom(currentRemoteSnapshot, forkRemoteSnapshot);
+		const mergeResult = remoteDroppedForkState
+			? { success: true as const, merged: localContent }
+			: performThreeWayMerge(fork.base, localContent, remoteContent);
+
+		if (mergeResult.success) {
+			// Hash first so the only async window in this reconcile sits before any
+			// durable mutation. A remote update that lands during the await moves
+			// remoteDoc past the content we merged: the outcome is superseded. Bail
+			// before touching localDoc or emitting writes so idle.loading can
+			// re-classify against the new remote state instead of committing — and
+			// then silently declaring converged on — a stale merge.
+			const hash = await this.hashFn(mergeResult.merged);
+			if (signal.aborted) {
+				return { success: false };
+			}
+			if (this.pendingIdleUpdates !== null) {
+				return { success: false, superseded: true };
+			}
+
+			// Cancel all disk ops — fork gates outbound sync so no peer
+			// has seen them. The merged result will be applied fresh via DMP.
+			const opCapture = this.getOpCapture();
+			const diskOps = (opCapture && fork.captureMark != null)
+				? opCapture.sinceByOrigin(fork.captureMark, DISK_ORIGIN)
+				: [];
+			this.hsmDebug('fork-reconcile cancel', JSON.stringify({
+				guid: this._guid, hasOpCapture: !!opCapture, captureMark: fork.captureMark,
+				diskOpsCount: diskOps.length, mergedLen: mergeResult.merged.length,
+				...(flags().enableDeltaLogging ? { merged: mergeResult.merged } : {}),
+			}));
+			if (diskOps.length > 0) {
+				opCapture!.cancel(diskOps);
+			}
+			this._ingestionTexts = [];
+
+			// Merge remote CRDT state into localDoc so that shared edits
+			// use the same item IDs as the remote. Without this step,
+			// applyContentToLocalDoc would generate independent insert
+			// ops that duplicate text already present in the remote CRDT.
+			const remoteUpdate = Y.encodeStateAsUpdate(
+				remoteDoc,
+				Y.encodeStateVector(localDoc),
+			);
+			this.applyRemoteStateThenMergedContent(
+				remoteUpdate,
+				mergeResult.merged,
+			);
+
+			const snapshot = snapshotFromDoc(localDoc).snapshot;
+			const update = Y.encodeStateAsUpdate(localDoc);
+
+			const mtime = this.timeProvider.now();
+			this.emitWriteDisk(
+				mergeResult.merged,
+				hash,
+				mtime,
+			);
+			this._bridge.syncToRemote(update);
+
+			// If fork originated from a machine edit, register as pending so
+			// the late-arriving remote CRDT (same edit from the other vault)
+			// is detected and skipped by idle-merge.
+			if (fork.origin === 'machine-edit' && fork.machineEditFn) {
+				this._pendingMachineEdits.push({
+					fn: fork.machineEditFn,
+					expectedText: mergeResult.merged,
+					captureMark: fork.captureMark,
+					registeredAt: this.timeProvider.now(),
+					teardownCompletion: { kind: "closed" },
+				});
+				const MACHINE_EDIT_TTL = 5000;
+				this.timeProvider.setTimeout(() => {
+					this.expireMachineEdits();
+				}, MACHINE_EDIT_TTL + 100);
+			}
+
+			return {
+				success: true,
+				newLCA: {
+					contents: mergeResult.merged,
+					meta: { hash, mtime },
+					snapshot,
+				},
+			};
+		}
+
+		// Merge conflict — can't auto-resolve.
+		// Build the active conflict so the diff UI is available when the user
+		// opens the file from idle.conflict. Without this, CRDT merge during
+		// provider sync would make localDoc and disk identical, causing the
+		// active.entering reconciliation to skip conflict detection
+		// (localText === diskText).
+		this._conflict = new Conflict({
+			base: fork.base,
+			ours: localContent,
+			theirs: remoteContent,
+			regions: mergeResult.conflictRegions ?? [],
+		});
+		return { success: false };
+	}
+
+	private emitWriteDisk(
+		contents: string,
+		hash: string | undefined,
+		mtime?: number,
+	): void {
+		// The disk record this write's merge was predicated on rides along so
+		// the executor can validate the file still matches it before the
+		// overwrite. _disk at emit time is that record: an observation that
+		// arrived after the decision either restarted the invoke that decided
+		// it or superseded the record with a strictly fresher look at the file.
+		const expectedDisk = this._disk;
+		this.emitEffect({
+			type: "WRITE_DISK",
+			guid: this._guid,
+			contents,
+			...(hash ? { hash } : {}),
+			...(mtime !== undefined ? { mtime } : {}),
+			...(expectedDisk ? { expectedDisk } : {}),
+		});
+	}
+
+	private updateDiskFromConfirmedWrite(identity: {
+		hash: string;
+		mtime: number;
+	}): void {
+		this._disk = identity;
+		this._needsDiskContentLoad = false;
+		this.discardSupersededPendingDiskContents();
+	}
+
+	/**
+	 * Commit an invoke result's LCA immediately when disk already carries its
+	 * content, otherwise hold it for commitPendingLCAOnDiskConfirm. A held
+	 * result that never confirms leaves the previous baseline in place, so
+	 * later classification re-derives from content the file actually has.
+	 */
+	private commitLCAWithDiskConfirmation(candidate: LCACandidate): void {
+		const newLCA = this.resolveLCACandidate(candidate);
+		if (!newLCA) {
+			this.hsmWarn(
+				`commitLCA: no head snapshot and no localDoc to capture one | ` +
+					`guid=${this._guid} state=${this._statePath}`,
+			);
+			return;
+		}
+		if (!this._disk || this._disk.hash === newLCA.meta.hash) {
+			this._setLCA(newLCA);
+			this._localSnapshot = newLCA.snapshot;
+			this._remoteSnapshot = newLCA.snapshot;
+			return;
+		}
+		this._pendingDiskConfirmLCA = {
+			lca: newLCA,
+			priorLocalSnapshot: this._localSnapshot,
+			priorRemoteSnapshot: this._remoteSnapshot,
+		};
+	}
+
+	/**
+	 * Resolve an invoke result's LCA candidate into a real LCAState. A
+	 * candidate defers head capture (snapshot: null) until its merge has been
+	 * applied to the live localDoc; capture happens here, at commit time.
+	 */
+	private resolveLCACandidate(candidate: LCACandidate): LCAState | null {
+		if (candidate.snapshot) {
+			return { ...candidate, snapshot: candidate.snapshot };
+		}
+		if (!this.localDoc) return null;
+		return { ...candidate, snapshot: snapshotFromDoc(this.localDoc).snapshot };
+	}
+
+	private commitPendingLCAOnDiskConfirm(identity: {
+		hash: string;
+		mtime: number;
+	}): void {
+		const pending = this._pendingDiskConfirmLCA;
+		if (!pending) return;
+		this._pendingDiskConfirmLCA = null;
+		if (pending.lca.meta.hash !== identity.hash) {
+			// A different write landed; the held result no longer describes
+			// disk. Keep the confirmed baseline and let the next
+			// classification re-derive.
+			return;
+		}
+		const previousLCA = this._lca;
+		this._setLCA({
+			...pending.lca,
+			meta: { ...pending.lca.meta, hash: identity.hash, mtime: identity.mtime },
+		});
+		if (this._lca === previousLCA) {
+			// _setLCA refused the capture (localDoc moved past the held
+			// result); the confirmed baseline stands.
+			return;
+		}
+		const unchangedSince = (
+			current: Uint8Array | null,
+			prior: Uint8Array | null,
+		): boolean => {
+			if (current === prior) return true;
+			if (current === null || prior === null) return false;
+			try {
+				return snapshotsEqual({ snapshot: current }, { snapshot: prior });
+			} catch {
+				return false;
+			}
+		};
+		// A head that moved while the write was in flight carries newer
+		// knowledge than the held result; never regress it.
+		if (unchangedSince(this._localSnapshot, pending.priorLocalSnapshot)) {
+			this._localSnapshot = pending.lca.snapshot;
+		}
+		if (unchangedSince(this._remoteSnapshot, pending.priorRemoteSnapshot)) {
+			this._remoteSnapshot = pending.lca.snapshot;
+		}
+		this.emitPersistState();
+	}
+
+	// ===========================================================================
+	// Event Handler
+	// ===========================================================================
+
+	private handleEvent(event: MergeEvent): void {
+		// Handle Obsidian file lifecycle events (diagnostic, all states)
+		if (event.type === 'OBSIDIAN_FILE_OPENED') {
+			this._obsidianFileOpen = true;
+			return; // Diagnostic only, no state transition
+		}
+			if (event.type === 'OBSIDIAN_FILE_UNLOADED') {
+				this._obsidianFileOpen = false;
+				return; // Diagnostic only, no state transition
+			}
+			if (event.type === 'OBSIDIAN_LOAD_FILE_INTERNAL') {
+				return; // Diagnostic only, no state transition
+			}
+		if (event.type === 'OBSIDIAN_SET_VIEW_DATA') {
+			// loadFileInternal is the authoritative open-view disk ingress.
+			// In active tracking, apply its final (possibly three-way merged)
+			// view body immediately. The following CM6 "set" transaction is an
+			// idempotent editor echo, not a second opportunity to infer origin.
+			if (
+				event.diskReload &&
+				this._statePath === "active.tracking" &&
+				!this._fork &&
+				!this._conflict &&
+				this.localDoc
+			) {
+				this.applyContentToLocalDoc(event.data);
+				this.lastKnownEditorText = event.data;
+				this._bridge.flushOutbound();
+				this.capturePendingDiskLCA(event.data);
+			} else if (event.clear && this._statePath !== "active.tracking") {
+				// Before active tracking, retain a full replacement as the disk
+				// side of active-entry reconciliation.
+				this.setPendingDiskContents(event.data, "view-data", this._disk?.hash ?? null);
+			}
+			return;
+		}
+		if (event.type === 'OBSIDIAN_SAVE_FRONTMATTER'
+			|| event.type === 'OBSIDIAN_METADATA_SYNC'
+			|| event.type === 'OBSIDIAN_VIEW_REUSED'
+			|| event.type === 'OBSIDIAN_THREE_WAY_MERGE'
+			|| event.type === 'DRIFT_CHECK') {
+			return; // Diagnostic only, no state transition
+		}
+
+		processEvent(this, event, MACHINE, this._interpreterConfig);
+	}
+
+
+	/**
+	 * Create localDoc and localPersistence if they don't exist.
+	 * Used when entering idle mode to keep docs alive for auto-merge.
+	 */
+	ensureLocalDocForIdle(): void {
+		if (!this.localDoc) {
+			this.localDoc = this.createLocalDoc();
+			this._localDocSnapshotSafe = false;
+			if (this._localDocClientID !== null) {
+				this.localDoc.clientID = this._localDocClientID;
+			}
+		}
+
+		if (!this.localPersistence) {
+			this.localPersistence = this._createPersistence(
+				this.vaultId,
+				this.localDoc,
+				this._captureOpts,
+			);
+
+			if (this.localPersistence.synced) {
+				this.handleIdleLocalPersistenceSynced();
+			} else {
+				this.localPersistence.once("synced", () => {
+					this.handleIdleLocalPersistenceSynced();
+				});
+			}
+		}
+		this.assertMachineResources("after ensureLocalDocForIdle");
+	}
+
+	/**
+	 * Replay events accumulated during loading state.
+	 * Called after mode transition to process REMOTE_UPDATE and DISK_CHANGED events.
+	 *
+	 * Events are accumulated during loading states and replayed after
+	 * the HSM transitions to idle.* or active.* mode.
+	 */
+	private replayAccumulatedEvents(): void {
+		if (this._accumulatedEvents.length === 0) {
+			return;
+		}
+
+		// Take a copy and clear before processing (avoid re-entrancy issues)
+		const events = [...this._accumulatedEvents];
+		this._accumulatedEvents = [];
+
+		for (const event of events) {
+			// Re-send the event - since we're now in idle/active mode, it will be processed normally
+			this.send(event as MergeEvent);
+		}
+	}
+
+	private absorbTextPreservingRemoteUpdate(event: MergeEvent): void {
+		if (event.type !== "REMOTE_UPDATE" || event.affectsText !== false) return;
+		if (!this._lca || !this.localDoc || !this.remoteDoc) return;
+		if (this._fork || this._conflict) return;
+		const lcaContents = this.requireLcaContents("absorbTextPreservingRemoteUpdate");
+		if (lcaContents === null) return;
+
+		const localText = this.localDoc.getText("contents").toString();
+		const remoteText = this.remoteDoc.getText("contents").toString();
+		if (localText !== remoteText || localText !== lcaContents) return;
+		if (this._disk && this._disk.hash !== this._lca.meta.hash) return;
+
+		// Convergence requires equal full snapshots: a delete-only update
+		// moves no insert clock while the documents' tombstones differ.
+		const localSnapshot = snapshotFromDoc(this.localDoc);
+		if (!snapshotsEqual(localSnapshot, snapshotFromDoc(this.remoteDoc))) {
+			return;
+		}
+
+		this._localSnapshot = localSnapshot.snapshot;
+		this._remoteSnapshot = localSnapshot.snapshot;
+
+		// Advance the baseline whenever the full snapshot moved — including
+		// delete-only changes. Recapture the snapshot from the live document:
+		// spreading the previous snapshot forward would persist a head that
+		// lacks the newly absorbed ops.
+		let lcaSnapshotCurrent = false;
+		try {
+			lcaSnapshotCurrent = snapshotsEqual(
+				{ snapshot: this._lca.snapshot },
+				localSnapshot,
+			);
+		} catch {
+			// Unreadable persisted snapshot data — recapture below.
+		}
+		if (lcaSnapshotCurrent) {
+			return;
+		}
+		this._setLCA({
+			...this._lca,
+			snapshot: localSnapshot.snapshot,
+		});
+		this.emitPersistState();
+	}
+
+	private hasLocalChangedSinceLCA(): boolean {
+		if (!this._lca) return false;
+		const localSnapshot = this._localSnapshot;
+
+		if (!localSnapshot) return false;
+
+		// Check if local has operations — inserts or deletes — not in LCA
+		try {
+			return snapshotHasOpsMissingFrom(
+				{ snapshot: localSnapshot },
+				{ snapshot: this._lca.snapshot },
+			);
+		} catch {
+			// An unreadable head cannot prove convergence; force verification.
+			return true;
+		}
+	}
+
+	private hasDiskChangedSinceLCA(): boolean {
+		if (!this._lca || !this._disk) return false;
+		return this._lca.meta.hash !== this._disk.hash;
+	}
+
+	/**
+	 * Classify an idle-invoke exception as transport-caused (retryable) or not.
+	 *
+	 * The retry loop must not mask real corruption, so this recognizes only the
+	 * connectivity failure signatures — provider drop, socket close, token
+	 * refresh — and treats everything else as permanent.
+	 */
+	private isTransportError(error: Error): boolean {
+		const text = `${error.name} ${error.message}`.toLowerCase();
+		return MergeHSM.TRANSPORT_ERROR_SIGNATURES.some((sig) => text.includes(sig));
+	}
+
+	private hasRemoteChangedSinceLCA(): boolean {
+		if (!this._lca) return false;
+		const remoteSnapshot = this._remoteSnapshot;
+
+		if (!remoteSnapshot) return false;
+
+		// Check if remote has operations — inserts or deletes — not in LCA
+		try {
+			return snapshotHasOpsMissingFrom(
+				{ snapshot: remoteSnapshot },
+				{ snapshot: this._lca.snapshot },
+			);
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * The basis a server head is compared against: the live localDoc's head
+	 * when the machine is warm; when cold, the enrolled local head (the head
+	 * the persisted record carries) or the LCA head for a clean hibernated
+	 * document whose own head was compacted away. Null means no basis —
+	 * nothing can prove currency. A stale basis errs toward "ahead", never
+	 * toward skipping needed work.
+	 */
+	private serverCompareBasis(): YjsSnapshot | null {
+		// The live doc is the basis only once its persistence has replayed —
+		// a doc mid-replay reads as empty and would call every head ahead.
+		if (this.localDoc && this.localPersistence?.synced === true) {
+			try {
+				return snapshotFromDoc(this.localDoc);
+			} catch {
+				return null;
+			}
+		}
+		const bytes = this._enrolledLocalSnapshot ?? this._lca?.snapshot ?? null;
+		return bytes ? { snapshot: bytes } : null;
+	}
+
+	/**
+	 * Act on a server head from a state that can: compare it against this
+	 * machine's own basis and request a background sync session unless the
+	 * two are provably converged. A head strictly ahead of the basis
+	 * converges immediately; any other divergence is a local-ahead flush,
+	 * paced by the in-memory attempt clock. A head equal to the basis clears
+	 * the clock and requests nothing.
+	 */
+	private actOnServerHead(head: YjsSnapshot): void {
+		const basis = this.serverCompareBasis();
+		if (basis) {
+			try {
+				if (snapshotsEqual(head, basis)) {
+					this._localAheadAttemptAt = null;
+					return;
+				}
+				if (!snapshotIsAhead(head, basis)) {
+					const now = this.timeProvider.now();
+					if (
+						this._localAheadAttemptAt !== null &&
+						now - this._localAheadAttemptAt <
+							MergeHSM.LOCAL_AHEAD_RETRY_INTERVAL_MS
+					) {
+						return;
+					}
+					this._localAheadAttemptAt = now;
+				}
+			} catch {
+				// An unreadable head or basis cannot prove convergence;
+				// fall through and request the session.
+			}
+		}
+		this.emitEffect({ type: "ENQUEUE_SYNC", guid: this._guid });
+	}
+
+	private providerSyncedRemoteAhead(): boolean {
+		if (!this._lca || !this.remoteDoc) return false;
+		if (this.hasDiskChangedSinceLCA() || this.hasLocalChangedSinceLCA()) {
+			return false;
+		}
+		try {
+			return snapshotIsAhead(
+				snapshotFromDoc(this.remoteDoc),
+				{ snapshot: this._lca.snapshot },
+			);
+		} catch {
+			// An unreadable baseline cannot prove convergence; treat the
+			// synced provider as ahead so verification runs.
+			return true;
+		}
+	}
+
+
+	// ===========================================================================
+	// YDoc Management
+	// ===========================================================================
+
+	/**
+	 * Keep every deleted item that was visible at the current LCA snapshot.
+	 * Items deleted by the baseline and items created afterward are unrelated
+	 * to reconstructing that baseline, so Yjs may collect them normally.
+	 */
+	private readonly localDocGcFilter = (item: Y.Item): boolean => {
+		if (!this._persistenceStateLoaded) return false;
+
+		const encoded = this._lca?.snapshot;
+		if (!encoded) return true;
+
+		if (this._lcaGcPinCache?.encoded !== encoded) {
+			let decoded: Y.Snapshot | null = null;
+			try {
+				decoded = Y.decodeSnapshot(encoded);
+			} catch {
+				// An unreadable baseline cannot safely identify disposable
+				// content. Keep deleted items until a valid baseline supersedes it.
+			}
+			this._lcaGcPinCache = { encoded, decoded };
+		}
+
+		const baseline = this._lcaGcPinCache.decoded;
+		if (!baseline) return false;
+
+		const baselineClock = baseline.sv.get(item.id.client) ?? 0;
+		if (item.id.clock >= baselineClock) return true;
+		return Y.isDeleted(baseline.ds, item.id);
+	};
+
+	private createLocalDoc(): Y.Doc {
+		return new Y.Doc({ gcFilter: this.localDocGcFilter });
+	}
+
+	/**
+	 * Revisit tombstones retained for an older baseline. Advancing the LCA adds
+	 * newly accepted deletions to its snapshot, so the filter releases their
+	 * content during this sweep instead of retaining it for the document's
+	 * lifetime.
+	 */
+	private collectUnpinnedLocalDeletes(): void {
+		if (!this.localDoc?.gc) return;
+		Y.tryGc(
+			Y.createDeleteSetFromStructStore(this.localDoc.store),
+			this.localDoc.store,
+			this.localDoc.gcFilter,
+		);
+	}
+
+	private createYDocs(): void {
+		// Reuse localDoc if it already exists (e.g., from initializeFromRemote() enrollment)
+		if (!this.localDoc) {
+			this.localDoc = this.createLocalDoc();
+			this._localDocSnapshotSafe = false;
+
+			// Reuse the client ID from a previous session if available.
+			// This prevents content duplication when IDB is empty on reopen:
+			// without this fix, a new client ID would be used to insert the same
+			// content, causing duplication when merged with remoteDoc's history.
+			if (this._localDocClientID !== null) {
+				const freshClientID = this.localDoc.clientID;
+				this.localDoc.clientID = this._localDocClientID;
+				this.crdtLog(
+					`createYDocs | reusing clientID=${this._localDocClientID} (fresh would have been ${freshClientID})`,
+				);
+			} else {
+				this.crdtLog(`createYDocs | new clientID=${this.localDoc.clientID}`);
+			}
+		}
+
+		// Attach persistence to localDoc — it loads stored updates
+		// asynchronously and fires 'synced' when done.
+		// Reuse persistence if it already exists (e.g., from initializeFromRemote() enrollment)
+		if (!this.localPersistence) {
+			this.localPersistence = this._createPersistence(
+				this.vaultId,
+				this.localDoc,
+				this._captureOpts,
+			);
+		}
+
+		// Check if persistence already synced (race condition fix).
+		// If synced is already true, the 'synced' event won't fire again,
+		// so we must call the handler immediately.
+		if (this.localPersistence.synced) {
+			this.handleLocalPersistenceSynced();
+		} else {
+			this.localPersistence.once("synced", () => {
+				this.handleLocalPersistenceSynced();
+			});
+		}
+	}
+
+	/**
+	 * Handle local persistence synced event.
+	 * Called either immediately if persistence was already synced,
+	 * or via the 'synced' event callback.
+	 */
+	private maybeSignalPersistenceReady(source: "event" | "localSync"): void {
+		if (!this.matches("active.entering.awaitingPersistence")) {
+			return;
+		}
+		if (!this.localPersistence || !this.localPersistence.synced) {
+			return;
+		}
+
+		const hasContent = this.localPersistence.hasUserData();
+		const remoteHasContent = !!this.remoteDoc && !isEmptyDoc(this.remoteDoc);
+		const canProceed = hasContent || remoteHasContent;
+
+		// System Invariant #3: when IDB is empty, consult the server before
+		// making a merge decision. Proceeding offline with no persisted CRDT
+		// and no server-delivered remote state risks either content duplication
+		// or a whole-file two-way conflict. Stay in awaitingPersistence until
+		// enrollment writes content or remote content arrives.
+		if (!canProceed) {
+			return;
+		}
+
+		this.crdtLog(
+			`persistence ready signal | source=${source} | hasContent=${hasContent} | ` +
+				`remoteHasContent=${remoteHasContent} | providerSynced=${this._providerSynced} | ` +
+				`hsmOnline=${this._isOnline}`,
+		);
+		this.send({ type: "PERSISTENCE_SYNCED", hasContent });
+	}
+
+	private refreshAfterLocalPersistenceSynced(options: { applyPendingIdleUpdates: boolean }): boolean {
+		// Set persistence metadata for recovery/debugging
+		if (this._persistenceMetadata && this.localPersistence?.set) {
+			this.localPersistence.set("path", this._persistenceMetadata.path);
+			this.localPersistence.set("relay", this._persistenceMetadata.relay);
+			this.localPersistence.set("appId", this._persistenceMetadata.appId);
+			this.localPersistence.set("s3rn", this._persistenceMetadata.s3rn);
+		}
+
+		// Determine if IDB had stored CRDT state by checking database size directly.
+		// This is checked BEFORE applying pendingIdleUpdates so it reflects
+		// only what the persistence database loaded.
+		//
+		// NOTE: We intentionally do NOT check for LCA existence here.
+		// Per System Invariant #3: "When IDB is empty (no persisted CRDT), the HSM
+		// must consult the server before making a merge decision."
+		// Even if LCA exists (from a previous session), if IDB is empty we must
+		// wait for PROVIDER_SYNCED to get the server's CRDT state before proceeding.
+		// Otherwise we'd go straight to reconciling with empty localDoc, trigger
+		// a merge that re-inserts disk content with a new client ID, and cause
+		// content duplication when synced with remoteDoc's existing history.
+		if (!this.localPersistence) {
+			throw new Error(
+				"[MergeHSM] localPersistence is null in handleLocalPersistenceSynced",
+			);
+		}
+		// Check if IDB has stored content.
+		const hasContent = this.localPersistence.hasUserData();
+		const localText = this.localDoc?.getText("contents").toString() ?? "";
+
+		this.crdtLog(
+			`persistence synced | hasContent=${hasContent} | ` +
+				`localDocLen=${localText.length} | clientID=${this.localDoc?.clientID} | ` +
+				`savedClientID=${this._localDocClientID}`,
+		);
+
+		// Only apply pendingIdleUpdates when localDoc is empty.
+		// If localDoc has content from IndexedDB, we must NOT blindly apply pendingIdleUpdates
+		// even if the content matches - the CRDT histories may differ (same text inserted by
+		// different clients), and applying would duplicate content.
+		//
+		// Instead, let flushInbound() in handleYDocsReady() handle the merge properly.
+		// It compares content and returns early if they match, without risking duplication.
+		if (
+			options.applyPendingIdleUpdates &&
+			this.pendingIdleUpdates &&
+			this.pendingIdleUpdates.length > 0 &&
+			this.localDoc
+		) {
+			// Only apply if localDoc has no CRDT history - safe to apply remote content.
+			if (isEmptyDoc(this.localDoc)) {
+				this._bridge.syncToLocal(this.pendingIdleUpdates);
+			}
+			// If localDoc has content, DO NOT apply - let flushInbound() handle it
+			this.pendingIdleUpdates = null;
+		}
+
+		// Update the head snapshot to reflect what's in localDoc.
+		if (this.localDoc) {
+			this._localSnapshot = snapshotFromDoc(this.localDoc).snapshot;
+			this.markLocalDocSnapshotSafeIfLoadedHeadMatches();
+
+			// Record the client ID for reuse across lock cycles.
+			// This prevents content duplication when IDB comes back empty on reopen.
+			if (this._localDocClientID === null) {
+				this._localDocClientID = this.localDoc.clientID;
+			}
+		}
+
+		return hasContent;
+	}
+
+	private handleIdleLocalPersistenceSynced(): void {
+		const hasContent = this.refreshAfterLocalPersistenceSynced({
+			applyPendingIdleUpdates: false,
+		});
+		if (this.shouldWakeLCARecoveryAfterPersistenceSynced(hasContent)) {
+			this.crdtLog(
+				`idle persistence ready | waking LCA recovery | ` +
+					`hasDisk=${this.pendingDiskContents !== null} | hasRemote=${this.pendingIdleUpdates !== null}`,
+			);
+			this.send({ type: "PERSISTENCE_SYNCED", hasContent });
+		}
+	}
+
+	private handleLocalPersistenceSynced(): void {
+		// Guard: If we're no longer in awaitingPersistence (e.g., lock was released
+		// or unload happened during async persistence load), ignore this callback.
+		if (!this.matches("active.entering.awaitingPersistence")) {
+			return;
+		}
+
+		this.refreshAfterLocalPersistenceSynced({
+			applyPendingIdleUpdates: true,
+		});
+
+		// Set up observer for remote updates (converts deltas to positioned changes)
+		this.setupLocalDocObserver();
+
+		// Signal readiness once persistence is synced and either:
+		// 1) IDB has content, or
+		// 2) remote content has arrived.
+		// An empty provider sync is not enough for a newly enrolled local file;
+		// initial disk enrollment must write the CRDT first.
+		this.maybeSignalPersistenceReady("localSync");
+	}
+
+
+	/**
+	 * When IDB was empty and the server has content, apply server CRDT to localDoc.
+	 * This ensures localDoc has the latest remote state before reconciliation.
+	 */
+	private applyRemoteToLocalIfNeeded(): void {
+		if (!this.localDoc || !this.remoteDoc) return;
+
+		// Only apply if localDoc has no CRDT history and remoteDoc does.
+		if (isEmptyDoc(this.localDoc) && !isEmptyDoc(this.remoteDoc)) {
+			const update = Y.encodeStateAsUpdate(
+				this.remoteDoc,
+				Y.encodeStateVector(this.localDoc),
+			);
+			this._bridge.syncToLocal(update);
+		}
+	}
+
+
+	/**
+	 * Set up Y.Text observer on localDoc to convert Yjs deltas to PositionedChange[].
+	 * When updates are applied with origin='remote', the observer fires with event.delta
+	 * which we convert directly to positioned changes for CM6.
+	 */
+	private setupLocalDocObserver(): void {
+		if (!this.localDoc) return;
+
+		const ytext = this.localDoc.getText("contents");
+		const ymap = this.localDoc.getMap("frontmatter");
+		const itemId = (value: Y.Item | Y.ID | null | undefined): string | null => {
+			const id = value && "id" in value ? value.id : value;
+			return typeof id?.client === "number" && typeof id?.clock === "number"
+				? `${id.client}:${id.clock}`
+				: null;
+		};
+		// Y.Map does not expose the causal predecessor of a winning value.
+		// Pin this narrow use of Yjs's Item shape so concurrent map seeds can be
+		// distinguished from value writes based on our current winner.
+		const currentItem = (key: string): Y.Item | undefined => ymap._map.get(key);
+		this.frontmatterMapItemIds.clear();
+		for (const key of ymap.keys()) {
+			const id = itemId(currentItem(key));
+			if (id !== null) this.frontmatterMapItemIds.set(key, id);
+		}
+		this.localFrontmatterObserver = (event, tr) => {
+			const updates = [...event.changes.keys].filter(([, change]) =>
+				change.action === "update",
+			);
+			if (
+				tr.origin === this.remoteDoc &&
+				!tr.changed.has(ytext as unknown as YChangedType) &&
+				updates.length > 0
+			) {
+				const parsed = this.parseFrontmatter(ytext.toString())?.parsed;
+				const shouldArm = parsed !== undefined && updates.some(([key, change]) => {
+						const item = currentItem(key);
+						const priorId = this.frontmatterMapItemIds.get(key);
+						const causalPredecessor = itemId(item?.origin);
+						return priorId !== undefined &&
+							causalPredecessor === priorId &&
+							key in parsed &&
+							JSON.stringify(parsed[key]) === change.oldValue &&
+							ymap.get(key) !== change.oldValue;
+					});
+				if (shouldArm) this._remoteFrontmatterMapUpdated = true;
+			}
+
+			for (const [key, change] of event.changes.keys) {
+				if (change.action === "delete") {
+					this.frontmatterMapItemIds.delete(key);
+					continue;
+				}
+				const id = itemId(currentItem(key));
+				if (id !== null) this.frontmatterMapItemIds.set(key, id);
+			}
+		};
+		ymap.observe(this.localFrontmatterObserver);
+		this.localTextObserver = (event: Y.YTextEvent, tr: Y.Transaction) => {
+			// Skip when suppressed (during machine edit rewind)
+			if (this._suppressLocalObserver) return;
+
+			// Skip changes originated by this HSM (CM6 edits, conflict resolution, etc.).
+			// Remote-originated changes use remoteDoc as origin, so they pass through.
+			if (tr.origin === this) return;
+
+			// Skip frontmatter repair ops. repairFrontmatterFromMap corrects the
+			// Y.Text to match the Y.Map — the editor already has clean content
+			// from the Y.Map dispatch path, so these Y.Text-only corrections
+			// must not be forwarded as raw deltas.
+			if (tr.origin === FRONTMATTER_MIRROR_ORIGIN) return;
+
+			// Only dispatch in tracking state
+			if (this._statePath !== "active.tracking") return;
+
+			// When the same transaction also updated Y.Map("frontmatter"),
+			// dispatch the Y.Map-derived frontmatter instead of raw Y.Text delta.
+			// This avoids interleaved character-level ops corrupting frontmatter in CM6.
+			const ymapChangedInTx = tr.changed.has(ymap as unknown as YChangedType);
+			if (ymapChangedInTx && this._yaml) {
+				if (tr.origin === this.remoteDoc) {
+					this._remoteFrontmatterMapUpdated = true;
+				}
+				const correctDoc = this.buildDocFromYMap();
+				const cachedEditorText = this.lastKnownEditorText;
+				const editorText = this.readCurrentEditorText();
+				this.crdtLog(
+					`Y.Map dispatch: ymapChanged=true, correctDoc=${correctDoc !== null ? correctDoc.length + ' chars' : 'null'}, ` +
+					`lastKnown=${cachedEditorText !== null ? cachedEditorText.length + ' chars' : 'null'}, ` +
+					`editorBase=${editorText !== null ? editorText.length + ' chars' : 'null'}, ` +
+					`origin=${String(tr.origin)}`
+				);
+				if (correctDoc !== null && editorText !== null) {
+					// Frontmatter map updates are full-document repairs from the
+					// receiver side. Use a single contiguous replacement diff for
+					// CM6 here; split DMP edits against repeated characters can be
+					// dropped or replayed incorrectly by the editor.
+					const changes = computePositionedChanges(
+						editorText,
+						correctDoc,
+					);
+					if (changes.length > 0) {
+						this.crdtLog(`Y.Map dispatch: ${changes.length} changes to CM6`);
+						this.emitEffect({
+							type: "DISPATCH_CM6",
+							changes,
+							originView: this._localDocDispatchOriginView,
+						});
+						this.lastKnownEditorText = correctDoc;
+					} else {
+						this.crdtLog("Y.Map dispatch: no diff, skipping");
+					}
+					return; // skip delta-based dispatch
+				}
+			}
+
+			// Default: delta-based dispatch (body changes, old clients)
+			const changes = this.deltaToPositionedChanges(event.delta);
+			if (changes.length > 0) {
+				this.crdtLog(
+					`delta dispatch: ${changes.length} changes, ` +
+					`delta=${JSON.stringify(event.delta)}, ` +
+					`origin=${String(tr.origin)}, ` +
+					`ymapInTx=${tr.changed.has(this.localDoc!.getMap("frontmatter") as unknown as YChangedType)}`
+				);
+				this.emitEffect({
+					type: "DISPATCH_CM6",
+					changes,
+					originView: this._localDocDispatchOriginView,
+				});
+				// Keep lastKnownEditorText in sync so Y.Map dispatch
+				// has an accurate base for its full-document diff.
+				if (this.lastKnownEditorText !== null) {
+					this.lastKnownEditorText = this.applyChangesToText(
+						this.lastKnownEditorText, changes
+					);
+				}
+			}
+		};
+		ytext.observe(this.localTextObserver);
+
+		this._bridge.setupUpdateQueues();
+	}
+
+	/**
+	 * Convert a Yjs delta to PositionedChange[].
+	 * Converts Yjs delta format to CM6-compatible positioned changes.
+	 */
+	private deltaToPositionedChanges(
+		delta: Array<{
+			insert?: string | object;
+			delete?: number;
+			retain?: number;
+		}>,
+	): PositionedChange[] {
+		const changes: PositionedChange[] = [];
+		let pos = 0;
+
+		for (const d of delta) {
+			if (d.insert != null) {
+				// Insert is string content (we ignore embedded objects)
+				const insertText = typeof d.insert === "string" ? d.insert : "";
+				if (insertText) {
+					changes.push({ from: pos, to: pos, insert: insertText });
+				}
+			} else if (d.delete != null) {
+				changes.push({ from: pos, to: pos + d.delete, insert: "" });
+				pos += d.delete;
+			} else if (d.retain != null) {
+				pos += d.retain;
+			}
+		}
+		// Collapse adjacent delete+insert pairs into a single replacement.
+		// CM6 can drop a zero-width insert that lands on the trailing
+		// boundary of a preceding delete, which manifests as the delete
+		// taking effect but the insert being lost.
+		return mergeAdjacentChanges(changes);
+	}
+
+	/**
+	 * Asynchronously compute the hash for a just-established LCA and patch it in.
+	 * Called after reconcileForkInActive sets an LCA with an empty hash placeholder.
+	 * Checks that the LCA still refers to the same content before patching, so
+	 * stale results from superseded reconciliations are safely ignored.
+	 */
+	private patchLCAHash(content: string): void {
+		this.hashFn(content).then((hash) => {
+			if (
+				this._lca &&
+				this._lca.meta.hash === "" &&
+				this._lca.contents === content
+			) {
+				this._setLCA({ ...this._lca, meta: { ...this._lca.meta, hash } });
+				this.emitPersistState();
+			}
+		}).catch(() => {
+			// Hash failure is non-fatal; deactivateEditor will compute a correct LCA on close.
+		});
+	}
+
+	/**
+	 * Editor-specific teardown (active → idle).
+	 * Captures final state, updates LCA if disk matches, persists state,
+	 * removes Y.Text observer. localDoc, localPersistence, and remoteDoc stay alive.
+	 */
+	private async deactivateEditor(): Promise<void> {
+		// Flush any pending machine edits — drop tracking and sync deferred ops
+		this.flushPendingMachineEdits();
+
+		// Capture final state for idle state determination and LCA update
+		let finalContent: string | null = null;
+		if (this.localDoc) {
+			this._localSnapshot = snapshotFromDoc(this.localDoc).snapshot;
+			finalContent = this.localDoc.getText("contents").toString();
+		}
+
+		// Update LCA if disk matches final localDoc content.
+		// This ensures that after a successful edit+save session, we transition to
+		// idle.synced instead of idle.diverged, preventing content duplication on reopen.
+		if (finalContent !== null && this._disk) {
+			const contentHash = await this.hashFn(finalContent);
+			const hashMatches = contentHash === this._disk.hash;
+			// Fallback to content comparison when disk hash is stale
+			// (save completed but file watcher hasn't fired yet)
+			const contentMatches =
+				hashMatches ||
+				this.pendingDiskContents === finalContent ||
+				this.lastKnownEditorText === finalContent;
+
+			if (contentMatches && !this._fork) {
+				// Disk matches localDoc - update LCA to reflect the synced state.
+				// Use disk.hash (not contentHash) to ensure hasDiskChangedSinceLCA()
+				// returns false, even if hash functions differ between sources.
+				this._setLCA({
+					contents: finalContent,
+					meta: {
+						hash: this._disk.hash,
+						mtime: this._disk.mtime,
+					},
+					snapshot: this._localSnapshot ?? emptySnapshot(),
+				});
+			}
+		}
+
+		// Always persist state on deactivation to cache the latest local head.
+		// This ensures idle mode sync status is accurate after reopening.
+		if (finalContent !== null) {
+			this.emitPersistState();
+		}
+
+		// Clean up Y.Text observer (editor-specific)
+		if (this.localDoc && this.localTextObserver) {
+			const ytext = this.localDoc.getText("contents");
+			ytext.unobserve(this.localTextObserver);
+			this.localTextObserver = null;
+		}
+		if (this.localDoc && this.localFrontmatterObserver) {
+			const ymap = this.localDoc.getMap("frontmatter");
+			ymap.unobserve(this.localFrontmatterObserver);
+			this.localFrontmatterObserver = null;
+		}
+
+		this._remoteFrontmatterMapUpdated = false;
+		this.frontmatterMapItemIds.clear();
+
+		// Clean up update queue listeners (editor-specific)
+		this._bridge.teardownUpdateQueues();
+
+		// localDoc, localPersistence, and remoteDoc stay alive for idle mode
+	}
+
+	/**
+	 * Destroy localDoc and persistence (for unload and hibernation).
+	 *
+	 * Nulls out references synchronously so callers see localDoc === null
+	 * immediately, then awaits pending IndexedDB writes on the captured
+	 * references. This prevents races where wake() recreates localDoc
+	 * while the async cleanup is still running.
+	 *
+	 * Caller handles remoteDoc separately.
+	 */
+	async destroyLocalDoc(): Promise<void> {
+		this.captureLocalHeadForPersistence();
+		// Capture current references before nulling — async cleanup
+		// operates on these, not on this.localDoc / this.localPersistence
+		// which may be replaced by ensureLocalDocForIdle() during the await.
+		const doc = this.localDoc;
+		const persistence = this.localPersistence;
+		const observer = this.localTextObserver;
+		const frontmatterObserver = this.localFrontmatterObserver;
+		// Capture and null handler references from the bridge
+		const { localUpdateHandler, remoteUpdateHandler } = this._bridge.detachHandlers();
+
+		// Null out immediately (synchronous) so the HSM is in a clean
+		// state for any subsequent ensureLocalDocForIdle() call.
+		this.localDoc = null;
+		this.localPersistence = null;
+		this.localTextObserver = null;
+		this.localFrontmatterObserver = null;
+		this._localDocSnapshotSafe = false;
+		this._remoteFrontmatterMapUpdated = false;
+		this.frontmatterMapItemIds.clear();
+		this._deferredFrontmatterKeys.clear();
+		this.assertMachineResources("after destroyLocalDoc");
+
+		// Clean up captured references
+		if (doc && observer) {
+			const ytext = doc.getText("contents");
+			ytext.unobserve(observer);
+		}
+		if (doc && frontmatterObserver) {
+			const ymap = doc.getMap("frontmatter");
+			ymap.unobserve(frontmatterObserver);
+		}
+		if (doc && localUpdateHandler) {
+			doc.off('update', localUpdateHandler);
+		}
+		if (this.remoteDoc && remoteUpdateHandler) {
+			this.remoteDoc.off('update', remoteUpdateHandler);
+		}
+
+		if (persistence) {
+			await persistence.destroy();
+		}
+		if (doc) {
+			doc.destroy();
+		}
+	}
+
+	async resetLocalPersistenceForRebuild(): Promise<void> {
+		const persistence = this.localPersistence as typeof this.localPersistence & {
+			clearDocumentData?: () => Promise<void>;
+		};
+		if (persistence?.clearDocumentData) {
+			await persistence.clearDocumentData();
+		}
+		await this.destroyLocalDoc();
+		this.clearEnrolledLocalHead();
+	}
+
+	/**
+	 * Central chokepoint for LCA *capture* (when we believe we've reached a
+	 * new common-ancestor state with the CRDT).
+	 *
+	 * Invariant: when localDoc exists, the captured LCA.contents must equal
+	 * localDoc.getText("contents"). LCA is the Last Common Ancestor — a
+	 * snapshot of content both sides agreed on. Capturing a value that
+	 * disagrees with the current CRDT creates a ghost baseline: disk/LCA
+	 * freezes at one value while localDoc evolves to another.
+	 *
+	 * Bypass: loading an LCA from persisted state (storePersistenceData)
+	 * is a trusted restoration — localDoc hasn't been built yet, there's
+	 * nothing to verify against, and the stored LCA was captured by a
+	 * prior session that already satisfied this invariant.
+	 */
+	private _setLCA(lca: LCAState | null): void {
+		// Never wipe a valid LCA by writing null — doing so drops the
+		// merge baseline and forces recovery mode on next boot. No
+		// production path should do this; the debug clearLca API
+		// bypasses the class boundary via `as any` on purpose.
+		if (lca === null && this._lca !== null) {
+			this.hsmWarn(
+				`setLCA: refusing to overwrite non-null LCA with null | ` +
+					`guid=${this._guid} state=${this._statePath}`,
+			);
+			return;
+		}
+		if (lca !== null && this.localDoc) {
+			if (lca.contents === null) {
+				this.hsmWarn(
+					`setLCA: refusing compacted LCA capture | ` +
+						`guid=${this._guid} state=${this._statePath}`,
+				);
+				return;
+			}
+			const actualText = this.localDoc.getText("contents").toString();
+			if (actualText !== lca.contents) {
+				this.hsmWarn(
+					`setLCA: content mismatch — refusing capture | ` +
+						`guid=${this._guid} state=${this._statePath} ` +
+						`actualLen=${actualText.length} lcaLen=${lca.contents.length}`,
+				);
+				return;
+			}
+		}
+		// Any baseline reaching this point supersedes a held invoke result.
+		this._pendingDiskConfirmLCA = null;
+		this._lca = lca;
+		if (lca !== null) {
+			this._persistenceStateLoaded = true;
+		}
+		this._lcaGcPinCache = null;
+		this.collectUnpinnedLocalDeletes();
+	}
+
+
+	/**
+	 * Apply new content to localDoc using diff-based updates.
+	 *
+	 * INVARIANT: Never uses delete-all/insert-all pattern. Uses diff-match-patch
+	 * to compute minimal edits that preserve CRDT operational history.
+	 *
+	 * @param origin - Transaction origin. Pass DISK_ORIGIN for disk ingestion
+	 *   so OpCapture can track these operations. Defaults to `this`.
+	 */
+	private applyContentToLocalDoc(newContent: string, origin?: unknown): void {
+		if (!this.localDoc) return;
+
+		const ytext = this.localDoc.getText("contents");
+		const currentText = ytext.toString();
+
+		if (currentText === newContent) return;
+
+		// Use diff-match-patch to compute minimal edits
+		const dmp = new diff_match_patch();
+		const diffs = dmp.diff_main(currentText, newContent);
+		dmp.diff_cleanupSemantic(diffs);
+
+		// Apply diffs incrementally to preserve CRDT history
+		this.localDoc.transact(() => {
+			let cursor = 0;
+			for (const [operation, text] of diffs) {
+				switch (operation) {
+					case 1: // Insert
+						ytext.insert(cursor, text);
+						cursor += text.length;
+						break;
+					case 0: // Equal - advance cursor
+						cursor += text.length;
+						break;
+					case -1: // Delete
+						ytext.delete(cursor, text.length);
+						break;
+				}
+			}
+
+			// Mirror frontmatter to Y.Map atomically with the content change
+			if (origin !== FRONTMATTER_MIRROR_ORIGIN) {
+				this.syncFrontmatterToMap(currentText);
+			}
+		}, origin ?? this);
+	}
+
+	/**
+	 * Adopt the remote operations represented by a successful text merge before
+	 * creating any local operations needed to reach its merged content.
+	 */
+	private applyRemoteStateThenMergedContent(
+		remoteUpdate: Uint8Array,
+		mergedContent: string,
+	): void {
+		if (!this.localDoc) return;
+		this._bridge.syncToLocal(remoteUpdate);
+		this.applyContentToLocalDoc(mergedContent);
+	}
+
+	private applyResolvedConflict(
+		contents: string,
+		options: { dispatchEditor: boolean },
+	): string {
+		const localDoc = this.requireLocalDoc("applyResolvedConflict");
+		const remoteDoc = this.requireRemoteDoc("applyResolvedConflict");
+		if (!localDoc || !remoteDoc) {
+			this._conflict = null;
+			return contents;
+		}
+
+		// Cancel disk ops from OpCapture to erase the disk edit from localDoc's
+		// CRDT history. Safe because the fork gates outbound sync; peers have
+		// not seen these ops.
+		const opCapture = this.getOpCapture();
+		if (opCapture && this._fork?.captureMark != null) {
+			const diskOps = opCapture.sinceByOrigin(this._fork.captureMark, DISK_ORIGIN);
+			opCapture.cancel(diskOps);
+		}
+
+		// Merge remote CRDT into local so histories converge before applying
+		// the user-selected text.
+		const remoteUpdate = Y.encodeStateAsUpdate(
+			remoteDoc,
+			Y.encodeStateVector(localDoc),
+		);
+		this.applyRemoteStateThenMergedContent(remoteUpdate, contents);
+
+		const resolvedText = localDoc.getText("contents").toString();
+		if (options.dispatchEditor) {
+			// The localDoc observer skips origin=this, so active editor sessions
+			// need an explicit CM6 dispatch.
+			const cachedEditorText =
+				this.lastKnownEditorText
+				?? this.pendingEditorContent;
+			const beforeText =
+				cachedEditorText === resolvedText
+					? cachedEditorText
+					: (
+						this.readCurrentEditorText()
+						?? cachedEditorText
+						?? this.pendingDiskContents
+						?? null
+					);
+			this.crdtLog(
+				`resolveConflict: contents=${resolvedText.length} chars, ` +
+				`before=${beforeText?.length ?? -1} chars, ` +
+				`equal=${resolvedText === beforeText}, ` +
+				`contents=${JSON.stringify(resolvedText.substring(0, 100))}, ` +
+				`before=${JSON.stringify(beforeText?.substring(0, 100) ?? null)}`
+			);
+			if (beforeText !== null && resolvedText !== beforeText) {
+				const changes = this.computeDiffChanges(beforeText, resolvedText);
+				this.crdtLog(`resolveConflict: ${changes.length} changes: ${JSON.stringify(changes)}`);
+				if (changes.length > 0) {
+					this.emitEffect({ type: "DISPATCH_CM6", changes });
+				}
+			}
+		}
+		this.lastKnownEditorText = resolvedText;
+
+		this._bridge.syncToRemote(Y.encodeStateAsUpdate(localDoc));
+		this._bridge.clearOutboundQueue();
+
+		this._fork = null;
+		this._bridge.resetPendingCounters();
+		this._ingestionTexts = [];
+		this._conflict = null;
+		// The user just settled this difference by hand. Any record that it was
+		// left outstanding at some earlier point is describing something that
+		// no longer exists, and leaving it behind refuses the note a fresh copy
+		// from the server for good.
+		this._deferredConflict = undefined;
+		// Resolution can be a no-op for the editor when the selected text is
+		// already on disk. Capture through the normal confirmed-disk path now,
+		// because that case produces no later save or disk event to do it.
+		// When the capture refuses and the resolution also did not dirty the
+		// editor, no later save-confirm runs either and the note is left with
+		// no baseline — so name the precondition that refused instead of
+		// failing silently.
+		const captureRefusal = this.capturePendingDiskLCA(resolvedText, {
+			allowViewData: true,
+		});
+		if (captureRefusal !== null) {
+			this.emitEffect({
+				type: "DIAGNOSTIC",
+				code: "RESOLVE_BASELINE_NOT_CAPTURED",
+				message: `conflict resolution did not capture a baseline: ${captureRefusal}`,
+				detail: { reason: captureRefusal },
+			});
+		}
+		this.clearPendingDiskContents();
+		this.pendingEditorContent = null;
+		return resolvedText;
+	}
+
+	private applyConflictHunkResolution(
+		event: ResolveHunkEvent,
+		options: { dispatchEditor: boolean; autoFinalize: boolean },
+	): void {
+		const localDoc = this.requireLocalDoc("applyConflictHunkResolution");
+		if (!this._conflict || !localDoc) return;
+
+		const { hunkId, resolution } = event;
+		const conflict = this._conflict;
+		const regionOffset = findConflictRegionOffset(conflict.regions, hunkId);
+
+		if (conflict.resolved.has(regionOffset)) return;
+
+		const region = conflict.regions[regionOffset];
+		const positioned = conflict.positions[regionOffset];
+
+		if (!region || !positioned) return;
+
+		let newContent: string;
+		switch (resolution) {
+			case "ours":
+				newContent = region.oursContent;
+				break;
+			case "theirs":
+				newContent = region.theirsContent;
+				break;
+			case "neither":
+				newContent = "";
+				break;
+			case "both":
+				newContent = region.oursContent + "\n" + region.theirsContent;
+				break;
+		}
+
+		const beforeText = localDoc.getText("contents").toString();
+
+		const ytext = localDoc.getText("contents");
+		localDoc.transact(() => {
+			const deleteLength = positioned.localEnd - positioned.localStart;
+			if (deleteLength > 0) {
+				ytext.delete(positioned.localStart, deleteLength);
+			}
+			if (newContent) {
+				ytext.insert(positioned.localStart, newContent);
+			}
+		}, this);
+
+		conflict.markResolved(regionOffset);
+
+		const afterText = localDoc.getText("contents").toString();
+		const changes = computePositionedChanges(beforeText, afterText);
+		if (options.dispatchEditor && changes.length > 0) {
+			this.emitEffect({ type: "DISPATCH_CM6", changes });
+		}
+
+		this.lastKnownEditorText = afterText;
+		conflict.updateOurs(afterText);
+
+		this._bridge.flushOutbound();
+
+		if (options.autoFinalize && conflict.isFullyResolved) {
+			this.send({ type: "RESOLVE", contents: afterText });
+		}
+	}
+
+	/**
+	 * Handle per-hunk conflict resolution from inline decorations.
+	 */
+	private handleResolveHunk(event: ResolveHunkEvent): void {
+		// Allow resolving from either bannerShown or resolving state
+		if (!this._statePath.includes("conflict")) return;
+		this.applyConflictHunkResolution(event, {
+			dispatchEditor: true,
+			autoFinalize: true,
+		});
+	}
+
+	private async computeLocalHash(): Promise<string> {
+		if (!this.localDoc) return "";
+		const text = this.localDoc.getText("contents").toString();
+		return this.hashFn(text);
+	}
+
+	async awaitAsync(id: string): Promise<void> {
+		// Externally awaited (awaitIdleAutoMerge/awaitForkReconcile/awaitCleanup):
+		// reject on teardown so callers do not hang if an invoke ignores its
+		// abort signal and never settles.
+		await this._lifetime.guard(() => this.awaitAsyncOperation(id));
+	}
+
+	async awaitCleanupSettled(): Promise<void> {
+		// Wait for any in-flight cleanup invoke, then for the machine-driven
+		// destroy teardown to reach the terminal "destroyed" state.
+		await this.awaitAsyncOperation("cleanup");
+		if (this._destroyPromise) await this._destroyPromise;
+	}
+
+	private async awaitAsyncOperation(id: string): Promise<void> {
+		for (;;) {
+			let op = this._asyncOps.get(id);
+			if (!op) {
+				await Promise.resolve();
+				op = this._asyncOps.get(id);
+				if (!op) return;
+			}
+			await op.promise;
+		}
+	}
+
+	private computeSyncStatusType(): SyncStatusType {
+		const statePath = this._statePath;
+
+		if (statePath === "idle.error" || this._error) {
+			return "error";
+		}
+
+		if (statePath.includes("conflict")) {
+			return "conflict";
+		}
+
+		if (this._conflict) {
+			return "conflict";
+		}
+
+		if (statePath === "idle.diverged") {
+			return "pending";
+		}
+
+		if (statePath === "idle.loading" && !this._lca && !this.hasLCARecoveryPendingWork()) {
+			return "synced";
+		}
+
+		if (
+			statePath === "idle.localAhead" ||
+			statePath === "idle.remoteAhead" ||
+			statePath === "idle.diskAhead" ||
+			statePath === "idle.loadingDiskContents" ||
+			statePath === "idle.recoverLCA" ||
+			statePath.startsWith("active.merging")
+		) {
+			return "pending";
+		}
+
+		if (statePath === "idle.synced" || statePath === "active.tracking") {
+			return "synced";
+		}
+
+		if (
+			statePath === "unloading" ||
+			statePath === "loading" ||
+			statePath === "unloaded" ||
+			statePath === "destroyed" ||
+			statePath.startsWith("active.entering") ||
+			statePath === "active.loading" ||
+			statePath === "idle.loading"
+		) {
+			return "pending";
+		}
+
+		return "synced";
+	}
+
+	// ===========================================================================
+	// Machine Edit Rewind
+	// ===========================================================================
+
+	private static readonly MACHINE_EDIT_TTL = 5000;
+
+	/**
+	 * Find a pending machine edit whose fn is already satisfied by remoteText.
+	 * fn(remoteText) === remoteText means the remote already has this transform.
+	 */
+	private _matchMachineEdit(remoteText: string): typeof this._pendingMachineEdits[number] | null {
+		for (const entry of this._pendingMachineEdits) {
+			if (remoteText === entry.expectedText) {
+				return entry;
+			}
+			try {
+				if (entry.fn(remoteText) === remoteText) {
+					return entry;
+				}
+			} catch {
+				// fn threw — skip this entry
+			}
+		}
+		return null;
+	}
+
+	private notifyMachineEditDrainWaiters(): void {
+		const waiters = Array.from(this._machineEditDrainWaiters);
+		this._machineEditDrainWaiters.clear();
+		for (const resolve of waiters) {
+			resolve();
+		}
+	}
+
+	private async waitForMachineEditDrainOrTimeout(ms: number, signal: AbortSignal): Promise<void> {
+		if (signal.aborted) return;
+		await new Promise<void>((resolve) => {
+			let timer: number | null = null;
+			let settled = false;
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				if (timer !== null) {
+					this.timeProvider.clearTimeout(timer);
+				}
+				signal.removeEventListener("abort", finish);
+				this._machineEditDrainWaiters.delete(finish);
+				resolve();
+			};
+
+			this._machineEditDrainWaiters.add(finish);
+			signal.addEventListener("abort", finish, { once: true });
+			timer = this.timeProvider.setTimeout(finish, Math.max(0, ms));
+			if (signal.aborted) finish();
+		});
+	}
+
+	private nextMachineEditExpiryDelay(): number {
+		const now = this.timeProvider.now();
+		let nextExpiry = Infinity;
+		for (const entry of this._pendingMachineEdits) {
+			nextExpiry = Math.min(
+				nextExpiry,
+				entry.registeredAt + MergeHSM.MACHINE_EDIT_TTL + 100,
+			);
+		}
+		return Number.isFinite(nextExpiry) ? Math.max(0, nextExpiry - now) : 0;
+	}
+
+	private async drainPendingMachineEditsForRelease(signal: AbortSignal): Promise<void> {
+		// Complete any half-applied link repair before draining/tearing down. A
+		// repair (delete of the old name + insert of the new) can reach the HSM as
+		// two CM6 steps; if RELEASE_LOCK fires between them the trailing insert
+		// arrives in `unloading` and is dropped, leaving the mangled run in
+		// localDoc. Bring localDoc up to the registered expectedText so the drain
+		// publishes the complete repair, never the half-applied one.
+		this.completeHalfAppliedMachineEdits();
+		while (!signal.aborted && this._pendingMachineEdits.length > 0) {
+			this.expireMachineEdits();
+			if (this._pendingMachineEdits.length === 0) return;
+			this._bridge.flushPendingMachineEditOutbound();
+			await this.waitForMachineEditDrainOrTimeout(
+				this.nextMachineEditExpiryDelay(),
+				signal,
+			);
+		}
+	}
+
+	private buildMachineEditTeardownCompletion(
+		sourceText: string,
+		expectedText: string,
+	): MachineEditTeardownCompletion {
+		const plannedChanges = this.computeDiffChanges(sourceText, expectedText);
+		const deleteChanges = plannedChanges
+			.filter((change) => change.to > change.from)
+			.map((change) => ({ from: change.from, to: change.to, insert: "" }));
+		if (deleteChanges.length === 0) return { kind: "closed" };
+
+		const intermediateText = this.applyChangesToText(sourceText, deleteChanges);
+		const insertChanges = computeInsertOnlyChanges(intermediateText, expectedText);
+		if (!insertChanges || insertChanges.length === 0) return { kind: "closed" };
+
+		return {
+			kind: "watching",
+			sourceText,
+			intermediateText,
+			deleteChanges,
+			insertChanges,
+		};
+	}
+
+	/**
+	 * Arm teardown completion only after observing the registered edit's exact
+	 * delete phase. Once the full result or any intervening edit is observed, the
+	 * registration is permanently closed so a later user deletion cannot re-arm it.
+	 */
+	private trackMachineEditTeardownProgress(
+		beforeText: string,
+		changes: PositionedChange[],
+		afterText: string,
+	): void {
+		if (beforeText === afterText) return;
+
+		for (const entry of this._pendingMachineEdits) {
+			const completion = entry.teardownCompletion;
+			if (completion.kind === "closed") continue;
+
+			if (afterText === entry.expectedText) {
+				entry.teardownCompletion = { kind: "closed" };
+				continue;
+			}
+
+			if (completion.kind === "half-applied") {
+				entry.teardownCompletion = { kind: "closed" };
+				continue;
+			}
+
+			if (
+				beforeText === completion.sourceText &&
+				afterText === completion.intermediateText &&
+				positionedChangesEqual(changes, completion.deleteChanges)
+			) {
+				entry.teardownCompletion = {
+					kind: "half-applied",
+					intermediateText: completion.intermediateText,
+					insertChanges: completion.insertChanges,
+				};
+			} else {
+				entry.teardownCompletion = { kind: "closed" };
+			}
+		}
+	}
+
+	/**
+	 * Complete one unambiguous half-applied machine edit whose trailing insert was
+	 * dropped by teardown. Every registration is checked against the same localDoc
+	 * snapshot and closed before mutation, making the operation idempotent and
+	 * preventing whole-document expectations from being chained together.
+	 */
+	private completeHalfAppliedMachineEdits(): void {
+		if (!this.localDoc) return;
+		const snapshot = this.localDoc.getText("contents").toString();
+		const candidates = new Map<string, PositionedChange[]>();
+
+		for (const entry of this._pendingMachineEdits) {
+			const completion = entry.teardownCompletion;
+			if (completion.kind !== "half-applied") continue;
+
+			entry.teardownCompletion = { kind: "closed" };
+			if (completion.intermediateText !== snapshot) continue;
+
+			const changes = computeInsertOnlyChanges(snapshot, entry.expectedText);
+			if (
+				!changes ||
+				changes.length === 0 ||
+				!positionedChangesEqual(changes, completion.insertChanges)
+			) {
+				continue;
+			}
+			candidates.set(entry.expectedText, changes);
+		}
+
+		if (candidates.size !== 1) return;
+		const [onlyCandidate] = candidates.values();
+		this.applyChangesToLocalDoc(onlyCandidate);
+	}
+
+	/**
+	 * Expire machine edits older than TTL.
+	 * Drops OpCapture tracking and syncs deferred ops.
+	 */
+	private expireMachineEdits(): void {
+		const now = this.timeProvider.now();
+		let anyExpired = false;
+		const opCapture = this.getOpCapture();
+
+		for (let i = this._pendingMachineEdits.length - 1; i >= 0; i--) {
+			const entry = this._pendingMachineEdits[i];
+			if (now - entry.registeredAt > MergeHSM.MACHINE_EDIT_TTL) {
+				if (opCapture) {
+					const ops = opCapture.sinceByOrigin(entry.captureMark, MACHINE_EDIT_ORIGIN);
+					if (ops.length > 0) {
+						opCapture.drop(ops);
+					}
+				}
+				this._pendingMachineEdits.splice(i, 1);
+				anyExpired = true;
+			}
+		}
+
+		if (anyExpired) {
+			this._bridge.flushOutbound();
+			this.notifyMachineEditDrainWaiters();
+		}
+	}
+
+	/**
+	 * Flush all pending machine edits immediately (e.g., on editor close).
+	 * Drops OpCapture tracking and syncs deferred ops.
+	 */
+	private flushPendingMachineEdits(): void {
+		if (this._pendingMachineEdits.length === 0) return;
+
+		const opCapture = this.getOpCapture();
+		for (const entry of this._pendingMachineEdits) {
+			if (opCapture) {
+				const ops = opCapture.sinceByOrigin(entry.captureMark, MACHINE_EDIT_ORIGIN);
+				if (ops.length > 0) {
+					opCapture.drop(ops);
+				}
+			}
+		}
+		this._pendingMachineEdits.length = 0;
+		this._bridge.flushOutbound();
+		this.notifyMachineEditDrainWaiters();
+	}
+
+	// ===========================================================================
+	// Diff Computation
+	// ===========================================================================
+
+
+
+	// ===========================================================================
+	// Effect Emission
+	// ===========================================================================
+
+
+
+	setOnTransition(cb: ((info: { from: StatePath; to: StatePath; event: MergeEvent; effects: MergeEffect[] }) => void) | null): void {
+		this._onTransition = cb ?? undefined;
+	}
+
+	private emitPersistState(): void {
+		// A hibernated synced note compacted its LCA body on purpose; do not
+		// re-inflate it (remoteDoc may still match) just to re-persist a body
+		// the store already holds.
+		if (this._lca?.contents === null && this.isExpectedCompactedLCAPersistNoop()) {
+			return;
+		}
+		if (this._lca?.contents === null) {
+			this.hydrateLCAContentsFromMatchingDoc();
+		}
+		if (this._lca?.contents === null) {
+			this.hsmWarn(
+				`emitPersistState: skipped compacted LCA body | ` +
+					`guid=${this._guid} state=${this._statePath}`,
+			);
+			return;
+		}
+		this.captureLocalHeadForPersistence();
+		const { localSnapshot } = this.getLocalHeadForPersistence();
+		const persistedState: PersistedMergeState = {
+			guid: this._guid,
+			path: this.path,
+			lca: this._lca
+				? {
+						contents: this._lca.contents,
+						hash: this._lca.meta.hash,
+						mtime: this._lca.meta.mtime,
+						snapshot: this._lca.snapshot,
+					}
+				: null,
+			disk: this._disk,
+			localSnapshot,
+			lastStatePath: this._statePath,
+			deferredConflict: this._deferredConflict,
+			fork: this._fork
+				? {
+						base: this._fork.base,
+						localSnapshot: this._fork.localSnapshot,
+						remoteSnapshot: this._fork.remoteSnapshot,
+						origin: this._fork.origin,
+						created: this._fork.created,
+						captureMark: this._fork.captureMark,
+					}
+				: null,
+			persistedAt: this.timeProvider.now(),
+		};
+
+		this.emitEffect({
+			type: "PERSIST_STATE",
+			guid: this._guid,
+			state: persistedState,
+		});
+	}
+
+	private isExpectedCompactedLCAPersistNoop(): boolean {
+		return (
+			this._statePath === "idle.synced" &&
+			this.localDoc === null &&
+			this.pendingDiskContents === null &&
+			this.pendingIdleUpdates === null &&
+			this._fork === null &&
+			this._conflict === null
+		);
+	}
+
+	// ===========================================================================
+	// State Change Notification
+	// ===========================================================================
+
+	private notifyStateChange(
+		from: StatePath,
+		to: StatePath,
+		event: MergeEvent,
+	): void {
+		// Emit on Observable (per spec)
+		this._stateChanges.emit(this.state);
+
+		// Notify detailed transition listeners.
+		for (const listener of this.stateChangeListeners) {
+			listener(from, to, event);
+		}
+	}
+
+	// =========================================================================
+	// Frontmatter Y.Map mirror — concurrent edit repair
+	// =========================================================================
+
+	/**
+	 * Apply positioned changes to a text string (mirrors what CM6 does).
+	 */
+	private applyChangesToText(text: string, changes: PositionedChange[]): string {
+		// Apply in reverse order so positions remain valid
+		const sorted = [...changes].sort((a, b) => b.from - a.from);
+		let result = text;
+		for (const change of sorted) {
+			result = result.slice(0, change.from) + change.insert + result.slice(change.to);
+		}
+		return result;
+	}
+
+	/**
+	 * Apply CM6 positioned changes to Y.Text.
+	 *
+	 * CodeMirror reports every range against the transaction's pre-change
+	 * document. Applying them in ascending order mutates the offsets for
+	 * later ranges; composed commands such as Move line up then insert at
+	 * the wrong point. Match applyChangesToText and apply from the end.
+	 */
+	private applyChangesToYText(ytext: Y.Text, changes: PositionedChange[]): void {
+		const sorted = [...changes].sort((a, b) => {
+			const byStart = b.from - a.from;
+			if (byStart !== 0) return byStart;
+			return b.to - a.to;
+		});
+		for (const change of sorted) {
+			if (change.to > change.from) {
+				ytext.delete(change.from, change.to - change.from);
+			}
+			if (change.insert) {
+				ytext.insert(change.from, change.insert);
+			}
+		}
+	}
+
+	/**
+	 * Build a "correct" document by combining Y.Map frontmatter (LWW winners)
+	 * with Y.Text body. Returns null if YAML is unavailable or nothing
+	 * usable remains to reconstruct (empty Y.Map, or no keys survive the
+	 * text-owns-keys filter).
+	 */
+	private buildDocFromYMap(): string | null {
+		if (!this.localDoc || !this._yaml) return null;
+
+		const ymap = this.localDoc.getMap("frontmatter");
+		if (ymap.size === 0) return null;
+
+		// Mirror Obsidian's processFrontMatter: parse the current
+		// frontmatter, mutate the parsed object in place, then stringify.
+		// Obsidian's stringifyYaml preserves JS object property order and
+		// YAML parsing preserves on-disk key order, so existing keys stay
+		// put and only truly-new keys are appended. Building the object
+		// in Y.Map iteration order instead would reorder lines, and the
+		// resulting delete-at-A + insert-at-B pair (separated by an
+		// intervening unchanged region) can't be coalesced and CM6 may
+		// apply only one side — producing duplicated frontmatter lines.
+		const text = this.localDoc.getText("contents").toString();
+		const fm = this.parseFrontmatter(text);
+		// A missing block means the text owns an empty key set. An
+		// unrecoverable block may contain the user's in-progress input even
+		// though it cannot provide a safe key set yet. In either case, let
+		// the ordinary Y.Text delta reach the editor instead of rebuilding
+		// from stale map entries and resurrecting or discarding text.
+		if (!fm) return null;
+		const obj: Record<string, unknown> = { ...fm.parsed };
+
+		// The text owns the key set; the Y.Map owns values. Overlay LWW
+		// values only for keys the parsed frontmatter still carries — a
+		// key present only in the map was deleted from the text, and
+		// writing it back here is what resurrected deleted fields.
+		// Duplicate-key recovery has already produced a safe parsed key set.
+		// A key whose map write is withheld stays text-authoritative until
+		// it drains: its map value predates the local edit.
+		for (const [key, value] of ymap.entries()) {
+			if (!(key in obj)) continue;
+			if (this._deferredFrontmatterKeys.has(key)) continue;
+			let parsed: unknown;
+			try { parsed = JSON.parse(value as string); }
+			catch { parsed = value; }
+			obj[key] = parsed;
+		}
+		if (Object.keys(obj).length === 0) return null;
+
+		const yamlBody = this._yaml.stringify(obj);
+		// Trailing `\n` on the canonical frontmatter is required so that
+		// concatenation with `text.slice(fm.end)` (which begins with the
+		// blank-line `\n`) preserves the `\n\n` frontmatter-to-body
+		// separator. Omitting it drops the blank line on every Y.Map
+		// dispatch — the shape producing `---\nhello` on disk for
+		// competing clients after Properties toggles.
+		const frontmatter = `---\n${yamlBody}---\n`;
+		// The body is everything after the frontmatter REGION, located by
+		// the frontmatter-info helper — which finds the block whether or
+		// not its YAML parses. Falling back to the whole text on a parse
+		// failure would keep the broken block and prepend a fresh one on
+		// every dispatch, stacking blocks.
+		const info = this._yaml.getFrontMatterInfo(text);
+		const body = info.exists ? text.slice(info.contentStart) : text;
+
+		return frontmatter + body;
+	}
+
+	/**
+	 * Extract the frontmatter region and parse it using Obsidian's own
+	 * primitives. `getFrontMatterInfo` locates the block, `parseYaml`
+	 * parses the YAML body — same two calls Obsidian uses internally in
+	 * `processFrontMatter`, so our region detection and value decoding
+	 * stay in lockstep with disk writes.
+	 *
+	 * Returned shape is kept stable for call sites:
+	 *   start: always 0 (Obsidian's frontmatter is anchored at file start)
+	 *   end:   `contentStart` — offset where the body begins
+	 *   raw:   the YAML body text (between the `---` delimiters)
+	 *   parsed: parsed object, with on-disk key order preserved
+	 *   recovered: true when the block only parsed after de-duplicating
+	 *     repeated top-level keys (see below)
+	 */
+	private parseFrontmatter(text: string): { start: number; end: number; parsed: Record<string, unknown>; raw: string; recovered: boolean } | null {
+		if (!this._yaml) return null;
+
+		const info = this._yaml.getFrontMatterInfo(text);
+		if (!info.exists) return null;
+
+		try {
+			const parsed = this._yaml.parse(info.frontmatter) as Record<string, unknown> | null;
+			if (!parsed || typeof parsed !== "object") return null;
+			return { start: 0, end: info.contentStart, parsed, raw: info.frontmatter, recovered: false };
+		} catch {
+			if (!flags().enableFrontmatterDuplicateRecovery) return null;
+			// Concurrent whole-line insertions can leave the same key on
+			// two lines, and duplicate keys make the block throw in the
+			// parser. Without a recovery path both mirror directions bail
+			// out on such a document forever. Retry with a last-wins
+			// de-duplication of top-level key lines so the document can
+			// converge back to a parseable state.
+			const deduped = this.dedupeTopLevelYamlKeys(info.frontmatter);
+			if (deduped === null) return null;
+			try {
+				const parsed = this._yaml.parse(deduped) as Record<string, unknown> | null;
+				if (!parsed || typeof parsed !== "object") return null;
+				return { start: 0, end: info.contentStart, parsed, raw: info.frontmatter, recovered: true };
+			} catch {
+				return null;
+			}
+		}
+	}
+
+	/**
+	 * Drop earlier occurrences of repeated top-level YAML keys, keeping
+	 * the last one (matching the last-wins reading most parsers apply
+	 * when they tolerate duplicates). A top-level entry is a column-0
+	 * `key:` line plus its indented continuation lines, so multi-line
+	 * values move with their key. Returns null when no duplicate was
+	 * found — the caller's parse failed for some other reason and this
+	 * transformation cannot help.
+	 */
+	private dedupeTopLevelYamlKeys(yamlBody: string): string | null {
+		const lines = yamlBody.split("\n");
+		type Entry = { key: string | null; lines: string[] };
+		const entries: Entry[] = [];
+		let current: Entry | null = null;
+		// A column-0 line introducing a mapping key: everything before the
+		// first `:` that is followed by whitespace or end-of-line. Quoted
+		// keys are left untouched because a colon inside the quotes is data,
+		// not the key/value separator.
+		const keyLine = /^([^\s#'"-][^:]*):(?:\s|$)/;
+		for (const line of lines) {
+			const match = line.match(keyLine);
+			if (match) {
+				current = { key: match[1], lines: [line] };
+				entries.push(current);
+			} else if (/^["']/.test(line)) {
+				// Keep a quoted top-level key as its own opaque entry. If it
+				// followed a duplicate plain key, attaching it as continuation
+				// text would delete it along with the earlier duplicate.
+				current = { key: null, lines: [line] };
+				entries.push(current);
+			} else if (current) {
+				current.lines.push(line);
+			} else {
+				entries.push({ key: null, lines: [line] });
+			}
+		}
+
+		const seen = new Set<string>();
+		let droppedAny = false;
+		// Walk backwards so the last occurrence of each key survives.
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const key = entries[i].key;
+			if (key === null) continue;
+			if (seen.has(key)) {
+				entries.splice(i, 1);
+				droppedAny = true;
+			} else {
+				seen.add(key);
+			}
+		}
+		if (!droppedAny) return null;
+
+		return entries.map((entry) => entry.lines.join("\n")).join("\n");
+	}
+
+	/**
+	 * Bring Y.Map("frontmatter") in line with the text at a sync point: seed
+	 * an empty map from the text, or reconcile a populated one with the
+	 * merged text. Runs on enrollment (before provider sync, with
+	 * `allowBeforeProviderSync`), on entry to active tracking, and on
+	 * PROVIDER_SYNCED after the remote merge.
+	 */
+	private seedFrontmatterMapFromCurrentText(allowBeforeProviderSync = false): void {
+		if (!this.localDoc || !this._yaml) return;
+		if (
+			!allowBeforeProviderSync &&
+			!this._providerSynced &&
+			!this._isProviderSynced()
+		) return;
+		// A pending fork keeps inbound sync gated, so the text has not merged
+		// the remote yet; publishing from it would mint exactly the pre-merge
+		// values this reconcile exists to avoid. Fork reconciliation runs
+		// this again once the fork clears.
+		if (this.hasFork()) return;
+
+		const ymap = this.localDoc.getMap("frontmatter");
+		if (ymap.size === 0) {
+			// Derive the structured baseline from the text. Enrollment gets
+			// here before provider sync because its disk text is the causal
+			// baseline; a returning client gets here only after the provider
+			// synced, so its text has merged peer state. Neither has a peer
+			// value to race against, so the offline gate does not apply.
+			this.localDoc.transact(() => {
+				this.syncFrontmatterToMap(undefined, { bypassOfflineGate: true });
+			}, this);
+		} else {
+			// PROVIDER_SYNCED runs mergeRemoteToLocal before this action, so
+			// the text now reflects the reconciled merge. Publishing the
+			// withheld keys from it makes their values causally after
+			// everything seen at sync; draining any earlier would re-introduce
+			// the pre-merge value the gate exists to suppress.
+			this.localDoc.transact(() => {
+				this.reconcileFrontmatterMapAfterSync({ seedMissing: true });
+			}, this);
+		}
+		this._bridge.flushOutbound();
+	}
+
+	/**
+	 * Publish withheld frontmatter values from an idle document once its
+	 * provider has synced. A note closed after an offline edit still ships
+	 * the edit's text operations on reconnect; if the map value did not
+	 * follow from the same sync, a peer's next map-carrying write would
+	 * rebuild and repair the stale map value over the edit on every client
+	 * that mirrors. Idle never seeds missing keys — that remains the active
+	 * path's job.
+	 */
+	private drainFrontmatterMapIfSynced(): void {
+		if (!this.localDoc || !this._yaml) return;
+		if (!this._providerSynced && !this._isProviderSynced()) return;
+		if (this.hasFork()) return;
+		if (this.localDoc.getMap("frontmatter").size === 0) return;
+		let published = false;
+		this.localDoc.transact(() => {
+			published = this.reconcileFrontmatterMapAfterSync({ seedMissing: false });
+		}, this);
+		if (published) this._bridge.flushOutbound();
+	}
+
+	/**
+	 * Reconcile a populated map with the merged text once the provider has
+	 * synced. Runs inside a transaction.
+	 *
+	 * Keys whose writes were withheld while the folder was disconnected
+	 * are published from the merged text: for those keys the text merge is
+	 * the arbiter, and its value becomes a fresh LWW operation every peer
+	 * adopts. A withheld key the text no longer carries is pruned instead —
+	 * the text owns key removal.
+	 *
+	 * With `seedMissing`, keys the text carries but the map lacks are added.
+	 * A baseline seeded around an edit made before the first sync, or a key
+	 * introduced by a client that does not mirror, otherwise leaves the map
+	 * sparse for that key forever and repair unable to converge it.
+	 *
+	 * Finally, a key whose text moved past its map value without a matching
+	 * map write — a withheld write whose in-memory marker did not survive
+	 * hibernation or a restart, or an edit from a client that does not
+	 * mirror — is published from the text. The evidence is the persisted
+	 * merge baseline (LCA): the text and snapshot on which disk and the
+	 * local document last agreed. Left alone, the next map overlay would
+	 * resurrect the stale map value over the edit.
+	 *
+	 * Returns whether any map operation was minted.
+	 */
+	private reconcileFrontmatterMapAfterSync(options: { seedMissing: boolean }): boolean {
+		if (!this.localDoc || !this._yaml) return false;
+		const text = this.localDoc.getText("contents").toString();
+		const ymap = this.localDoc.getMap("frontmatter");
+		const fm = this.parseFrontmatter(text);
+		let minted = false;
+
+		if (!fm) {
+			// No block at all means the text deleted every key, withheld or
+			// not — the same pruning the edit path applies once synced. A
+			// block that does not parse keeps its keys deferred until it
+			// parses again.
+			if (!this._yaml.getFrontMatterInfo(text).exists) {
+				for (const key of [...ymap.keys()]) {
+					ymap.delete(key);
+					minted = true;
+				}
+				this._deferredFrontmatterKeys.clear();
+			}
+			return minted;
+		}
+
+		const drained: string[] = [];
+		for (const key of this._deferredFrontmatterKeys) {
+			if (key in fm.parsed) {
+				const serialized = JSON.stringify(fm.parsed[key]);
+				if (ymap.get(key) !== serialized) {
+					ymap.set(key, serialized);
+					minted = true;
+				}
+			} else if (ymap.has(key)) {
+				ymap.delete(key);
+				minted = true;
+			}
+			drained.push(key);
+		}
+		for (const key of drained) this._deferredFrontmatterKeys.delete(key);
+		if (drained.length > 0) {
+			this.crdtLog(
+				`frontmatter mirror: drained ${drained.length} withheld key(s) after sync: ${drained.join(", ")}`,
+			);
+		}
+
+		if (options.seedMissing) {
+			const added: string[] = [];
+			for (const [key, value] of Object.entries(fm.parsed)) {
+				if (ymap.has(key)) continue;
+				ymap.set(key, JSON.stringify(value));
+				minted = true;
+				added.push(key);
+			}
+			if (added.length > 0) {
+				this.crdtLog(
+					`frontmatter mirror: seeded ${added.length} key(s) missing from the map: ${added.join(", ")}`,
+				);
+			}
+		}
+
+		// A block that parsed only after duplicate-key recovery has no single
+		// value per key to compare, so this recovery declines rather than
+		// reading the wrong duplicate.
+		const baseline = fm.recovered ? null : this.lcaMirrorBaseline();
+		if (baseline !== null) {
+			const published: string[] = [];
+			for (const [key, value] of Object.entries(fm.parsed)) {
+				const serialized = JSON.stringify(value);
+				const current = ymap.get(key);
+				if (current === undefined || current === serialized) continue;
+				if (!(key in baseline.parsed)) continue;
+				const lcaValue = JSON.stringify(baseline.parsed[key]);
+				let textIsNewer = false;
+				if (lcaValue === current) {
+					// The map still matches the last confirmed text, and the
+					// text has moved on since: the edit happened after the
+					// baseline with no map write to follow it.
+					textIsNewer = true;
+				} else if (lcaValue === serialized) {
+					// The confirmed text already carried today's value. That is
+					// newer than the map only if the map's winning value was
+					// written before the baseline — a map value written since
+					// is a peer's newer write the repair has yet to apply.
+					const winnerId = ymap._map.get(key)?.id;
+					textIsNewer =
+						winnerId !== undefined &&
+						snapshotCoversItem(baseline.snapshot, winnerId);
+				}
+				if (!textIsNewer) continue;
+				ymap.set(key, serialized);
+				minted = true;
+				published.push(key);
+			}
+			if (published.length > 0) {
+				this.crdtLog(
+					`frontmatter mirror: published ${published.length} key(s) edited past the map: ${published.join(", ")}`,
+				);
+			}
+		}
+		return minted;
+	}
+
+	/**
+	 * The persisted merge baseline as the mirror's reference: the LCA's
+	 * snapshot and its parsed frontmatter, or null when no usable baseline
+	 * exists. A hibernated note may have compacted the LCA body; it is
+	 * rebuilt from the attached documents first, and without a body there is
+	 * nothing to compare.
+	 */
+	private lcaMirrorBaseline(): {
+		snapshot: YjsSnapshot;
+		parsed: Record<string, unknown>;
+	} | null {
+		if (this._lca?.contents === null) this.hydrateLCAContentsFromMatchingDoc();
+		const lca = this._lca;
+		if (!lca || !lca.snapshot || lca.contents === null) return null;
+		const parsed = this.parseFrontmatter(lca.contents)?.parsed;
+		if (!parsed) return null;
+		return { snapshot: { snapshot: lca.snapshot }, parsed };
+	}
+
+	/**
+	 * Sync frontmatter properties from Y.Text to Y.Map("frontmatter").
+	 *
+	 * MUST be called from inside an existing Y.Doc transaction so the
+	 * Y.Map update is atomic with the Y.Text content change. When no
+	 * enclosing transaction exists (e.g., initial seed), the caller is
+	 * responsible for wrapping in transact().
+	 */
+	private syncFrontmatterToMap(
+		previousText?: string,
+		options: { bypassOfflineGate?: boolean } = {},
+	): void {
+		if (!this.localDoc || !this._yaml) return;
+
+		const text = this.localDoc.getText("contents").toString();
+		const fm = this.parseFrontmatter(text);
+		const ymap = this.localDoc.getMap("frontmatter");
+		const synced = this._providerSynced || this._isProviderSynced();
+
+		if (!fm) {
+			// Distinguish a document with NO frontmatter block from one
+			// whose block would not parse even after recovery. The text
+			// owns key removal, so deleting the whole block prunes every
+			// key; a genuinely mangled block is left alone so the map
+			// keeps the last known-good values.
+			if (
+				ymap.size > 0 &&
+				synced &&
+				!this._yaml.getFrontMatterInfo(text).exists
+			) {
+				for (const key of [...ymap.keys()]) {
+					ymap.delete(key);
+				}
+				this._deferredFrontmatterKeys.clear();
+			}
+			return;
+		}
+
+		let previousParsed: Record<string, unknown> | null = null;
+		if (previousText !== undefined) {
+			const previousInfo = this._yaml.getFrontMatterInfo(previousText);
+			if (previousInfo.exists) {
+				const previousFm = this.parseFrontmatter(previousText);
+				// A malformed previous block has no safe structured delta, so
+				// no key counts as changed; withheld keys can still drain.
+				previousParsed = previousFm ? previousFm.parsed : fm.parsed;
+			} else {
+				previousParsed = {};
+			}
+		}
+
+		// Store changed values as JSON strings for faithful round-tripping.
+		// Enrollment omits previousText to seed a full baseline. Edit paths
+		// provide it so unchanged stale values never become map writes.
+		//
+		// A changed value is written in the same transaction as the text
+		// that motivated it: peers receive text and map together, which is
+		// what lets them rebuild the editor from the map and repair
+		// interleaved text. The one exception is a disconnected folder —
+		// that text cannot have merged the server's state, so the write is
+		// withheld and the key drained after provider sync. A connected
+		// folder whose document session has not finished syncing (the first
+		// moments after opening a note) still writes immediately.
+		const online =
+			options.bypassOfflineGate === true || this._isFolderConnected();
+		for (const [key, value] of Object.entries(fm.parsed)) {
+			const serialized = JSON.stringify(value);
+			const changed =
+				previousParsed === null ||
+				!(key in previousParsed) ||
+				JSON.stringify(previousParsed[key]) !== serialized;
+			const deferred = this._deferredFrontmatterKeys.has(key);
+			// A withheld key drains opportunistically once synced: by then the
+			// text has merged peer state, the same condition the provider-sync
+			// drain waits for.
+			if (!changed && !(deferred && synced)) continue;
+			if (ymap.get(key) === serialized) {
+				// Agreement never mints a new operation, and leaves nothing to drain.
+				this._deferredFrontmatterKeys.delete(key);
+				continue;
+			}
+			// A map that did not even match the pre-edit text is already
+			// behind this key's text — a withheld write whose marker was lost,
+			// or a peer that edits text without mirroring. Until provider sync
+			// merges that history, a further edit must not publish from it
+			// either, even with the folder connected.
+			const mapBehindText =
+				previousParsed !== null &&
+				key in previousParsed &&
+				ymap.has(key) &&
+				ymap.get(key) !== JSON.stringify(previousParsed[key]);
+			if (!online || ((deferred || mapBehindText) && !synced)) {
+				this._deferredFrontmatterKeys.add(key);
+				continue;
+			}
+			ymap.set(key, serialized);
+			if (synced) this._deferredFrontmatterKeys.delete(key);
+		}
+		// The text owns key removal: a key deleted from the frontmatter
+		// must leave the map, or the next reconstruction resurrects it.
+		// Prune only while the provider is synced — before first sync the
+		// local text may simply predate map entries written by peers, and
+		// a delete issued from stale text would destroy them for everyone.
+		// An unpruned stale key is inert (reconstruction never reintroduces
+		// keys the text lacks) and is pruned at the next reconciliation by
+		// repairFrontmatterFromMap instead.
+		if (synced) {
+			for (const key of [...ymap.keys()]) {
+				if (!(key in fm.parsed)) {
+					ymap.delete(key);
+					this._deferredFrontmatterKeys.delete(key);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Detect frontmatter corruption by comparing Y.Text frontmatter against
+	 * Y.Map("frontmatter"). If mismatched, reconstruct from Y.Map and apply.
+	 * Called after merging remote updates into localDoc.
+	 */
+	private repairFrontmatterFromMap(): void {
+		if (!this.localDoc || !this._yaml) return;
+
+		// Only repair if the remote update contained Y.Map changes,
+		// meaning the remote client also populates the map.
+		if (!this._remoteFrontmatterMapUpdated) return;
+		this._remoteFrontmatterMapUpdated = false;
+
+		const ymap = this.localDoc.getMap("frontmatter");
+		if (ymap.size === 0) return;
+
+		const text = this.localDoc.getText("contents").toString();
+		const editorText = this._statePath === "active.tracking"
+			? this.readCurrentEditorText()
+			: null;
+		const fm = this.parseFrontmatter(text);
+
+		if (!fm) return; // No parseable frontmatter to repair against
+
+		// Mirror Obsidian's processFrontMatter: start from the parsed
+		// frontmatter (preserves on-disk key order) and overlay Y.Map's
+		// LWW values in place. This keeps Obsidian's writes and our
+		// repairs emitting the same key order so DMP only sees
+		// content-level changes, never reorders.
+		//
+		// The text owns the key set. A map key the parsed frontmatter no
+		// longer carries was deleted from the text, so it is pruned from
+		// the map here rather than written back: re-inserting the line is
+		// what resurrected deleted fields, and two clients re-inserting
+		// the same line each contribute a copy the merge keeps, while two
+		// clients pruning the same map entry converge to one state.
+		//
+		// A key whose map write is withheld keeps its text value: the map
+		// holds the value from before the local edit, and the corruption
+		// check below must not read that divergence as text corruption.
+		const obj: Record<string, unknown> = { ...fm.parsed };
+		const staleKeys: string[] = [];
+		for (const [key, value] of ymap.entries()) {
+			if (!(key in obj)) {
+				staleKeys.push(key);
+				continue;
+			}
+			if (this._deferredFrontmatterKeys.has(key)) continue;
+			let parsed: unknown;
+			try { parsed = JSON.parse(value as string); }
+			catch { parsed = value; }
+			obj[key] = parsed;
+		}
+
+		if (staleKeys.length > 0) {
+			this.crdtLog(
+				`frontmatter mirror: pruning ${staleKeys.length} map key(s) deleted from the text`,
+			);
+			this.localDoc.transact(() => {
+				for (const key of staleKeys) {
+					ymap.delete(key);
+					this._deferredFrontmatterKeys.delete(key);
+				}
+			}, FRONTMATTER_MIRROR_ORIGIN);
+		}
+
+		// Corruption check: a map value differs from what the text
+		// carries. A block that only parsed after de-duplication is also
+		// rewritten — the rewrite emits the canonical single-line-per-key
+		// block, and when the values already agree that diff is pure
+		// deletion, which concurrent identical repairs apply idempotently.
+		let corrupted = fm.recovered;
+		for (const key of Object.keys(obj)) {
+			if (JSON.stringify(fm.parsed[key]) !== JSON.stringify(obj[key])) {
+				corrupted = true;
+				break;
+			}
+		}
+
+		if (!corrupted) return;
+
+		this.crdtLog("frontmatter corruption detected — repairing from Y.Map");
+
+		const yamlBody = this._yaml.stringify(obj);
+		// Obsidian's getFrontMatterInfo sets contentStart to the position
+		// immediately after the closing `---\n`, so text.slice(fm.end)
+		// begins with the blank-line `\n` (or with body text when the file
+		// has no separator). The canonical frontmatter block must therefore
+		// end with its own `\n` to preserve the blank-line separator when
+		// concatenated — omitting it drops the blank line and produces
+		// `---\nbody` on disk.
+		const canonicalFrontmatter = `---\n${yamlBody}---\n`;
+		const newText = canonicalFrontmatter + text.slice(fm.end);
+
+		this.applyContentToLocalDoc(newText, FRONTMATTER_MIRROR_ORIGIN);
+
+		if (editorText !== null && this._statePath === "active.tracking") {
+			const changes = computePositionedChanges(editorText, newText);
+			if (changes.length > 0) {
+				this.emitEffect({
+					type: "DISPATCH_CM6",
+					changes,
+					originView: this._localDocDispatchOriginView,
+				});
+				this.lastKnownEditorText = newText;
+			}
+		}
+	}
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/**
+ * Compute a single contiguous text replacement that transforms `before`
+ * into `after` by trimming the shared prefix and suffix.
+ */
+function computePositionedChanges(
+	before: string,
+	after: string,
+): PositionedChange[] {
+	let prefixLen = 0;
+	while (
+		prefixLen < before.length &&
+		prefixLen < after.length &&
+		before[prefixLen] === after[prefixLen]
+	) {
+		prefixLen++;
+	}
+
+	let suffixLen = 0;
+	while (
+		suffixLen < before.length - prefixLen &&
+		suffixLen < after.length - prefixLen &&
+		before[before.length - 1 - suffixLen] ===
+			after[after.length - 1 - suffixLen]
+	) {
+		suffixLen++;
+	}
+
+	const from = prefixLen;
+	const to = before.length - suffixLen;
+	const insert = after.slice(prefixLen, after.length - suffixLen);
+
+	if (from === to && insert === "") {
+		return [];
+	}
+
+	return [{ from, to, insert }];
+}
+
+async function defaultHashFn(contents: string): Promise<string> {
+	const encoder = new TextEncoder();
+	return generateHash(encoder.encode(contents).buffer);
+}
+
+// =============================================================================
+// 3-Way Merge Implementation
+// =============================================================================
+
+export function performThreeWayMerge(
+	lca: string,
+	local: string,
+	remote: string,
+): MergeResult {
+	if (local === remote) {
+		return {
+			success: true,
+			merged: local,
+			patches: computePositionedChanges(local, local),
+		};
+	}
+
+	// One-sided changes need no diff: when a side is byte-identical to the
+	// LCA, the merge result is exactly the other side (the token diff below
+	// would reproduce it byte-for-byte, at super-linear cost on large
+	// documents). This is the common shape of a synced document being
+	// rewritten remotely while the local copy sits unedited.
+	if (local === lca) {
+		return {
+			success: true,
+			merged: remote,
+			patches: computePositionedChanges(local, remote),
+		};
+	}
+	if (remote === lca) {
+		return {
+			success: true,
+			merged: local,
+			patches: computePositionedChanges(local, local),
+		};
+	}
+
+	const tok = (s: string) => s.split(/(\n)/);
+	const lcaTokens = tok(lca);
+	const localTokens = tok(local);
+	const remoteTokens = tok(remote);
+
+	const result = adaptiveDiff3Merge(localTokens, lcaTokens, remoteTokens);
+
+	const hasConflict = result.some(
+		(region: {
+			ok?: string[];
+			conflict?: { a: string[]; o: string[]; b: string[] };
+		}) => "conflict" in region,
+	);
+
+	if (hasConflict) {
+		return {
+			success: false,
+			base: lca,
+			ours: local,
+			theirs: remote,
+			conflictRegions: extractConflictRegions(result, lca),
+		};
+	}
+
+	const mergedTokens: string[] = [];
+	for (const region of result) {
+		if ("ok" in region && region.ok) {
+			for (const token of region.ok) mergedTokens.push(token);
+		}
+	}
+	const merged = mergedTokens.join("");
+
+	// Consumers only use `patches` to tell whether `local` and `merged`
+	// differ (editor patches are recomputed against the live editor text at
+	// dispatch time), so the single trimmed replacement suffices — a full
+	// character-level diff here costs ~1s on a large rewrite.
+	const patches = computePositionedChanges(local, merged);
+
+	return {
+		success: true,
+		merged,
+		patches,
+	};
+}
+
+function extractConflictRegions(
+	result: Array<{
+		ok?: string[];
+		conflict?: { a: string[]; o: string[]; b: string[] };
+	}>,
+	base: string,
+): Array<{
+	baseStart: number;
+	baseEnd: number;
+	oursContent: string;
+	theirsContent: string;
+}> {
+	const regions: Array<{
+		baseStart: number;
+		baseEnd: number;
+		oursContent: string;
+		theirsContent: string;
+	}> = [];
+
+	let lineOffset = 0;
+	for (const region of result) {
+		if ("conflict" in region && region.conflict) {
+			const { a: localTokens, o: baseTokens, b: remoteTokens } = region.conflict;
+			regions.push({
+				baseStart: lineOffset,
+				baseEnd: lineOffset + (baseTokens?.length ?? 0),
+				oursContent: localTokens?.join("") ?? "",
+				theirsContent: remoteTokens?.join("") ?? "",
+			});
+			lineOffset += baseTokens?.length ?? 0;
+		} else if ("ok" in region && region.ok) {
+			lineOffset += region.ok.length;
+		}
+	}
+
+	return regions;
+}
+
+/**
+ * Build per-hunk ConflictRegions from a two-way diff (no LCA).
+ * Uses local text as the positional reference so that
+ * `positionRegions` (in conflict.ts) can find each hunk by string search.
+ */
+function computeTwoWayConflictRegions(
+	localText: string,
+	diskText: string,
+): ConflictRegion[] {
+	const dmp = new diff_match_patch();
+	const diffs = dmp.diff_main(localText, diskText);
+	dmp.diff_cleanupSemantic(diffs);
+
+	const regions: ConflictRegion[] = [];
+	let localPos = 0;
+	let oursAccum = "";
+	let theirsAccum = "";
+	let hunkStart = -1;
+
+	const flushHunk = () => {
+		if (hunkStart === -1) return;
+		regions.push({
+			baseStart: hunkStart,
+			baseEnd: localPos,
+			oursContent: oursAccum,
+			theirsContent: theirsAccum,
+		});
+		oursAccum = "";
+		theirsAccum = "";
+		hunkStart = -1;
+	};
+
+	for (const [op, text] of diffs) {
+		if (op === 0) {
+			// Equal — flush any pending hunk
+			flushHunk();
+			localPos += text.length;
+		} else if (op === -1) {
+			// Deleted from local (present in local, absent in disk)
+			if (hunkStart === -1) hunkStart = localPos;
+			oursAccum += text;
+			localPos += text.length;
+		} else if (op === 1) {
+			// Inserted in disk (absent in local, present in disk)
+			if (hunkStart === -1) hunkStart = localPos;
+			theirsAccum += text;
+		}
+	}
+	flushHunk();
+
+	return regions;
+}
+
+/** Maximum exact diff size for the editor-only dispatch fast path. */
+const EXACT_CHAR_DIFF_LIMIT = 65536;
+
+/**
+ * Compute an editor dispatch. Its operation shape is disposable because the
+ * editor receives only the resulting text; above the limit, avoid spending
+ * about a second in diff-match-patch and emit one spanning replacement.
+ * CRDT-mutating and machine-edit callers use computeDiffMatchPatchChanges,
+ * whose exact delete/insert shape is load-bearing for idempotence and matching.
+ */
+/** @internal Exported only for direct operation-shape tests. */
+export function computeEditorDiffChanges(
+	before: string,
+	after: string,
+): PositionedChange[] {
+	if (before === after) return [];
+	const spanning = computePositionedChanges(before, after);
+	if (spanning.length === 1) {
+		const span = spanning[0];
+		const changed = Math.max(span.to - span.from, span.insert.length);
+		if (changed > EXACT_CHAR_DIFF_LIMIT) return spanning;
+	}
+	return computeDiffMatchPatchChanges(before, after);
+}
+
+export function computeDiffMatchPatchChanges(
+	before: string,
+	after: string,
+): PositionedChange[] {
+	if (before === after) return [];
+
+	const dmp = new diff_match_patch();
+	const diffs = dmp.diff_main(before, after);
+	dmp.diff_cleanupSemantic(diffs);
+
+	const changes: PositionedChange[] = [];
+	let pos = 0;
+
+	for (const [op, text] of diffs) {
+		if (op === 0) {
+			pos += text.length;
+		} else if (op === -1) {
+			changes.push({ from: pos, to: pos + text.length, insert: "" });
+			pos += text.length;
+		} else if (op === 1) {
+			changes.push({ from: pos, to: pos, insert: text });
+		}
+	}
+
+	return mergeAdjacentChanges(changes);
+}
+
+/**
+ * Return the insertions that derive `after` from `before`, or null when the
+ * transition removes or replaces text. The greedy scan finds the earliest
+ * surviving occurrence of each UTF-16 code unit, yielding changes positioned
+ * against the original `before` snapshot.
+ */
+function computeInsertOnlyChanges(
+	before: string,
+	after: string,
+): PositionedChange[] | null {
+	const changes: PositionedChange[] = [];
+	let beforePos = 0;
+	let afterPos = 0;
+
+	while (beforePos < before.length) {
+		const nextMatch = after.indexOf(before[beforePos], afterPos);
+		if (nextMatch < 0) return null;
+		if (nextMatch > afterPos) {
+			changes.push({
+				from: beforePos,
+				to: beforePos,
+				insert: after.slice(afterPos, nextMatch),
+			});
+		}
+		beforePos++;
+		afterPos = nextMatch + 1;
+	}
+
+	if (afterPos < after.length) {
+		changes.push({
+			from: before.length,
+			to: before.length,
+			insert: after.slice(afterPos),
+		});
+	}
+	return changes;
+}
+
+function positionedChangesEqual(
+	left: PositionedChange[],
+	right: PositionedChange[],
+): boolean {
+	if (left.length !== right.length) return false;
+	return left.every((change, index) => {
+		const other = right[index];
+		return (
+			change.from === other.from &&
+			change.to === other.to &&
+			change.insert === other.insert
+		);
+	});
+}
+
+function mergeAdjacentChanges(changes: PositionedChange[]): PositionedChange[] {
+	if (changes.length <= 1) return changes;
+
+	const merged: PositionedChange[] = [];
+	let i = 0;
+
+	while (i < changes.length) {
+		const current = changes[i];
+
+		if (
+			i + 1 < changes.length &&
+			current.insert === "" &&
+			changes[i + 1].from === current.to &&
+			changes[i + 1].to === changes[i + 1].from
+		) {
+			merged.push({
+				from: current.from,
+				to: current.to,
+				insert: changes[i + 1].insert,
+			});
+			i += 2;
+		} else {
+			merged.push(current);
+			i++;
+		}
+	}
+
+	return merged;
+}
