@@ -1,4 +1,5 @@
 "use strict";
+import { AttachmentTransfers } from "./AttachmentTransfers";
 
 import type { MergeEvent } from "./merge-hsm/types";
 import {
@@ -31,6 +32,12 @@ import {
 import { SharedFolders } from "./SharedFolder";
 import { FolderNavigationDecorations } from "./ui/FolderNav";
 import { MetadataHealthSidebarNoticeMount } from "./ui/MetadataHealthSidebarNotice";
+import { SidebarNoticeMount } from "./ui/SidebarNoticeMount";
+import { mountComponent } from "./ui/svelteHost.svelte";
+import ServiceMessagesNotice from "./components/ServiceMessagesNotice.svelte";
+import { ServiceMessages, type ServiceMessageAction } from "./ServiceMessages";
+import { SERVICE_MESSAGE_VIEW, ServiceMessageView, openServiceMessageView } from "./ui/ServiceMessageView";
+import { NoteMessageBanners } from "./ui/NoteMessageBanners";
 import { ResourceMeterMount } from "./ui/ResourceMeter";
 import { LiveSettingsTab } from "./ui/SettingsTab";
 import { LoginManager, type LoginSettings } from "./LoginManager";
@@ -66,6 +73,7 @@ import { BackgroundSync } from "./BackgroundSync";
 import { HSMStore } from "./merge-hsm/persistence";
 import { trackAsyncCleanup } from "./reloadUtils";
 import { isDestroyedError } from "./DestroyedError";
+import { handleVaultCreate } from "./vaultCreate";
 import { FeatureFlagToggleModal } from "./ui/FeatureFlagModal";
 import { DebugModal } from "./ui/DebugModal";
 import {
@@ -75,13 +83,16 @@ import {
 	openSyncStatusView,
 } from "./ui/SyncStatusView";
 import { type SettingsTree, NamespacedSettings, Settings } from "./SettingsStorage";
+import { ensureLinkUpdatesOn } from "./linkUpdates";
 import { ObsidianFileAdapter, ObsidianNotifier } from "./debugObsididan";
 import { BugReportModal } from "./ui/BugReportModal";
+import { restoreBeforeUnload } from "./conflict-note";
 import { IndexedDBAnalysisModal } from "./ui/IndexedDBAnalysisModal";
 
 import { UpdateManager } from "./UpdateManager";
 import type { Release } from "./UpdateManager";
 import { ReleaseManager } from "./ui/ReleaseManager";
+import { openPluginPage } from "./PluginPage";
 import type { ReleaseSettings } from "./UpdateManager";
 import { SyncSettingsManager } from "./SyncSettings";
 import { ContentAddressedFileStore, isSyncFile } from "./SyncFile";
@@ -98,6 +109,8 @@ import {
 	setPluginRequestConfig,
 } from "./customFetch";
 import { RelayDebugAPI } from "./RelayDebugAPI";
+import { buildCliContext } from "./cli/context";
+import { registerRelayCli } from "./cli/registerCli";
 import { isRetryableS3Error } from "./S3Error";
 import { MetadataHealth } from "./MetadataHealth";
 import { createPublicApi, publishPublicApi, type Api } from "./PublicAPI";
@@ -146,6 +159,7 @@ declare const GIT_TAG: string;
 declare const REPOSITORY: string;
 
 export default class Live extends Plugin {
+	public attachmentTransfers!: AttachmentTransfers;
 	api!: Api;
 	appId!: string;
 	private _instanceId!: string;
@@ -165,6 +179,7 @@ export default class Live extends Plugin {
 	backgroundSync!: BackgroundSync;
 	folderNavDecorations!: FolderNavigationDecorations;
 	private metadataHealthSidebarNotice: MetadataHealthSidebarNoticeMount | null = null;
+	private serviceMessagesSidebarNotice: SidebarNoticeMount | null = null;
 	private resourceMeter: ResourceMeterMount | null = null;
 	relayManager!: RelayManager;
 	deviceManager!: DeviceManager;
@@ -192,6 +207,10 @@ export default class Live extends Plugin {
 	get metadataBridge(): MetadataBridge | undefined {
 		return this._liveViews;
 	}
+	/** The view manager, for the debug surface's read-only probes. */
+	get liveViews(): LiveViewManager | undefined {
+		return this._liveViews;
+	}
 	fileDiffMergeWarningKey = "file-diff-merge-warning";
 	version = GIT_TAG;
 	repo = REPOSITORY;
@@ -199,21 +218,21 @@ export default class Live extends Plugin {
 	private _hsmStore!: HSMStore;
 	promises = new PromiseTracker();
 
-	enableDebugging(save?: boolean) {
+	async enableDebugging(save?: boolean): Promise<void> {
 		setDebugging(true);
 		console.warn("RelayInstances", RelayInstances);
 		if (save) {
-			void this.debugSettings.update((settings) => ({
+			return this.debugSettings.update((settings) => ({
 				...settings,
 				debugging: true,
 			}));
 		}
 	}
 
-	disableDebugging(save?: boolean) {
+	async disableDebugging(save?: boolean): Promise<void> {
 		setDebugging(false);
 		if (save) {
-			void this.debugSettings.update((settings) => ({
+			return this.debugSettings.update((settings) => ({
 				...settings,
 				debugging: false,
 			}));
@@ -592,6 +611,11 @@ export default class Live extends Plugin {
 		this.settings = new Settings<RelaySettings>(this, DEFAULT_SETTINGS);
 		await this.settings.load();
 
+		// Enable the stored link-update preference only when the vault never
+		// chose. An explicit opt-out still governs this user's own renames;
+		// peer renames temporarily answer the preference as on to repair links.
+		await ensureLinkUpdatesOn(this.app.vault);
+
 		const settingsTree = this.settings as unknown as SettingsTree;
 		this.featureSettings = new NamespacedSettings(settingsTree, "(enable*)");
 		this.debugSettings = new NamespacedSettings(settingsTree, "(debugging)");
@@ -621,6 +645,20 @@ export default class Live extends Plugin {
 				this.savingFlagPolyfill?.setEnabled(
 					manager.getFlag(flag.enableSavingFlagPolyfill),
 				);
+			}),
+		);
+
+		// Canvas presence attaches and detaches with its flag: a refresh
+		// re-attaches every live view, which creates or destroys the
+		// presence plugin for open canvases.
+		let canvasPresence = flagManager.getFlag(flag.enableCanvasPresence);
+		this.register(
+			flagManager.subscribe((manager) => {
+				if (this._unloading) return;
+				const enabled = manager.getFlag(flag.enableCanvasPresence);
+				if (enabled === canvasPresence) return;
+				canvasPresence = enabled;
+				void this._liveViews?.refresh("[Canvas presence flag]");
 			}),
 		);
 		this.savingFlagPolyfill.setEnabled(
@@ -800,6 +838,8 @@ export default class Live extends Plugin {
 		}));
 
 		this.vault = this.app.vault;
+		this.attachmentTransfers = new AttachmentTransfers(this.vault, this.manifest.id, this.appId);
+		await this.attachmentTransfers.initialize();
 		const vaultName = this.vault.getName();
 		this.fileManager = this.app.fileManager;
 
@@ -856,6 +896,9 @@ export default class Live extends Plugin {
 			this.loginManager,
 			this.textViewRegistry,
 			this.app.workspace,
+			() => {
+				void this._liveViews?.refresh("public-api:text-view-registration");
+			},
 		);
 		this.register(() => {
 			publicApi.detach();
@@ -887,6 +930,18 @@ export default class Live extends Plugin {
 		);
 
 		this.networkStatus = new NetworkStatus(this.timeProvider, HEALTH_URL);
+
+		this.registerView(SERVICE_MESSAGE_VIEW, leaf => new ServiceMessageView(leaf));
+		const serviceMessages = new ServiceMessages(this.appId, this.manifest.id, this.timeProvider);
+		this.register(() => serviceMessages.destroy());
+		this.register(this.networkStatus.subscribeServiceMessageSelection(selection => serviceMessages.updateSelection(selection)));
+		this.serviceMessagesSidebarNotice = new SidebarNoticeMount(
+			this.app.workspace,
+			"system3-service-messages-slot",
+			(target, anchor) => mountComponent(ServiceMessagesNotice, {
+				target, anchor, props: { messages: serviceMessages, onAction: (action: ServiceMessageAction) => { void this.openServiceMessageAction(action); } },
+			}),
+		);
 
 		this.backgroundSync = new BackgroundSync(
 			this.loginManager,
@@ -923,6 +978,10 @@ export default class Live extends Plugin {
 			this.textViewRegistry.load();
 
 			this.sharedFolders.load();
+			this.addChild(new NoteMessageBanners(
+				this.app, serviceMessages, this.sharedFolders, this.textViewRegistry,
+				action => { void this.openServiceMessageAction(action); },
+			));
 			this._liveViews = new LiveViewManager(
 				this.app,
 				this.sharedFolders,
@@ -948,7 +1007,7 @@ export default class Live extends Plugin {
 			this.tokenStore.start();
 
 			if (!Platform.isIosApp) {
-				// We can't run network status on iOS or it will always be offline.
+				// iOS health probes must not control sync connectivity.
 				this.networkStatus.addEventListener("offline", () => {
 					this.tokenStore.stop();
 					this.relayManager.offline();
@@ -960,8 +1019,8 @@ export default class Live extends Plugin {
 					void this.relayManager.online();
 					this._liveViews.goOnline();
 				});
-				this.networkStatus.start();
 			}
+			this.networkStatus.start({ monitorConnectivity: !Platform.isIosApp });
 
 			this.registerView(
 				VIEW_TYPE_DIFFERENCES,
@@ -1185,6 +1244,7 @@ export default class Live extends Plugin {
 			relayId,
 			authoritative,
 			remote,
+			this.attachmentTransfers,
 		);
 		return folder;
 	}
@@ -1213,6 +1273,22 @@ export default class Live extends Plugin {
 		this.settingsTab.navigateTo(path);
 	}
 
+	async openServiceMessageAction(action: ServiceMessageAction): Promise<void> {
+		try {
+			if (action.type === "settings") {
+				await this.openSettings(action.path);
+			} else if (action.type === "link") {
+				window.open(action.url, "_blank", "noopener,noreferrer");
+			} else {
+				const setting = (this.app as typeof this.app & { setting: SettingsController & { close(): void } }).setting;
+				setting.close();
+				await openServiceMessageView(this.app.workspace, action);
+			}
+		} catch (error) {
+			this.warn("Unable to open service message action", error);
+		}
+	}
+
 	openReleaseManager(version?: string) {
 		const modal = new ReleaseManager(this.app, this, version);
 
@@ -1223,6 +1299,10 @@ export default class Live extends Plugin {
 
 		this.openModals.push(modal);
 		modal.open();
+	}
+
+	openPluginPage(): void {
+		openPluginPage(this.app, this.manifest.id);
 	}
 
 	openGithubRelease(release?: Release | string): void {
@@ -1372,25 +1452,7 @@ export default class Live extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("create", (tfile) => {
-				// NOTE: this is called on every file at startup...
-				const folder = this.sharedFolders.lookup(tfile.path);
-				if (folder) {
-					// A known file materializes immediately; a new file's registration settles
-					// for a debounce window so a short-lived atomic-write temp
-					// file vanishes before it is place-held and uploaded.
-					if (folder.notifyVaultCreateLegacy(tfile)) {
-						folder.whenReady()
-							.then((folder) => {
-								folder.getFile(tfile);
-							})
-							.catch((error) => {
-								if (isDestroyedError(error)) {
-									return;
-								}
-								this.warn("folder ready failed after file create", error);
-							});
-					}
-				}
+				handleVaultCreate(this, tfile);
 			}),
 		);
 
@@ -1557,6 +1619,10 @@ export default class Live extends Plugin {
 			onUnloadFile(old: (...args: unknown[]) => unknown) {
 				return function (this: MarkdownView, file: TFile) {
 					if (file instanceof TFile) {
+						// A conflict open in the note gets back the note's text
+						// first, so what Obsidian saves and what Relay captures is
+						// the text the note held before.
+						restoreBeforeUnload(this);
 						try {
 							if (typeof this.getViewData === 'function') {
 								captureEditorContentForHSM(file, this.getViewData());
@@ -1800,7 +1866,6 @@ export default class Live extends Plugin {
 			action: string;
 			relay?: string;
 			id?: string;
-			version?: string;
 		}
 
 		this.registerObsidianProtocolHandler("relay/settings/relays", async (e) => {
@@ -1820,14 +1885,39 @@ export default class Live extends Plugin {
 			},
 		);
 
-		this.registerObsidianProtocolHandler("relay/upgrade", async (e) => {
-			const parameters = e as unknown as Parameters;
-			const version = parameters.version?.trim();
-			this.openReleaseManager(version);
+		this.registerObsidianProtocolHandler("relay/upgrade", (parameters) => {
+			if (this.releaseSettings.get().channel === "beta") {
+				this.openReleaseManager(parameters.version?.trim());
+			} else {
+				this.openPluginPage();
+			}
 		});
 
 		this.backgroundSync.start();
 		this.updateManager.start();
+		this.registerRelayCli();
+	}
+
+	/**
+	 * Register the `relay` command family with the Obsidian CLI. Requires a
+	 * desktop app new enough to expose registerCliHandler; older apps and
+	 * mobile get no commands and no error.
+	 */
+	private registerRelayCli(): void {
+		if (!Platform.isDesktopApp || !requireApiVersion("1.12.2")) return;
+		const registrar = this as unknown as { registerCliHandler?: unknown };
+		if (typeof registrar.registerCliHandler !== "function") return;
+		const ctx = buildCliContext(this, {
+			flags: this.featureSettings,
+			debugging: {
+				get: () => this.debugSettings.get().debugging,
+				set: (on) => on ? this.enableDebugging(true) : this.disableDebugging(true),
+			},
+			metadataHealth: () => this.metadataHealth,
+			debugAPI: this.relayDebugAPI,
+		});
+		const ids = registerRelayCli(this, ctx);
+		this.debug(`[cli] registered ${ids.length} commands`);
 	}
 
 	removeCommand(command: string): void {
@@ -1880,6 +1970,7 @@ export default class Live extends Plugin {
 		setActiveTracker(null);
 		this.promises.destroy();
 		this.promises = null as unknown as typeof this.promises;
+		teardownStep("attachmentTransfers.destroy", () => this.attachmentTransfers?.destroy());
 		teardownStep("pendingVaultDeleteFlush", () => {
 			if (this.pendingVaultDeleteFlush !== null) {
 				window.clearTimeout(this.pendingVaultDeleteFlush);
@@ -1906,6 +1997,10 @@ export default class Live extends Plugin {
 		teardownStep("metadataHealthFeature.destroy", () => {
 			this.destroyMetadataHealthFeature();
 		});
+		teardownStep("serviceMessagesSidebarNotice.destroy", () => {
+			this.serviceMessagesSidebarNotice?.destroy();
+		});
+		this.serviceMessagesSidebarNotice = null;
 
 		teardownStep("folderNavDecorations.destroy", () => {
 			this.folderNavDecorations?.destroy();

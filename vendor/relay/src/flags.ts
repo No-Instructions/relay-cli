@@ -1,8 +1,12 @@
 export interface FeatureFlags {
+	enableStreamingDownloads: boolean;
+	enableStreamingUploads: boolean;
+	enableAttachmentSizeLimit: boolean;
 	enableDocumentStatus: boolean;
 	enableNewLinkFormat: boolean;
 	enableDiffLinkStatus: boolean;
 	enableDeltaLogging: boolean;
+	enableNativeNetworking: boolean;
 	enableNetworkLogging: boolean;
 	enableVerifyUploads: boolean;
 	enableDiscordLogin: boolean;
@@ -18,6 +22,9 @@ export interface FeatureFlags {
 	enableFrontmatterDuplicateRecovery: boolean;
 	enableSingleUserHistory: boolean;
 	enableStreamerMode: boolean;
+	enableCanvasPresence: boolean;
+	enableReaderRole: boolean;
+	enableInNoteConflicts: boolean;
 }
 
 export type FeatureFlagCategory = "labs" | "debugging" | "danger";
@@ -50,6 +57,18 @@ export interface FeatureFlagSchemaEntry {
 export const FeatureFlagSchema: {
 	[K in keyof FeatureFlags]: FeatureFlagSchemaEntry;
 } = {
+	enableStreamingDownloads: {
+		default: false, category: "labs", title: "Stream attachment downloads",
+		description: "Download and verify attachments in bounded chunks.",
+	},
+	enableStreamingUploads: {
+		default: false, category: "labs", title: "Stream desktop attachment uploads",
+		description: "Read and upload desktop attachments without loading the whole file into memory.",
+	},
+	enableAttachmentSizeLimit: {
+		default: false, category: "labs", title: "Limit attachments on this device",
+		description: "Skip attachments above this device's size limit when planning sync.",
+	},
 	enableDocumentStatus: {
 		default: false,
 		category: "debugging",
@@ -99,6 +118,12 @@ export const FeatureFlagSchema: {
 		description:
 			"Log Yjs deltas, diff operations, byte mismatches, and merge payload details.",
 	},
+	enableNativeNetworking: {
+		default: false,
+		category: "labs",
+		title: "Native networking",
+		description: "Use Node's HTTP stack for Relay requests on desktop. Responses are uncompressed. May not work with system proxies or private certificates. Has no effect on mobile.",
+	},
 	enableNetworkLogging: {
 		default: false,
 		category: "debugging",
@@ -128,7 +153,7 @@ export const FeatureFlagSchema: {
 			"Assert MergeHSM resource expectations declared on the machine states.",
 	},
 	enableDraftMode: {
-		default: false,
+		default: true,
 		category: "labs",
 		title: "Draft mode",
 		description:
@@ -183,6 +208,28 @@ export const FeatureFlagSchema: {
 		description:
 			"Show only chosen display names and uploaded avatars; hide account names, profile pictures, and email addresses.",
 		requiresReload: false,
+	},
+	enableCanvasPresence: {
+		default: false,
+		category: "labs",
+		title: "Canvas presence",
+		description:
+			"Show collaborators' cursors, viewports, selections, and connections being drawn on shared canvases.",
+		requiresReload: false,
+	},
+	enableReaderRole: {
+		default: false,
+		category: "labs",
+		title: "Reader role",
+		description:
+			"Offer the Reader role when sharing folders and inviting users. Readers receive live updates without publishing changes.",
+	},
+	enableInNoteConflicts: {
+		default: false,
+		category: "labs",
+		title: "Resolve conflicts in the note",
+		description:
+			"Show a merge conflict inside the note, with each side's lines to pick between, instead of the banner and the side-by-side view.",
 	},
 };
 

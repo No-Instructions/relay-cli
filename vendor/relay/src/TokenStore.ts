@@ -5,12 +5,19 @@ import type { TimeProvider } from "./TimeProvider";
 import { RelayInstances } from "./debug";
 import { trackAsyncCleanup } from "./reloadUtils";
 
+/** Passed to the refresh function when a held token is suspected stale. */
+export interface RefreshContext<NetToken> {
+	reconcile: boolean;
+	heldToken?: NetToken;
+}
+
 interface TokenStoreConfig<StorageToken, NetToken> {
 	log: (message: string) => void;
 	refresh: (
 		documentId: string,
 		onSuccess: (token: NetToken) => void,
 		onError: (err: Error) => void,
+		context?: RefreshContext<NetToken>,
 	) => void;
 	getTimeProvider: () => TimeProvider;
 	getJwtExpiry?: (token: NetToken) => number;
@@ -113,7 +120,10 @@ export class TokenStore<TokenType extends HasToken> {
 		documentId: string,
 		onSuccess: (token: TokenType) => void,
 		onError: (err: Error) => void,
+		context?: RefreshContext<TokenType>,
 	) => void;
+	// Documents whose next refresh carries the reconcile signal.
+	private reconcileRequests = new Set<string>();
 
 	constructor(
 		config: TokenStoreConfig<TokenInfo<TokenType>, TokenType>,
@@ -154,7 +164,10 @@ export class TokenStore<TokenType extends HasToken> {
 		return new Error("attempted to use TokenStore after it was destroyed.");
 	}
 
-	onRefresh(documentId: string): Promise<TokenType> {
+	onRefresh(
+		documentId: string,
+		context?: RefreshContext<TokenType>,
+	): Promise<TokenType> {
 		if (this.destroyed) {
 			return Promise.reject(this.getDestroyedError());
 		}
@@ -174,9 +187,27 @@ export class TokenStore<TokenType extends HasToken> {
 				this.removeFromRefreshQueue(documentId);
 				reject(error);
 			};
-			this.refresh(documentId, onSuccess, onError);
+			this.refresh(
+				documentId,
+				onSuccess,
+				onError,
+				context ?? this.consumeReconcileContext(documentId),
+			);
 		});
 		return promise as Promise<TokenType>;
+	}
+
+	/** Take the pending reconcile signal, attaching the held token. */
+	private consumeReconcileContext(
+		documentId: string,
+	): RefreshContext<TokenType> | undefined {
+		if (!this.reconcileRequests.delete(documentId)) {
+			return undefined;
+		}
+		return {
+			reconcile: true,
+			heldToken: this.tokenMap.get(documentId)?.token ?? undefined,
+		};
 	}
 
 	start() {
@@ -278,7 +309,12 @@ export class TokenStore<TokenType extends HasToken> {
 					this.addToRefreshQueue(next);
 				}
 			};
-			this.refresh(documentId, onSuccess, onError);
+			this.refresh(
+				documentId,
+				onSuccess,
+				onError,
+				this.consumeReconcileContext(documentId),
+			);
 		} else {
 			this.log(`enqueued refresh of ${documentId}`);
 			this.refreshQueue.add(documentId);
@@ -308,6 +344,22 @@ export class TokenStore<TokenType extends HasToken> {
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Refresh a document's token now, with the reconcile signal, and deliver
+	 * it to the registered callback. No-op without a registered callback.
+	 */
+	forceRefresh(documentId: string): void {
+		if (this.destroyed) {
+			return;
+		}
+		if (!this.callbacks.has(documentId)) {
+			return;
+		}
+		this.log(`force refresh of ${documentId}`);
+		this.reconcileRequests.add(documentId);
+		this.addToRefreshQueue(documentId);
 	}
 
 	log(text: string) {
@@ -421,25 +473,23 @@ export class TokenStore<TokenType extends HasToken> {
 	private getTokenFromNetwork(
 		documentId: string,
 		friendlyName: string,
-		callback: (token: TokenType) => void,
 	) {
 		if (this.destroyed) {
 			return Promise.reject(this.getDestroyedError());
 		}
 		const activePromise = this._activePromises.get(documentId);
 		if (activePromise) {
-			this.callbacks.set(documentId, callback);
 			return activePromise;
 		}
 		const existing = this.tokenMap.get(documentId);
+		const reconcileContext = this.consumeReconcileContext(documentId);
 		this.tokenMap.set(documentId, {
 			token: null,
 			friendlyName: friendlyName,
 			expiryTime: 0,
 			attempts: existing?.attempts ?? 0,
 		});
-		this.callbacks.set(documentId, callback);
-		const sharedPromise = this.onRefresh(documentId)
+		const sharedPromise = this.onRefresh(documentId, reconcileContext)
 			.then((newToken: TokenType) => {
 				if (this.destroyed) {
 					throw this.getDestroyedError();
@@ -465,15 +515,23 @@ export class TokenStore<TokenType extends HasToken> {
 		documentId: string,
 		friendlyName: string,
 		callback: (token: TokenType) => void,
+		needsReconcile?: (token: TokenType) => boolean,
 	): Promise<TokenType> {
 		this.log(`getting token ${friendlyName}`);
 		if (this.destroyed || !this.tokenMap) {
 			return Promise.reject(this.getDestroyedError());
 		}
+		this.callbacks.set(documentId, callback);
+		const held = this.tokenMap.get(documentId)?.token;
+		if (held && needsReconcile?.(held)) {
+			if (!this._activePromises.has(documentId)) {
+				this.reconcileRequests.add(documentId);
+			}
+			return this.getTokenFromNetwork(documentId, friendlyName);
+		}
 		if (this.tokenMap.has(documentId)) {
 			const tokenInfo = this.tokenMap.get(documentId)!;
 			if (tokenInfo.token && this.isTokenValid(tokenInfo)) {
-				this.callbacks.set(documentId, callback);
 				tokenInfo.friendlyName = friendlyName;
 				callback(tokenInfo.token);
 				this.log("token was valid, cache hit!");
@@ -481,7 +539,32 @@ export class TokenStore<TokenType extends HasToken> {
 				return Promise.resolve(tokenInfo.token);
 			}
 		}
-		return this.getTokenFromNetwork(documentId, friendlyName, callback);
+		return this.getTokenFromNetwork(documentId, friendlyName);
+	}
+
+	/**
+	 * Get a token for a bounded request without keeping the document in the
+	 * proactive refresh set. One-shot callers still share the token cache and
+	 * in-flight network requests with live providers, but they never add or
+	 * replace a provider refresh callback.
+	 */
+	async getTokenOnce(
+		documentId: string,
+		friendlyName: string,
+	): Promise<TokenType> {
+		this.log(`getting one-shot token ${friendlyName}`);
+		if (this.destroyed || !this.tokenMap) {
+			return Promise.reject(this.getDestroyedError());
+		}
+		if (this.tokenMap.has(documentId)) {
+			const tokenInfo = this.tokenMap.get(documentId)!;
+			if (tokenInfo.token && this.isTokenValid(tokenInfo)) {
+				tokenInfo.friendlyName = friendlyName;
+				this.log("one-shot token was valid, cache hit!");
+				return Promise.resolve(tokenInfo.token);
+			}
+		}
+		return this.getTokenFromNetwork(documentId, friendlyName);
 	}
 
 	_reportWithFilter(filter: (documentId: string) => boolean) {
