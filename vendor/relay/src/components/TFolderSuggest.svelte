@@ -1,10 +1,18 @@
 <script lang="ts">
 	import { onMount, onDestroy, createEventDispatcher, tick } from "svelte";
 	import { App, TFolder } from "obsidian";
+	import { folderSuggestHeight, placeFolderSuggest } from "./folderSuggestLayout";
 
+	import { ownerDoc, ownerWin } from "./ownerWindow";
+	// The dropdown portals out to body level so it escapes the modal's
+	// overflow. That makes its target document a real choice rather than a
+	// formality: settings can render in its own window, and a node appended
+	// to the wrong body opens in a window the user is not looking at. Every
+	// placement decision below — body, viewport, listeners, focus — reads
+	// the document the input itself belongs to.
 	// Portal action to render content at body level
 	function portal(node: HTMLElement) {
-		document.body.appendChild(node);
+		ownerDoc(inputEl).body.appendChild(node);
 		return {
 			destroy() {
 				node.remove();
@@ -15,7 +23,7 @@
 	// Action to position the element once it's in the portal
 	function positionWhenReady(node: HTMLElement) {
 		// Wait for the element to be moved to body by the portal action
-		setTimeout(() => {
+		ownerWin(inputEl).setTimeout(() => {
 			suggestEl = node;
 			positionSuggest();
 		}, 0);
@@ -115,9 +123,10 @@
 			return;
 		}
 
+		const win = ownerWin(inputEl);
 		const rect = inputEl.getBoundingClientRect();
-		const viewportWidth = window.innerWidth;
-		const viewportHeight = window.innerHeight;
+		const viewportWidth = win.innerWidth;
+		const viewportHeight = win.innerHeight;
 
 		// Force fixed positioning with high z-index to break out of modal
 		suggestEl.style.position = "fixed";
@@ -125,13 +134,7 @@
 
 		const isMobile = viewportWidth < 768;
 
-		// Calculate height based on number of suggestions
-		const suggestionHeight = 40; // Approximate height per suggestion item (increased for padding)
-		const containerPadding = 8; // Container padding
-		const actualHeight = Math.min(
-			suggestions.length * suggestionHeight + containerPadding,
-			isMobile ? 240 : 300,
-		);
+		const actualHeight = folderSuggestHeight(suggestions.length);
 
 		// Clear any existing positioning
 		suggestEl.style.top = "";
@@ -162,14 +165,25 @@
 				suggestEl.style.transform = "translateY(-100%)"; // Position above the bottom point
 			}
 		} else {
-			// Desktop: positioned relative to input using simple left/top
+			// Desktop: anchored to the input's left edge, below it when the
+			// window has room there and above it otherwise, so an input near
+			// the window's bottom edge never opens a list off screen.
 			const desktopWidth = Math.max(rect.width, 350); // Minimum 350px width for better folder path display
 			const maxWidth = Math.min(desktopWidth, viewportWidth - rect.left - 20); // Don't go off screen
+			const placement = placeFolderSuggest(
+				{ top: rect.top, bottom: rect.bottom },
+				viewportHeight,
+				actualHeight,
+			);
 
 			suggestEl.style.left = `${rect.left}px`;
-			suggestEl.style.top = `${rect.bottom + 2}px`;
+			if (placement.side === "above") {
+				suggestEl.style.bottom = `${placement.bottom}px`;
+			} else {
+				suggestEl.style.top = `${placement.top}px`;
+			}
 			suggestEl.style.width = `${maxWidth}px`;
-			suggestEl.style.maxHeight = `${actualHeight}px`;
+			suggestEl.style.maxHeight = `${placement.maxHeight}px`;
 			suggestEl.style.height = ""; // Let content determine height
 		}
 	}
@@ -189,6 +203,13 @@
 		inputEl?.blur();
 	}
 
+	async function scrollSelectedSuggestionIntoView() {
+		await tick();
+		suggestEl
+			?.querySelector<HTMLElement>(".suggestion-item.is-selected")
+			?.scrollIntoView({ block: "nearest" });
+	}
+
 	function handleKeydown(e: KeyboardEvent) {
 		if (!isOpen) {
 			if (e.key === "Enter" && inputValue.trim()) {
@@ -205,10 +226,12 @@
 			case "ArrowDown":
 				e.preventDefault();
 				selectedIndex = Math.min(selectedIndex + 1, suggestions.length - 1);
+				void scrollSelectedSuggestionIntoView();
 				break;
 			case "ArrowUp":
 				e.preventDefault();
 				selectedIndex = Math.max(selectedIndex - 1, -1);
+				void scrollSelectedSuggestionIntoView();
 				break;
 			case "Enter":
 				e.preventDefault();
@@ -263,8 +286,8 @@
 
 	function handleBlur(e: FocusEvent) {
 		// Delay close to allow click events on suggestions
-		setTimeout(() => {
-			if (!suggestEl?.contains(document.activeElement)) {
+		ownerWin(inputEl).setTimeout(() => {
+			if (!suggestEl?.contains(ownerDoc(inputEl).activeElement)) {
 				closeSuggestions();
 			}
 		}, 200);
@@ -289,14 +312,21 @@
 		}
 	}
 
+	// Captured at mount: the binding is cleared before teardown runs, so the
+	// listeners have to be removed from the pair they were added to.
+	let listenerDoc: Document;
+	let listenerWin: Window;
+
 	onMount(() => {
-		document.addEventListener("click", handleDocumentClick);
-		window.addEventListener("resize", handleWindowResize);
+		listenerDoc = ownerDoc(inputEl);
+		listenerWin = ownerWin(inputEl);
+		listenerDoc.addEventListener("click", handleDocumentClick);
+		listenerWin.addEventListener("resize", handleWindowResize);
 	});
 
 	onDestroy(() => {
-		document.removeEventListener("click", handleDocumentClick);
-		window.removeEventListener("resize", handleWindowResize);
+		listenerDoc?.removeEventListener("click", handleDocumentClick);
+		listenerWin?.removeEventListener("resize", handleWindowResize);
 	});
 </script>
 

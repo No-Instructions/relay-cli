@@ -32,10 +32,11 @@ import type {
   Fork,
   FrontMatterPrimitives,
   MergeEvent,
-  ResolveHunkEvent,
   StatePath,
+  ActiveAccessMode,
 } from './types';
 import type { ConflictInfoSnapshot } from './conflict';
+import type { BlockDecision } from './conflictValue';
 import type { TimeProvider } from '../TimeProvider';
 import { DefaultTimeProvider } from '../TimeProvider';
 import { ObservableMap } from '../observable/ObservableMap';
@@ -124,6 +125,7 @@ export interface MergeManagerConfig {
 
   /** Callback when an effect is emitted by any HSM */
   onEffect?: (guid: string, effect: MergeEffect) => void | Promise<void>;
+
 
   /**
    * Callback to get disk state for a document (for polling).
@@ -623,38 +625,37 @@ export class MergeManager {
     return (await this.conflictProviderFor(guid).getConflictInfo()) as ConflictInfoSnapshot;
   }
 
-  async resolveConflict(guid: string, contents: string): Promise<StatePath> {
-    return (await this.conflictProviderFor(guid).resolveConflict(contents)) as StatePath;
+  async resolveConflict(guid: string, conflictId: string, contents: string): Promise<StatePath> {
+    return (await this.conflictProviderFor(guid).resolveConflict(conflictId, contents)) as StatePath;
   }
 
-  async resolveConflictHunk(
+  async decideConflictBlock(
     guid: string,
-    hunkId: string,
-    resolution: ResolveHunkEvent['resolution'],
+    conflictId: string,
+    blockId: string,
+    decision: BlockDecision,
   ): Promise<StatePath> {
-    return (await this.conflictProviderFor(guid).resolveConflictHunk(
-      hunkId,
-      resolution,
+    return (await this.conflictProviderFor(guid).decideConflictBlock(
+      conflictId,
+      blockId,
+      decision,
     )) as StatePath;
   }
 
-  /** The MergeHSM-backed conflict dialect (text hunks). */
+  /** The MergeHSM-backed conflict dialect: the conflict value and decisions on its blocks. */
   private createDocumentConflictProvider(guid: string): ConflictProvider {
     return {
       getConflictInfo: async () => {
         const hsm = await this.prepareHeadlessConflictResolution(guid);
         return hsm.getConflictInfoSnapshot();
       },
-      resolveConflict: async (contents: string) => {
+      resolveConflict: async (conflictId: string, contents: string) => {
         const hsm = await this.prepareHeadlessConflictResolution(guid);
-        return hsm.resolveConflictContents(contents);
+        return hsm.resolveConflict(conflictId, contents);
       },
-      resolveConflictHunk: async (hunkId: string, resolution: unknown) => {
+      decideConflictBlock: async (conflictId: string, blockId: string, decision: unknown) => {
         const hsm = await this.prepareHeadlessConflictResolution(guid);
-        return hsm.resolveConflictHunk(
-          hunkId,
-          resolution as ResolveHunkEvent['resolution'],
-        );
+        return hsm.decideConflictBlock(conflictId, blockId, decision as BlockDecision);
       },
     };
   }
@@ -708,6 +709,7 @@ export class MergeManager {
     getCurrentDiskMetadata?: () => { mtime: number; hash?: string } | null;
     getPersistenceMetadata?: () => PersistenceMetadata;
     isFolderConnected?: () => boolean;
+    getAccessMode?: () => ActiveAccessMode;
   }): MergeHSM {
     const {
       guid,
@@ -717,6 +719,7 @@ export class MergeManager {
       getCurrentDiskMetadata,
       getPersistenceMetadata,
       isFolderConnected,
+      getAccessMode,
     } = config;
 
     const hsm = new MergeHSM({
@@ -730,6 +733,7 @@ export class MergeManager {
       persistenceMetadata: getPersistenceMetadata?.(),
       diskLoader: getDiskContent,
       isFolderConnected,
+      getAccessMode,
       yaml: this._yaml ?? undefined,
     });
 

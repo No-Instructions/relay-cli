@@ -142,7 +142,7 @@ export interface RecordingMetadata {
 export type SerializableEvent =
   | { type: 'LOAD'; guid: string }
   | { type: 'UNLOAD' }
-  | { type: 'ACQUIRE_LOCK' }
+  | { type: 'ACQUIRE_LOCK'; accessMode?: 'write' | 'read' }
   | { type: 'RELEASE_LOCK' }
   | { type: 'DISK_CHANGED'; contents: string; mtime: number; hash: string }
   | { type: 'DISK_METADATA_CHANGED'; mtime: number; hash?: string }
@@ -152,11 +152,14 @@ export type SerializableEvent =
   | { type: 'PROVIDER_SYNCED' }
   | { type: 'CONNECTED' }
   | { type: 'DISCONNECTED' }
-  | { type: 'RESOLVE'; contents: string }
-  | { type: 'RESOLVE_HUNK'; hunkId: string; resolution: 'ours' | 'theirs' | 'both' | 'neither' }
+  | { type: 'RESOLVE'; conflictId?: string; contents: string }
+  | { type: 'DECIDE_BLOCK'; blockId: string; decision: 'ours' | 'theirs' | 'both' | 'neither' }
   | { type: 'DISMISS_CONFLICT' }
   | { type: 'OPEN_DIFF_VIEW' }
   | { type: 'CANCEL' }
+  | { type: 'DEMOTE_TO_READ' }
+  | { type: 'PROMOTE_TO_WRITE' }
+  | { type: 'DISCARD_LOCAL_FORK' }
   | {
       type: 'PERSISTENCE_LOADED';
       lca: SerializableLCA | null;
@@ -170,7 +173,7 @@ export type SerializableEvent =
     }
   | { type: 'PERSISTENCE_SYNCED'; hasContent: boolean }
   | { type: 'MERGE_SUCCESS'; newLCA: SerializableLCA }
-  | { type: 'MERGE_CONFLICT'; base: string; ours: string; theirs: string }
+  | { type: 'MERGE_CONFLICT'; situation: 'both-edited' | 'no-baseline' | 'drift' | 'merge-failed'; base: string | null; ours: { source: 'editor' | 'file' | 'record' | 'remote'; text: string }; theirs: { source: 'editor' | 'file' | 'record' | 'remote'; text: string } }
   | { type: 'REMOTE_DOC_UPDATED' }
   | { type: 'ERROR'; error: string } // error message
   | { type: 'IDLE_MERGE_COMPLETE'; success: true; source: string; newLCA: SerializableLCA }
@@ -185,7 +188,8 @@ export type SerializableEffect =
   | { type: 'WRITE_DISK'; guid: string; contents: string; hash?: string; mtime?: number }
   | { type: 'PERSIST_STATE'; guid: string; state: SerializablePersistedState }
   | { type: 'SYNC_TO_REMOTE'; update: string } // base64
-  | { type: 'STATUS_CHANGED'; guid: string; status: SerializableSyncStatus };
+  | { type: 'STATUS_CHANGED'; guid: string; status: SerializableSyncStatus }
+  | { type: 'READER_EDIT_OVERWRITTEN'; guid: string; path: string; contentHash: string };
 
 /**
  * Serializable LCA state.

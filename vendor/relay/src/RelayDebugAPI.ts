@@ -8,7 +8,7 @@
  */
 
 import * as Y from 'yjs';
-import { TFile, View } from 'obsidian';
+import { MarkdownView, TFile, View } from 'obsidian';
 import type { WorkspaceLeaf } from 'obsidian';
 import type { EditorView } from '@codemirror/view';
 import { diff_match_patch } from 'diff-match-patch';
@@ -30,16 +30,22 @@ import {
 } from './ui/SyncStatusModel';
 import type { FolderSyncSnapshot } from './BackgroundSyncProgress';
 import { Canvas, isCanvas } from './Canvas';
+import { readCanvasPresence, readCanvasPresenceUser, type CanvasPresenceState, type CanvasPresenceUser } from './canvas-presence/types';
+import type { CanvasHSM } from './canvas-hsm/CanvasHSM';
 import type { CanvasData } from './CanvasView';
-import type { ConflictData } from './merge-hsm/conflict';
+import type { BlockDecision, ConflictValue } from './merge-hsm/conflictValue';
+import { sessionOf, type SessionSnapshot } from './conflict-note';
 import type Live from './main';
+import type { RelayCanvasView } from './LiveViews';
 import type { SharedFolder } from './SharedFolder';
+import type { Document } from './Document';
 import type { MergeHSM } from './merge-hsm/MergeHSM';
 import type { MergeManager, MergeManagerDocument } from './merge-hsm/MergeManager';
 import type { RemoteEntityFile } from './BackgroundSync';
 import { areCanvasDataEqual } from './CanvasData';
 
-export type { ConflictHunkInfo, ConflictInfoSnapshot } from './merge-hsm/conflict';
+export type { ConflictInfoSnapshot } from './merge-hsm/conflict';
+export type { BlockDecision, ConflictBlock, ConflictSide, ConflictValue } from './merge-hsm/conflictValue';
 
 // =============================================================================
 // Types
@@ -61,6 +67,13 @@ export interface DocumentContentSnapshot {
   server: { content: string; snapshot: string; updateSize: number } | null;
 }
 
+/** Locally held canvas awareness, without waking a document or fetching remote state. */
+export interface CanvasPresenceSnapshot {
+  localClientId: number | null;
+  canPublishContent: boolean;
+  states: Array<{ clientId: number; user?: CanvasPresenceUser; canvas: CanvasPresenceState | null }>;
+}
+
 /**
  * Every representation of one canvas: the vault-facing localDoc, the
  * provider-facing remoteDoc, the .canvas file on disk, the open view (when
@@ -68,7 +81,12 @@ export interface DocumentContentSnapshot {
  * Data payloads are CanvasData exports; equality flags use the
  * order-insensitive canvas comparison.
  */
-export interface CanvasContentSnapshot {
+/**
+ * Every local representation of a canvas: both in-memory replicas, the file
+ * on disk, an open view, the persisted machine record, and the equality flags
+ * among them. Reads nothing over the network, so a probe may poll it.
+ */
+export interface CanvasStateSnapshot {
   path: string;
   guid: string;
   folder: string;
@@ -79,13 +97,31 @@ export interface CanvasContentSnapshot {
   userLock: boolean;
   downloadPending: boolean;
   local: { data: unknown; snapshot: string } | null;
+  /** The provider-facing replica, held in memory alongside the local one. */
   remote: { data: unknown; snapshot: string } | null;
   disk: { data: unknown; mtime: number; parseError: boolean } | null;
-  view: { data: unknown } | null;
-  server: { data: unknown; snapshot: string; updateSize: number } | null;
+  /**
+   * The open canvas view's rendered data, with the plugin's wiring state
+   * for it: `owned` once the rendered data is known to be this file's (the
+   * gate for CRDT-to-view imports and embedded-note sessions), `loadSeq`
+   * counting setViewData deliveries seen since attach, and `trackedEmbeds`
+   * counting embedded markdown editors wired to their documents, and
+   * `mismatched` listing rendered node and edge ids the last ownership
+   * check could match to neither the local CRDT nor the disk copy (empty
+   * once owned). `wiring` is null when no Relay view is attached to the
+   * leaf.
+   */
+  view: {
+    data: unknown;
+    wiring: {
+      owned: boolean;
+      loadSeq: number;
+      trackedEmbeds: number;
+      mismatched: string[];
+    } | null;
+  } | null;
   localRemoteContentEqual: boolean | null;
   diskMatchesLocal: boolean | null;
-  serverMatchesLocal: boolean | null;
   viewMatchesLocal: boolean | null;
   lca: { present: boolean; diskHash: string | null; diskMtime: number | null };
   persisted: {
@@ -96,6 +132,17 @@ export interface CanvasContentSnapshot {
   } | null;
   /** Ring buffer of recent machine transitions, oldest first. */
   recentTransitions: HsmStateTransition[];
+}
+
+/**
+ * A state snapshot plus the server's own copy of the canvas. Obtaining the
+ * server copy costs a full-state download, which is the same request the
+ * sync machine issues, so asking for it attaches the canvas server side.
+ * Read it deliberately; never poll it.
+ */
+export interface CanvasContentSnapshot extends CanvasStateSnapshot {
+  server: { data: unknown; snapshot: string; updateSize: number } | null;
+  serverMatchesLocal: boolean | null;
 }
 
 export interface HsmStateTransition {
@@ -209,6 +256,13 @@ export interface HsmStateSnapshot {
   guid: string;
   folder: string;
   statePath: string;
+  access: {
+    canWriteContent: boolean | null;
+    folderPolicy: boolean | null;
+    tokenAuthorization: string | null;
+    folderRoles: string[];
+    relayRoles: string[];
+  };
   syncGate: HsmSyncGate | null;
   hasLCA: boolean;
   lcaHash: string | null;
@@ -219,7 +273,7 @@ export interface HsmStateSnapshot {
   persistedLcaContent: string | null;
   persistedAt: number | null;
   hasConflict: boolean;
-  conflictData: ConflictData | null;
+  conflict: ConflictValue | null;
   localDocLength: number;
   idbContent: string | null;
   diskMtime: number | null;
@@ -304,6 +358,14 @@ export interface DebugDocumentLookup {
   filePath: string;
 }
 
+export interface DebugCanvasLookup {
+  canvas: Canvas;
+  hsm: CanvasHSM;
+  guid: string;
+  folder: SharedFolder;
+  filePath: string;
+}
+
 export interface RelayDebugGlobal {
   /** Identity of the installing API instance; teardown removes only its own global. */
   __owner?: unknown;
@@ -380,53 +442,65 @@ export interface RelayDebugGlobal {
    */
   awaitHsmState: (path: string, statePrefix: string, timeoutMs: number) => Promise<string>;
   /**
-   * Snapshot every representation of a canvas — localDoc, remoteDoc, disk,
-   * open view, server copy — plus machine posture, LCA presence, and the
-   * persisted record, with cross-representation equality flags. Reading the
-   * localDoc materializes a hibernated canvas; pass `{ wake: false }` for a
-   * non-waking probe (local/view come back null while hibernated).
+   * Snapshot every local representation of a canvas — localDoc, remoteDoc,
+   * disk, open view — plus machine posture, LCA presence, and the persisted
+   * record, with cross-representation equality flags. Reads nothing over the
+   * network, so this is safe to poll. Reading the localDoc materializes a
+   * hibernated canvas; pass `{ wake: false }` for a non-waking probe
+   * (local/view come back null while hibernated).
    */
-  getCanvasState: (path: string, options?: { wake?: boolean }) => Promise<CanvasContentSnapshot>;
+  getCanvasState: (path: string, options?: { wake?: boolean }) => Promise<CanvasStateSnapshot>;
+  /** Read locally held canvas awareness without waking a document. */
+  getCanvasPresence: (path: string) => CanvasPresenceSnapshot;
+  /**
+   * The same snapshot plus the server's own copy of the canvas.
+   *
+   * Note: fetches remote server state. That download is the request the sync
+   * machine issues, so it attaches the canvas server side — call it to settle
+   * a question about the server, and poll `getCanvasState` instead.
+   */
+  getCanvasContent: (path: string) => Promise<CanvasContentSnapshot>;
   /**
    * Wait for a canvas machine to reach a state path that starts with
    * `statePrefix`. Thin bridge over `CanvasHSM.awaitState` — event-driven.
    */
   awaitCanvasState: (path: string, statePrefix: string, timeoutMs: number) => Promise<string>;
   /**
-   * Focused conflict snapshot: base/ours/theirs plus labels so callers
-   * can pick the right side by semantic name without pulling the whole
-   * HsmStateSnapshot. Throws if the document is not found.
+   * Focused conflict snapshot: the conflict value, with both sides, what each
+   * one is, the baseline and the blocks, plus the decisions made so far.
+   * Throws if the document is not found.
    */
   getConflictInfo: (path: string) => Promise<ConflictInfoSnapshot>;
   /**
-   * Resolve the conflict with the chosen final content. Active conflicts use
-   * the normal HSM event path; idle.diverged conflicts resolve headlessly
-   * without opening editors or views.
+   * Resolve the conflict with the chosen final content. `conflictId` is the id
+   * from `getConflictInfo`; an id that is not the current conflict's is
+   * refused, so an outcome worked out against a conflict that has since
+   * changed is never applied. Works with the note open or closed.
    */
-  resolveConflict: (path: string, contents: string) => Promise<string>;
+  resolveConflict: (path: string, conflictId: string, contents: string) => Promise<string>;
   /**
-   * Dispatch a `RESOLVE_HUNK` event for a single conflict hunk.
-   *
-   * `hunkId` is matched against `ConflictHunkInfo.id`; throws on
-   * ambiguous (collision) or missing. Numeric array indices are not
-   * accepted at this boundary because digit-only hash prefixes are valid ids.
-   *
-   * `resolution` picks the side to apply:
-   *   - "ours"    → oursContent
-   *   - "theirs"  → theirsContent
-   *   - "both"    → oursContent + "\n" + theirsContent
-   *   - "neither" → remove the hunk entirely
-   *
-   * The HSM mutates localDoc in place at the hunk's positioned region,
-   * marks the hunk resolved, and once every hunk is resolved commits
-   * the final content. idle.diverged conflicts resolve headlessly
-   * without opening editors or views.
+   * Record one decision on a block of the conflict. `blockId` is a block's id
+   * or any prefix that names one block. Ours is what this device has and
+   * theirs is what came in, in every situation; both and neither are valid
+   * only between two texts. Nothing is written until every disagreement has
+   * an answer, and then the outcome is applied.
    */
-  resolveHunk: (
+  decideConflictBlock: (
     path: string,
-    hunkId: string,
-    resolution: 'ours' | 'theirs' | 'both' | 'neither',
+    conflictId: string,
+    blockId: string,
+    decision: BlockDecision,
   ) => Promise<string>;
+  /**
+   * The conflict as shown in the note: whether the pick document is shown,
+   * every block with its decision so far, and the outcome Done would apply.
+   * Throws when no note at `path` has a conflict open in it.
+   */
+  conflictNote: (path: string) => SessionSnapshot;
+  /** Decide one block of the conflict shown in the note; `blockId` may be any prefix that names one block. */
+  conflictNoteDecide: (path: string, blockId: string, decision: BlockDecision) => SessionSnapshot;
+  /** Press Done on the conflict shown in the note: the outcome is applied and the conflict resolved. */
+  conflictNoteDone: (path: string) => Promise<string>;
   /**
    * Dispatch an `OPEN_DIFF_VIEW` event — the state-machine-level
    * equivalent of the user clicking the conflict banner. Transitions
@@ -659,6 +733,8 @@ export class RelayDebugAPI {
       listEditors: () => this.listEditors(),
       getDocumentContent: async (path) => this.getDocumentContent(path),
       getCanvasState: async (path, options) => this.getCanvasState(path, options),
+      getCanvasPresence: (path) => this.getCanvasPresence(path),
+      getCanvasContent: async (path) => this.getCanvasContent(path),
       awaitCanvasState: async (path, statePrefix, timeoutMs) =>
         this.awaitCanvasState(path, statePrefix, timeoutMs),
       getHsmStateSnapshot: async (path) => this.getHsmStateSnapshot(path),
@@ -668,9 +744,21 @@ export class RelayDebugAPI {
       awaitHsmState: async (path, statePrefix, timeoutMs) =>
         this.awaitHsmState(path, statePrefix, timeoutMs),
       getConflictInfo: async (path) => this.getConflictInfo(path),
-      resolveConflict: async (path, contents) => this.resolveConflict(path, contents),
-      resolveHunk: async (path, hunkId, resolution) =>
-        this.resolveHunk(path, hunkId, resolution),
+      resolveConflict: async (path, conflictId, contents) =>
+        this.resolveConflict(path, conflictId, contents),
+      decideConflictBlock: async (path, conflictId, blockId, decision) =>
+        this.decideConflictBlock(path, conflictId, blockId, decision),
+      conflictNote: (path) => this.conflictNoteSession(path).snapshot(),
+      conflictNoteDecide: (path, blockId, decision) => {
+        const session = this.conflictNoteSession(path);
+        session.decide(blockId, decision);
+        return session.snapshot();
+      },
+      conflictNoteDone: async (path) => {
+        const session = this.conflictNoteSession(path);
+        session.done();
+        return this.awaitHsmState(path, 'active.tracking', 5000);
+      },
       openDiffView: async (path) => this.sendConflictEvent(path, { type: 'OPEN_DIFF_VIEW' }),
       cancelDiffView: async (path) => this.sendConflictEvent(path, { type: 'CANCEL' }),
       clearLca: async (path) => this.clearLca(path),
@@ -1264,19 +1352,52 @@ export class RelayDebugAPI {
   }
 
   /**
+   * The already-loaded canvas at a vault-level path, or null. Unlike
+   * lookupCanvas this answers rather than throws, and it resolves only
+   * through the folder's loaded files: lookupCanvas falls back to getFile,
+   * which mints a handle for a canvas that is not loaded. This runs on the
+   * in-plugin inspector's timer, and watching a canvas must not be what
+   * brings it into existence.
+   */
+  findCanvas(path: string): DebugCanvasLookup | null {
+    const sharedFolders = this.plugin?.sharedFolders;
+    if (!sharedFolders || !path) return null;
+    const folder = sharedFolders.lookup(path);
+    if (!folder) return null;
+    const guid = folder.syncStore?.get(folder.getVirtualPath(path));
+    if (!guid) return null;
+    const canvas = folder.files.get(guid);
+    if (!isCanvas(canvas)) return null;
+    return { canvas, hsm: canvas.hsm, guid, folder, filePath: path };
+  }
+
+  /** Read locally held canvas awareness without waking a document. */
+  getCanvasPresence(path: string): CanvasPresenceSnapshot {
+    const canvas = this.findCanvas(path)?.canvas;
+    const awareness = canvas?._provider?.awareness;
+    return {
+      localClientId: awareness?.clientID ?? null,
+      canPublishContent: canvas?.canPublishContent ?? false,
+      states: Array.from(awareness?.getStates() ?? [], ([clientId, state]) => ({
+        clientId, user: readCanvasPresenceUser(state), canvas: readCanvasPresence(state),
+      })),
+    };
+  }
+
+  /**
    * Snapshot every representation of a canvas plus machine posture and
    * cross-representation equality flags. See CanvasContentSnapshot.
    */
-  private async getCanvasState(
+  async getCanvasState(
     path: string,
     options?: { wake?: boolean },
-  ): Promise<CanvasContentSnapshot> {
+  ): Promise<CanvasStateSnapshot> {
     const { canvas, folder, guid } = this.lookupCanvas(path);
     const wake = options?.wake ?? true;
     const wasMaterialized = !!canvas.isMaterialized;
     const machine = canvas.hsm.getSnapshot();
 
-    const result: CanvasContentSnapshot = {
+    const result: CanvasStateSnapshot = {
       path,
       guid,
       folder: folder.path || folder.name,
@@ -1289,10 +1410,8 @@ export class RelayDebugAPI {
       remote: null,
       disk: null,
       view: null,
-      server: null,
       localRemoteContentEqual: null,
       diskMatchesLocal: null,
-      serverMatchesLocal: null,
       viewMatchesLocal: null,
       lca: {
         present: !!machine.hasLCA,
@@ -1357,24 +1476,27 @@ export class RelayDebugAPI {
           const data = view.canvas?.getData();
           result.view = {
             data: { nodes: data?.nodes ?? [], edges: data?.edges ?? [] },
+            wiring: null,
           };
         }
       });
     } catch { /* view not readable */ }
 
-    // Server copy
+    // The Relay view attached to that leaf, when there is one
     try {
-      const response = await folder.backgroundSync.downloadItem(canvas);
-      const rawUpdate = new Uint8Array(response.arrayBuffer);
-      const tempDoc = new Y.Doc();
-      Y.applyUpdate(tempDoc, rawUpdate);
-      result.server = {
-        data: Canvas.exportCanvasData(tempDoc),
-        snapshot: this.toHex(snapshotFromDoc(tempDoc).snapshot),
-        updateSize: rawUpdate.byteLength,
-      };
-      tempDoc.destroy();
-    } catch { /* server download failed */ }
+      if (result.view) {
+        for (const candidate of this.requirePlugin().liveViews?.views ?? []) {
+          const relayView = candidate as Partial<RelayCanvasView>;
+          if (
+            relayView.view?.file?.path === path &&
+            typeof relayView.plugin?.wiringSnapshot === 'function'
+          ) {
+            result.view.wiring = relayView.plugin.wiringSnapshot();
+            break;
+          }
+        }
+      }
+    } catch { /* live views not readable */ }
 
     // Persisted machine record
     try {
@@ -1400,11 +1522,47 @@ export class RelayDebugAPI {
     if (result.local && result.disk && !result.disk.parseError) {
       result.diskMatchesLocal = eq(result.disk.data, result.local.data);
     }
-    if (result.local && result.server) {
-      result.serverMatchesLocal = eq(result.server.data, result.local.data);
-    }
     if (result.local && result.view) {
       result.viewMatchesLocal = eq(result.view.data, result.local.data);
+    }
+
+    return result;
+  }
+
+  /**
+   * A canvas's state snapshot together with the server's copy.
+   *
+   * Downloading the server copy is the same full-state request the sync
+   * machine issues, so it attaches the canvas server side: this is a
+   * participant's read, not an observer's. Call it to settle a question about
+   * the server; poll getCanvasState instead.
+   */
+  private async getCanvasContent(path: string): Promise<CanvasContentSnapshot> {
+    const { canvas, folder } = this.lookupCanvas(path);
+    const result: CanvasContentSnapshot = {
+      ...(await this.getCanvasState(path)),
+      server: null,
+      serverMatchesLocal: null,
+    };
+
+    try {
+      const response = await folder.backgroundSync.downloadItem(canvas);
+      const rawUpdate = new Uint8Array(response.arrayBuffer);
+      const tempDoc = new Y.Doc();
+      Y.applyUpdate(tempDoc, rawUpdate);
+      result.server = {
+        data: Canvas.exportCanvasData(tempDoc),
+        snapshot: this.toHex(snapshotFromDoc(tempDoc).snapshot),
+        updateSize: rawUpdate.byteLength,
+      };
+      tempDoc.destroy();
+    } catch { /* server download failed */ }
+
+    if (result.local && result.server) {
+      result.serverMatchesLocal = areCanvasDataEqual(
+        result.server.data as CanvasData | null | undefined,
+        result.local.data as CanvasData | null | undefined,
+      );
     }
 
     return result;
@@ -1574,11 +1732,23 @@ export class RelayDebugAPI {
       persistedLcaContent !== null &&
       idbContent === persistedLcaContent;
 
+    const accessDoc = doc as Partial<Pick<Document, 'canWriteContent' | 'clientToken'>>;
+    const manager = this.plugin?.relayManager;
+    const principal = manager?.user?.id;
+    const remote = folder.remote;
+
     return {
       path: this.toVaultPath(folder, filePath),
       guid,
       folder: folder.name,
       statePath,
+      access: {
+        canWriteContent: accessDoc.canWriteContent ?? null,
+        folderPolicy: folder.canWriteContentAnswer,
+        tokenAuthorization: accessDoc.clientToken?.authorization ?? null,
+        folderRoles: manager?.folderRoles.values().filter(r => r.userId === principal && r.sharedFolderId === remote?.id).map(r => r.role) ?? [],
+        relayRoles: manager?.relayRoles.values().filter(r => r.userId === principal && r.relayId === remote?.relayId).map(r => r.role) ?? [],
+      },
       syncGate,
       hasLCA: hasValidLCA,
       lcaHash: lca?.meta?.hash || null,
@@ -1588,8 +1758,8 @@ export class RelayDebugAPI {
       persistedLcaContentLength: persistedLcaContent?.length ?? null,
       persistedLcaContent,
       persistedAt,
-      hasConflict: !!hsm.getConflictData(),
-      conflictData: hsm.getConflictData() || null,
+      hasConflict: !!hsm.getConflict(),
+      conflict: hsm.getConflict() || null,
       localDocLength: localDoc
         ? (localDoc.getText?.('contents')?.toString()?.length ?? 0)
         : 0,
@@ -1670,7 +1840,7 @@ export class RelayDebugAPI {
     };
   }
 
-  private async getConflictInfo(path: string): Promise<ConflictInfoSnapshot> {
+  async getConflictInfo(path: string): Promise<ConflictInfoSnapshot> {
     const { manager, guid, folder, filePath } = this.resolveConflictTarget(path);
     if (typeof manager.getConflictInfo !== 'function') {
       throw new Error(`Conflict info is not available: ${path}`);
@@ -1682,12 +1852,12 @@ export class RelayDebugAPI {
     };
   }
 
-  private async resolveConflict(path: string, contents: string): Promise<string> {
+  async resolveConflict(path: string, conflictId: string, contents: string): Promise<string> {
     const { manager, guid } = this.resolveConflictTarget(path);
     if (typeof manager.resolveConflict !== 'function') {
       throw new Error(`Conflict resolution is not available: ${path}`);
     }
-    return manager.resolveConflict(guid, contents);
+    return manager.resolveConflict(guid, conflictId, contents);
   }
 
   /**
@@ -1731,7 +1901,7 @@ export class RelayDebugAPI {
     return '/' + folder.getPath(vpath);
   }
 
-  private getFolderSyncStatus(folderGuid: string): { guid: string; path: string; status: string }[] {
+  getFolderSyncStatus(folderGuid: string): { guid: string; path: string; status: string }[] {
     const folder = this.getFolderByGuid(folderGuid);
     const mm = folder?.mergeManager;
     if (!folder || !mm?.syncStatus) return [];
@@ -1762,7 +1932,7 @@ export class RelayDebugAPI {
       .map(({ guid, path }) => ({ guid, path }));
   }
 
-  private listAllConflicts(): { folderGuid: string; folderPath: string; guid: string; path: string }[] {
+  listAllConflicts(): { folderGuid: string; folderPath: string; guid: string; path: string }[] {
     if (!this.plugin?.sharedFolders) return [];
     const out: { folderGuid: string; folderPath: string; guid: string; path: string }[] = [];
     for (const folder of this.plugin.sharedFolders.items()) {
@@ -1775,7 +1945,7 @@ export class RelayDebugAPI {
     return out;
   }
 
-  private getSyncPanelStatus(folderGuid: string): SyncPanelStatus {
+  getSyncPanelStatus(folderGuid: string): SyncPanelStatus {
     const folder = this.getFolderByGuid(folderGuid);
     if (!folder) {
       throw new Error(`Folder not found: ${folderGuid}`);
@@ -1783,7 +1953,7 @@ export class RelayDebugAPI {
     return this.serializeSyncPanelStatus(folder, buildFolderSyncStatusModel(folder));
   }
 
-  private listSyncPanelStatus(): SyncPanelStatus[] {
+  listSyncPanelStatus(): SyncPanelStatus[] {
     if (!this.plugin?.sharedFolders) return [];
     const panels: SyncPanelStatus[] = [];
     for (const folder of this.plugin.sharedFolders.items()) {
@@ -1865,16 +2035,30 @@ export class RelayDebugAPI {
     return this.hsmInternals(hsm)._statePath || 'unknown';
   }
 
-  private async resolveHunk(
+  /** The session of the note at `path` with a conflict open in it. The path may carry the leading slash the other debug calls take. */
+  private conflictNoteSession(path: string) {
+    const vaultPath = path.replace(/^\/+/, '');
+    let found: ReturnType<typeof sessionOf> | undefined;
+    this.requirePlugin().app.workspace.iterateAllLeaves((leaf) => {
+      if (found) return;
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.file?.path === vaultPath) found = sessionOf(view);
+    });
+    if (!found) throw new Error(`No conflict is open in the note: ${path}`);
+    return found;
+  }
+
+  async decideConflictBlock(
     path: string,
-    hunkId: string,
-    resolution: 'ours' | 'theirs' | 'both' | 'neither',
+    conflictId: string,
+    blockId: string,
+    decision: BlockDecision,
   ): Promise<string> {
     const { manager, guid } = this.resolveConflictTarget(path);
-    if (typeof manager.resolveConflictHunk !== 'function') {
-      throw new Error(`Conflict hunk resolution is not available: ${path}`);
+    if (typeof manager.decideConflictBlock !== 'function') {
+      throw new Error(`Conflict decisions are not available: ${path}`);
     }
-    return manager.resolveConflictHunk(guid, hunkId, resolution);
+    return manager.decideConflictBlock(guid, conflictId, blockId, decision);
   }
 
   /**

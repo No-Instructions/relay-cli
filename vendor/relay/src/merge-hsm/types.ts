@@ -243,6 +243,13 @@ export interface MergeState {
 }
 
 // =============================================================================
+// Access Mode
+// =============================================================================
+
+/** Content-write permission for a document session. */
+export type ActiveAccessMode = "write" | "read";
+
+// =============================================================================
 // State Path Types (Discriminated Union)
 // =============================================================================
 
@@ -265,6 +272,8 @@ export type StatePath =
 	| "active.entering.awaitingPersistence"
 	| "active.entering.reconciling"
 	| "active.tracking"
+	| "active.reading"
+	| "active.reading.repairing"
 	| "active.merging.twoWay"
 	| "active.merging.threeWay"
 	| "active.conflict.bannerShown"
@@ -299,6 +308,23 @@ export interface AcquireLockEvent {
 	 * when DISK_CHANGED fires and dirty === false (auto-save has flushed).
 	 */
 	editorViewRef?: EditorViewRef;
+	/** Omitted means the machine asks its getAccessMode callback. */
+	accessMode?: ActiveAccessMode;
+}
+
+/** Write access ended for an open document; enters active.reading. */
+export interface DemoteToReadEvent {
+	type: "DEMOTE_TO_READ";
+}
+
+/** Write access returned for an open document; a held fork is presented first. */
+export interface PromoteToWriteEvent {
+	type: "PROMOTE_TO_WRITE";
+}
+
+/** User action: discard the preserved fork and rebuild localDoc from the replica. */
+export interface DiscardLocalForkEvent {
+	type: "DISCARD_LOCAL_FORK";
 }
 
 export interface ReleaseLockEvent {
@@ -421,13 +447,16 @@ export interface SetModeIdleColdEvent {
 // User Events
 export interface ResolveEvent {
 	type: "RESOLVE";
+	/** The conflict the contents answer. An id that is not the held conflict's is refused. */
+	conflictId?: string;
 	contents: string;
 }
 
-export interface ResolveHunkEvent {
-	type: "RESOLVE_HUNK";
-	hunkId: string;
-	resolution: "ours" | "theirs" | "both" | "neither";
+/** One decision on a block of the held conflict. Nothing is written by it. */
+export interface DecideBlockEvent {
+	type: "DECIDE_BLOCK";
+	blockId: string;
+	decision: BlockDecision;
 }
 
 export interface DismissConflictEvent {
@@ -490,15 +519,17 @@ export interface MergeSuccessEvent {
 	newLCA: LCAState;
 }
 
+/**
+ * A conflict raised by event. It carries what each side is and the situation;
+ * the handler fills in nothing that is missing.
+ */
 export interface MergeConflictEvent {
 	type: "MERGE_CONFLICT";
 	origin?: string;
-	base: string;
-	ours: string;
-	theirs: string;
-	oursLabel?: string;
-	theirsLabel?: string;
-	conflictRegions?: ConflictRegion[];
+	situation: ConflictSituation;
+	base: string | null;
+	ours: ConflictSide;
+	theirs: ConflictSide;
 }
 
 export interface DriftCheckEvent {
@@ -646,10 +677,14 @@ export type MergeEvent =
 	| SetModeIdleColdEvent
 	// User
 	| ResolveEvent
-	| ResolveHunkEvent
+	| DecideBlockEvent
 	| DismissConflictEvent
 	| OpenDiffViewEvent
 	| CancelEvent
+	| DiscardLocalForkEvent
+	// Permission transitions
+	| DemoteToReadEvent
+	| PromoteToWriteEvent
 	// Internal
 	| PersistenceLoadedEvent
 	| PersistenceSyncedEvent
@@ -736,20 +771,6 @@ export interface StatusChangedEffect {
 }
 
 /**
- * Positioned conflict region with character offsets for CM6 decorations.
- */
-export interface PositionedConflict {
-	/** Character position where conflict starts in editor */
-	localStart: number;
-	/** Character position where conflict ends in editor */
-	localEnd: number;
-	/** Content from ours (editor/CRDT) version */
-	oursContent: string;
-	/** Content from theirs (disk/remote) version */
-	theirsContent: string;
-}
-
-/**
  * Request provider sync for fork reconciliation.
  * Emitted when a fork is created and needs remote state to reconcile.
  */
@@ -770,6 +791,17 @@ export interface DiagnosticEffect {
 	detail?: Record<string, unknown>;
 }
 
+/**
+ * A read-mode repair replaced a Reader's local edit with the shared version.
+ * `contentHash` identifies the replaced text in the log stream.
+ */
+export interface ReaderEditOverwrittenEffect {
+	type: "READER_EDIT_OVERWRITTEN";
+	guid: string;
+	path: string;
+	contentHash: string;
+}
+
 export type MergeEffect =
 	| DispatchCM6Effect
 	| SetCM6Effect
@@ -780,7 +812,8 @@ export type MergeEffect =
 	| StatusChangedEffect
 	| RequestProviderSyncEffect
 	| RequestHibernateEffect
-	| DiagnosticEffect;
+	| DiagnosticEffect
+	| ReaderEditOverwrittenEffect;
 
 // =============================================================================
 // Persistence Types
@@ -877,10 +910,16 @@ export interface ManagedFile {
 export interface ConflictProvider {
 	/** Wake and prepare state, then snapshot the conflict for UI/debug. */
 	getConflictInfo(): Promise<unknown>;
-	/** Apply fully resolved content; resolves to the resulting state label. */
-	resolveConflict(contents: string): Promise<string>;
-	/** Resolve one conflict region. */
-	resolveConflictHunk(hunkId: string, resolution: unknown): Promise<string>;
+	/**
+	 * Apply fully resolved content to the conflict with this id; resolves to
+	 * the resulting state label. An id that is not the current conflict's is refused.
+	 */
+	resolveConflict(conflictId: string, contents: string): Promise<string>;
+	/**
+	 * Record one decision on a part of the conflict with this id. Nothing is
+	 * written until every disagreement has an answer.
+	 */
+	decideConflictBlock(conflictId: string, blockId: string, decision: unknown): Promise<string>;
 }
 
 /** Lightweight projection of PersistedMergeState without heavy fields (lca.contents, fork body). */
@@ -908,6 +947,7 @@ export interface PersistedStateMeta {
 // =============================================================================
 
 // Re-export TimeProvider from existing module for consistency
+import type { BlockDecision, ConflictSide, ConflictSituation } from "./conflictValue";
 import type { TimeProvider } from "../TimeProvider";
 export type { TimeProvider };
 
@@ -961,6 +1001,8 @@ export interface IYDocPersistence {
 	 * @returns true if initialization happened, false if already initialized
 	 */
 	initializeFromRemote?(update: Uint8Array, origin?: unknown): Promise<boolean>;
+	/** Delete every stored row for this document so a rebuild starts empty. */
+	clearDocumentData?(): Promise<void>;
 	/**
 	 * OpCapture instance managed by this persistence layer.
 	 * Initialized during the persistence sync lifecycle when captureOpts
@@ -1056,6 +1098,7 @@ export interface MergeHSMConfig {
 	 */
 	createPersistence: CreatePersistence;
 
+
 	/**
 	 * Metadata to store on the persistence for recovery/debugging.
 	 * Set after persistence syncs.
@@ -1082,6 +1125,9 @@ export interface MergeHSMConfig {
 	 * newly-created HSM that has not yet received its own CONNECTED event.
 	 */
 	isFolderConnected?: () => boolean;
+
+	/** Current content-write permission; absent means "write". */
+	getAccessMode?: () => ActiveAccessMode;
 
 	/**
 	 * When true, invoke sources return never-resolving promises instead of
@@ -1180,6 +1226,10 @@ export interface CapabilityContract {
 	canPersistFullLca?: boolean;
 	canUseRemoteDoc?: boolean;
 	canUsePendingDiskContents?: boolean;
+	/** Whether local editor/machine/disk content may enter localDoc. */
+	canAcceptLocalContent?: boolean;
+	/** Whether local CRDT state may flow to remoteDoc / SYNC_TO_REMOTE. */
+	canSyncOutbound?: boolean;
 }
 
 /** A single state node in the machine definition */

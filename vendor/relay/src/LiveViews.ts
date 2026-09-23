@@ -1,4 +1,6 @@
-import type { Extension } from "@codemirror/state";
+import { type Extension } from "@codemirror/state";
+import { conflictSideNames } from "./differ/conflictNames";
+import { type ConflictNoteSession, closeSession, conflictNoteExtension, openSession, sessionOf } from "./conflict-note";
 import { EditorView } from "@codemirror/view";
 import {
 	App,
@@ -22,6 +24,7 @@ import NetworkStatus from "./NetworkStatus";
 import { SharedFolder, SharedFolders } from "./SharedFolder";
 import { curryLog, HasLogging, RelayInstances, metrics } from "./debug";
 import { Banner } from "./ui/Banner";
+import { PreservedEditsModal } from "./ui/PreservedEditsModal";
 import { HSMEditorPlugin } from "./merge-hsm/integration/HSMEditorPlugin";
 import {
 	yRemoteSelections,
@@ -37,8 +40,14 @@ import * as Differ from "./differ/differencesView";
 import type { CanvasView } from "./CanvasView";
 import { isCanvas, type Canvas } from "./Canvas";
 import { CanvasPlugin } from "./CanvasPlugin";
+import { CanvasPresencePlugin } from "./canvas-presence";
+import { ANONYMOUS_PROFILE_NAME } from "./User";
 import { LiveNode } from "./y-codemirror.next/LiveNodePlugin";
 import { flags } from "./flagManager";
+import { accessModeCompartment, configureAccessMode } from "./readOnlyEditorState";
+import { finishMarkdownModeChanges, requestedMarkdownMode, setMarkdownViewMode } from "./markdownViewMode";
+import { getPatcher } from "./Patcher";
+import { notSyncedPillState, type NotSyncedPillState } from "./notSyncedState";
 import {
 	AwarenessViewPlugin,
 	resolveMarkdownAwarenessAnchor,
@@ -54,6 +63,7 @@ import { trackPromise } from "./trackPromise";
 import { isDocumentDestroyedError } from "./DocumentDestroyedError";
 import { trackAsyncCleanup } from "./reloadUtils";
 import { transitionViewsOffline } from "./offlineViews";
+import { preservedForkText } from "./merge-hsm/snapshots";
 import type { ObsidianCanvas } from "src/CanvasView";
 
 /**
@@ -183,6 +193,41 @@ export interface S3View {
 	offlineBanner?: () => () => void;
 }
 
+export class NotSyncedView implements S3View {
+	document = null;
+	canConnect = false;
+	private banner?: Banner;
+
+	constructor(
+		public view: TextFileView | CanvasView,
+		public readonly status: NotSyncedPillState,
+		private folder: SharedFolder,
+	) {}
+
+	attach(): Promise<S3View> {
+		const readOnlyFolder = this.status.reason === "read-only-folder";
+		const kind = this.view instanceof MarkdownView ? "note" : "file";
+		this.banner ??= new Banner(this.view, {
+			short: readOnlyFolder ? `${this.folder.name} is read-only` : "Not synced",
+			long: `${readOnlyFolder ? "is read-only" : this.status.label} — this ${kind} will not be synced`,
+			context: readOnlyFolder ? {
+				name: this.folder.name,
+				icon: this.folder.remote ? (this.folder.remote.private ? "folder-lock" : "folder") : "layers",
+			} : undefined,
+		}, undefined, "relay-not-synced");
+		return Promise.resolve(this);
+	}
+
+	release(): void {
+		this.banner?.destroy();
+		this.banner = undefined;
+	}
+
+	destroy(): void {
+		this.release();
+	}
+}
+
 export class LoggedOutView implements S3View {
 	view: TextFileView | CanvasView;
 	login: () => Promise<boolean>;
@@ -203,11 +248,13 @@ export class LoggedOutView implements S3View {
 	}
 
 	attach(): Promise<S3View> {
-		this.banner = new Banner(
+		this.banner ??= new Banner(
 			this.view,
 			{ short: "Login to Relay", long: "Login to enable Live edits" },
 			async () => {
-				return await this.login();
+				const loggedIn = await this.login();
+				if (loggedIn) this.release();
+				return loggedIn;
 			},
 		);
 		return Promise.resolve(this);
@@ -215,11 +262,11 @@ export class LoggedOutView implements S3View {
 
 	release() {
 		this.banner?.destroy();
+		this.banner = undefined;
 	}
 
 	destroy() {
-		this.banner?.destroy();
-		this.banner = undefined;
+		this.release();
 		this.view = null as unknown as typeof this.view;
 	}
 }
@@ -257,7 +304,10 @@ export class RelayCanvasView implements S3View {
 	private offConnectionStatusSubscription?: () => void;
 	private _parent: LiveViewManager;
 	private _banner?: Banner;
+	private _offlineBanner?: Banner;
+	private _offOfflineOnline?: () => void;
 	private _awarenessPlugin?: AwarenessViewPlugin;
+	private _presencePlugin?: CanvasPresencePlugin;
 	private _lockViewer?: DocumentViewer;
 	tracking: boolean;
 
@@ -300,22 +350,33 @@ export class RelayCanvasView implements S3View {
 	}
 
 	offlineBanner(): () => void {
-		if (this.shouldConnect) {
-			const banner = new Banner(
+		if (!this.shouldConnect) return () => {};
+		if (!this._offlineBanner) {
+			this._offlineBanner = new Banner(
 				this.view,
 				{ short: "Offline", long: "You're offline -- click to reconnect" },
 				async () => {
 					void this._parent.networkStatus.checkStatus();
 					this.connect();
-					return this._parent.networkStatus.online;
+					const online = this._parent.networkStatus.online;
+					if (online) this.clearOfflineBanner();
+					return online;
 				},
+				{ priority: 0 },
 			);
-			this._parent.networkStatus.onceOnline(() => {
+			this._offOfflineOnline = this._parent.networkStatus.onceOnline(() => {
+				this.clearOfflineBanner();
 				this.connect();
-				banner.destroy();
 			});
 		}
-		return () => {};
+		return () => this.clearOfflineBanner();
+	}
+
+	private clearOfflineBanner(): void {
+		this._offOfflineOnline?.();
+		this._offOfflineOnline = undefined;
+		this._offlineBanner?.destroy();
+		this._offlineBanner = undefined;
 	}
 
 	setConnectionDot(): void {
@@ -390,6 +451,20 @@ export class RelayCanvasView implements S3View {
 			this.plugin = new CanvasPlugin(this._parent, this);
 		}
 
+		const presenceEnabled = flags().enableCanvasPresence;
+		if (!this._presencePlugin && presenceEnabled) {
+			this._presencePlugin = new CanvasPresencePlugin(this.view, this.canvas, {
+				resolveName: (user) =>
+					flags().enableStreamerMode
+						? ANONYMOUS_PROFILE_NAME
+						: user?.name || ANONYMOUS_PROFILE_NAME,
+			});
+		} else if (this._presencePlugin && !presenceEnabled) {
+			// The flag was turned off while the canvas was open.
+			this._presencePlugin.destroy();
+			this._presencePlugin = undefined;
+		}
+
 		if (!this._awarenessPlugin) {
 			const viewEl = this.view.containerEl;
 			this._awarenessPlugin = new AwarenessViewPlugin(
@@ -404,6 +479,9 @@ export class RelayCanvasView implements S3View {
 							: null;
 					},
 					vertical: true,
+					locateUser: presenceEnabled
+						? (userId) => this._presencePlugin?.locateUser(userId) ?? false
+						: undefined,
 					configureContainer: (el) => {
 						const controls =
 							viewEl.querySelector<HTMLElement>(".canvas-controls");
@@ -463,10 +541,13 @@ export class RelayCanvasView implements S3View {
 
 		this.plugin?.destroy();
 		this.plugin = undefined;
+		this._presencePlugin?.destroy();
+		this._presencePlugin = undefined;
 		this._awarenessPlugin?.destroy();
 		this._awarenessPlugin = undefined;
 		this._viewActions?.destroy();
 		this._viewActions = undefined;
+		this.clearOfflineBanner();
 		this._banner?.destroy();
 		this._banner = undefined;
 		if (this.offConnectionStatusSubscription) {
@@ -499,6 +580,11 @@ export class RelayCanvasView implements S3View {
 	}
 }
 
+/** Per-view CM6 compartment: empty for write access, non-editable for read. */
+export { accessModeCompartment } from "./readOnlyEditorState";
+
+let liveViewCount = 0;
+
 export class LiveView<ViewType extends TextFileView>
 	extends HasLogging
 	implements S3View
@@ -514,6 +600,20 @@ export class LiveView<ViewType extends TextFileView>
 	private offConnectionStatusSubscription?: () => void;
 	private _parent: LiveViewManager;
 	private _banner?: Banner;
+	private _conflictSession?: ConflictNoteSession;
+	/** Tells one live view from another in the log. */
+	private readonly viewSeq = ++liveViewCount;
+	private _offlineBanner?: Banner;
+	private _offOfflineOnline?: () => void;
+	private _forkNotice?: Banner;
+	private _readOnlyBanner?: Banner;
+	private _offAccessStatus?: () => void;
+	private _offPermissions?: () => void;
+	private _previousMarkdownMode?: "preview" | "source";
+	private _offMarkdownState?: () => void;
+	private _leavingMarkdownFile = false;
+	/** Last access mode observed by the editor UX edge detector. */
+	private _lastEditableReading: boolean | null = null;
 	_tracking: boolean;
 	private _awarenessPlugin?: AwarenessViewPlugin;
 	private _hsmStateUnsubscribe?: () => void;
@@ -571,9 +671,47 @@ export class LiveView<ViewType extends TextFileView>
 
 	public get tracking() {
 		if (this.document?.hsm) {
-			return this.document.hsm.state.statePath === "active.tracking";
+			return this.document.hsm.statePath === "active.tracking";
 		}
 		return this._tracking;
+	}
+
+	/** Whether the machine is in a read state. */
+	public get reading() {
+		const statePath = this.document?.hsm?.statePath;
+		return statePath === "active.reading" || statePath === "active.reading.repairing";
+	}
+
+	private reconcileAccessModeBanners(statePath: string): void {
+		const showForkNotice =
+			statePath.startsWith("active.reading") &&
+			(this.document.hsm?.hasFork() ?? false);
+
+		// The view has one banner slot. Remove the current banner before creating another.
+		if (!showForkNotice && this._forkNotice) {
+			this._forkNotice.destroy();
+			this._forkNotice = undefined;
+		}
+
+		const isConflict = statePath.includes("conflict");
+		if (isConflict && !this._banner && !this._conflictSession?.keepsView) {
+			this.log("[LiveView] HSM entered conflict state, showing merge banner");
+			this.mergeBanner();
+		} else if (!isConflict && (this._banner || this._conflictSession)) {
+			this.log("[LiveView] HSM exited conflict state, hiding merge banner");
+			this._banner?.destroy();
+			this._banner = undefined;
+			this.closeConflictNote();
+		}
+
+		if (showForkNotice && !this._forkNotice) {
+			this.log("[LiveView] read mode with preserved fork, showing notice");
+			this.preservedEditsBanner();
+		}
+	}
+
+	public get live() {
+		return this.tracking || this.reading;
 	}
 
 	public set tracking(value: boolean) {
@@ -601,7 +739,61 @@ export class LiveView<ViewType extends TextFileView>
 		}
 	}
 
+	/**
+	 * With conflicts resolved in the note, the conflict opens as a pick
+	 * document in the editor instead of a banner. A member with read access
+	 * keeps the banner and the side-by-side comparison of held edits.
+	 */
+	private openConflictNote(): boolean {
+		if (!flags().enableInNoteConflicts || !(this.view instanceof MarkdownView) || this.reading) return false;
+		const hsm = this.document.hsm;
+		const conflict = hsm?.getConflict();
+		const cm = (this.view.editor as { cm?: EditorView } | undefined)?.cm;
+		if (!hsm || !conflict || !cm) return false;
+		if (this._conflictSession?.keepsView) return true;
+		// A session another owner of this view opened is this view's session too.
+		const existing = sessionOf(this.view);
+		if (existing?.keepsView) {
+			this._conflictSession = existing;
+			return true;
+		}
+		// A session the editor no longer shows, though it did not end, lost its
+		// state to a rebuild of the editor's configuration; it is closed and replaced.
+		const before = this._conflictSession ? (this._conflictSession.endedBy ?? "a rebuilt editor state") : null;
+		this.log(`[LiveView] opening conflict ${conflict.id} in the note (${before ? `after a session ended by ${before}` : "no session yet"}; view ${this.viewSeq})`);
+		this._conflictSession = openSession(this.view, cm, hsm, conflict, {
+			collaborator: this.collaboratorName(),
+			report: () => {
+				(this._parent.app as { commands?: { executeCommandById(id: string): void } }).commands?.executeCommandById("system3-relay:send-bug-report");
+			},
+		});
+		return true;
+	}
+
+	private closeConflictNote(): void {
+		if (!this._conflictSession) return;
+		if (this.view instanceof MarkdownView && sessionOf(this.view) === this._conflictSession) closeSession(this.view);
+		else this._conflictSession.close();
+		this._conflictSession = undefined;
+	}
+
+	/** The name of a collaborator present on the note, when awareness has one who is not this user. */
+	private collaboratorName(): string | null {
+		const awareness = this.document.sharedFolder?._provider?.awareness;
+		if (!awareness) return null;
+		for (const [clientId, raw] of awareness.getStates()) {
+			if (clientId === awareness.clientID) continue;
+			const user = (raw as { user?: { id?: string; name?: string } }).user;
+			if (!user?.id || this.document.sharedFolder.isLocalUserId(user.id)) continue;
+			const name = (user.name ?? this.document.sharedFolder.getUserDisplayName(user.id))?.trim();
+			if (name && name !== ANONYMOUS_PROFILE_NAME) return name;
+		}
+		return null;
+	}
+
 	mergeBanner(): () => void {
+		if (this._banner) return () => {};
+		if (this.openConflictNote()) return () => {};
 		this._banner = new Banner(
 			this.view,
 			{ short: "Merge conflict", long: "Merge conflict -- click to resolve" },
@@ -609,54 +801,26 @@ export class LiveView<ViewType extends TextFileView>
 				// HSM-aware conflict resolution path
 				const hsm = this.document.hsm;
 				if (hsm) {
-					const conflictData = hsm.getConflictData({ fresh: true });
+					const conflict = hsm.getConflict({ fresh: true });
 					const localDoc = hsm.getLocalDoc();
 					if (
-						conflictData &&
+						conflict &&
 						localDoc &&
 						hsm.state.statePath.includes("conflict")
 					) {
 						this.log("[mergeBanner] Opening diff view for conflict resolution");
 
-						// Check if there are inline conflict regions (new flow)
-						const hasInlineConflicts =
-							conflictData.conflictRegions &&
-							conflictData.conflictRegions.length > 0;
-
-						if (hasInlineConflicts) {
-							// With inline conflicts, clicking banner opens diff view as alternative
-							this.log(
-								"[mergeBanner] Inline conflicts present, opening diff view as alternative",
-							);
-						}
-
-						// Use the conflict payload sides directly so labels and hunk actions
-						// stay aligned with what the HSM declared as ours/theirs.
-						const oursContent = conflictData.ours;
-						const theirsContent = conflictData.theirs;
-						const currentLocalContent = localDoc.getText("contents").toString();
-						if (currentLocalContent !== oursContent) {
-							this.log(
-								`[mergeBanner] conflict side drift detected: localDoc=${currentLocalContent.length}, conflict.ours=${oursContent.length}`,
-							);
-						}
-
+						// Ours is what this device has and theirs is what came in, in
+						// every situation, so ours goes first. The names come from what
+						// each side is, never from the engine or from label text.
+						const names = conflictSideNames(conflict);
+						const topContent = conflict.ours.text;
+						const bottomContent = conflict.theirs.text;
+						const topLabel = names.ours;
+						const bottomLabel = names.theirs;
 						this.log(
-							`[mergeBanner] ours: ${oursContent.length} chars, theirs: ${theirsContent.length} chars`,
+							`[mergeBanner] ${conflict.situation}: ours ${conflict.ours.source} ${topContent.length} chars, theirs ${conflict.theirs.source} ${bottomContent.length} chars`,
 						);
-
-						const oursLabel = conflictData.oursLabel ?? "Editor";
-						const theirsLabel = conflictData.theirsLabel ?? "Disk";
-						const showRemoteOnTop =
-							oursLabel.toLowerCase().includes("local")
-							&& (
-								theirsLabel.toLowerCase().includes("remote")
-								|| theirsLabel.toLowerCase().includes("peer")
-							);
-						const topContent = showRemoteOnTop ? theirsContent : oursContent;
-						const bottomContent = showRemoteOnTop ? oursContent : theirsContent;
-						const topLabel = showRemoteOnTop ? theirsLabel : oursLabel;
-						const bottomLabel = showRemoteOnTop ? oursLabel : theirsLabel;
 
 						// Create DiskBuffer wrappers (differ expects TFile-like objects).
 						// file1 is always shown on top/left in the differ.
@@ -689,7 +853,9 @@ export class LiveView<ViewType extends TextFileView>
 								// Get the resolved content and apply it to HSM's localDoc.
 								const resolvedContent = topFile.contents;
 
-								hsm.send({ type: "RESOLVE", contents: resolvedContent });
+								// The id says which conflict this answers: one that has
+								// since changed is refused instead of overwritten.
+								await hsm.resolveConflict(conflict.id, resolvedContent);
 
 								this._banner?.destroy();
 								this._banner = undefined;
@@ -708,23 +874,84 @@ export class LiveView<ViewType extends TextFileView>
 		return () => {};
 	}
 
+	preservedEditsBanner(): void {
+		if (this._forkNotice) return;
+		this._forkNotice = new Banner(
+			this.view,
+			{
+				short: "Local edits held",
+				long: "Local edits held -- restore later or revert",
+			},
+			async () => {
+				const hsm = this.document.hsm;
+				if (!hsm) return false;
+				new PreservedEditsModal(this._parent.app, {
+					fileName: this.document.path.split("/").pop() ?? this.document.path,
+					onCompare: () => {
+						const localDoc = hsm.getLocalDoc();
+						const remoteDoc = hsm.getRemoteDoc();
+						const preservedText = preservedForkText(
+							localDoc,
+							hsm.state.fork,
+						);
+						if (preservedText === null || !remoteDoc) return;
+						const preserved = new DiskBuffer(
+							this._parent.app.vault,
+							this.document.path + " (Your edits)",
+							preservedText,
+						);
+						const shared = new DiskBuffer(
+							this._parent.app.vault,
+							this.document.path + " (Shared version)",
+							remoteDoc.getText("contents").toString(),
+						);
+						this._parent.openDiffView({
+							file1: preserved,
+							file2: shared,
+							showMergeOption: false,
+							oursLabel: "Your edits",
+							theirsLabel: "Shared version",
+							sourceVaultPath: this.document.tfile?.path,
+						});
+					},
+					onDiscard: () => {
+						hsm.send({ type: "DISCARD_LOCAL_FORK" });
+					},
+				}).open();
+				// The state subscription hides the notice when the fork clears.
+				return false;
+			},
+		);
+	}
+
 	offlineBanner(): () => void {
-		if (this.shouldConnect) {
-			const banner = new Banner(
+		if (!this.shouldConnect) return () => {};
+		if (!this._offlineBanner) {
+			this._offlineBanner = new Banner(
 				this.view,
 				{ short: "Offline", long: "You're offline -- click to reconnect" },
 				async () => {
 					void this._parent.networkStatus.checkStatus();
 					this.connect();
-					return this._parent.networkStatus.online;
+					const online = this._parent.networkStatus.online;
+					if (online) this.clearOfflineBanner();
+					return online;
 				},
+				{ priority: 0 },
 			);
-			this._parent.networkStatus.onceOnline(() => {
+			this._offOfflineOnline = this._parent.networkStatus.onceOnline(() => {
+				this.clearOfflineBanner();
 				this.connect();
-				banner.destroy();
 			});
 		}
-		return () => {};
+		return () => this.clearOfflineBanner();
+	}
+
+	private clearOfflineBanner(): void {
+		this._offOfflineOnline?.();
+		this._offOfflineOnline = undefined;
+		this._offlineBanner?.destroy();
+		this._offlineBanner = undefined;
 	}
 
 	setConnectionDot(): void {
@@ -743,7 +970,7 @@ export class LiveView<ViewType extends TextFileView>
 						view: this,
 						state: this.document.state,
 						remote: this.document.sharedFolder.remote,
-						tracking: this.tracking,
+						tracking: this.live,
 						localOnly: this.document.hsm?.isLocalOnly ?? false,
 						enableDraftMode: flags().enableDraftMode,
 						folderConnected: this.document.sharedFolder.connected,
@@ -758,7 +985,7 @@ export class LiveView<ViewType extends TextFileView>
 							view: this,
 							state: state,
 							remote: this.document.sharedFolder.remote,
-							tracking: this.tracking,
+							tracking: this.live,
 							localOnly: this.document.hsm?.isLocalOnly ?? false,
 							enableDraftMode: flags().enableDraftMode,
 							folderConnected: this.document.sharedFolder.connected,
@@ -773,34 +1000,25 @@ export class LiveView<ViewType extends TextFileView>
 			if (hsm && !this._hsmStateUnsubscribe) {
 				this._hsmStateUnsubscribe = hsm.stateChanges.subscribe((state) => {
 					if (!this.document.sharedFolder) return;
+					const currentFlags = flags();
 					this._viewActions?.set({
-						tracking: state.statePath === "active.tracking",
+						tracking: this.live,
 						localOnly: this.document.hsm?.isLocalOnly ?? false,
-						enableDraftMode: flags().enableDraftMode,
+						enableDraftMode: currentFlags.enableDraftMode,
 						folderConnected: this.document.sharedFolder.connected,
 						pendingOutbound: this.document.hsm?.pendingOutbound ?? 0,
 						pendingInbound: this.document.hsm?.pendingInbound ?? 0,
 					});
-					const isConflict = state.statePath.includes("conflict");
-					if (isConflict && !this._banner) {
-						this.log(
-							"[LiveView] HSM entered conflict state, showing merge banner",
-						);
-						this.mergeBanner();
-					} else if (!isConflict && this._banner) {
-						this.log(
-							"[LiveView] HSM exited conflict state, hiding merge banner",
-						);
-						this._banner.destroy();
-						this._banner = undefined;
-					}
+					this.reconcileAccessModeBanners(state.statePath);
+					this.applyEditableState();
 				});
+				this.reconcileAccessModeBanners(hsm.statePath);
 			}
 			this._viewActions.set({
 				view: this,
 				state: this.document.state,
 				remote: this.document.sharedFolder.remote,
-				tracking: this.tracking,
+				tracking: this.live,
 				localOnly: this.document.hsm?.isLocalOnly ?? false,
 				enableDraftMode: flags().enableDraftMode,
 				folderConnected: this.document.sharedFolder.connected,
@@ -851,19 +1069,140 @@ export class LiveView<ViewType extends TextFileView>
 	}
 
 	private initializeEditorIntegration(): void {
-		if (!(this.view instanceof MarkdownView)) {
+		if (this._released || this._leavingMarkdownFile || !(this.view instanceof MarkdownView)) {
 			return;
 		}
+		this.installMarkdownModeRestoration(this.view);
 		const cm = (this.view.editor as { cm?: EditorView } | undefined)?.cm;
-		if (!cm) {
+		const plugin = cm?.plugin(HSMEditorPlugin);
+		plugin?.initializeIfReady();
+		this.applyEditableState(true);
+	}
+
+	private installMarkdownModeRestoration(view: MarkdownView): void {
+		if (this._offMarkdownState || typeof view.setState !== "function") return;
+		const owner = () => this;
+		this._offMarkdownState = getPatcher().patch(view, {
+			setState(old: MarkdownView["setState"]) {
+				return function (this: MarkdownView, state: unknown, result: Parameters<MarkdownView["setState"]>[1]) {
+					const live = owner();
+					const previousMode = live._previousMarkdownMode;
+					if (previousMode !== undefined && state && typeof state === "object" &&
+						"file" in state && typeof state.file === "string" &&
+						state.file !== live.document.sharedFolder.getPath(live.document.path)) {
+						// Restore before the next file is shown. Waiting for the
+						// manager's asynchronous release would overwrite a mode
+						// the user selected on that next file in the meantime.
+						live._previousMarkdownMode = undefined;
+						live._leavingMarkdownFile = true;
+						return finishMarkdownModeChanges(this).then(() => {
+							// The manager can still be waiting on folder readiness.
+							// Release this file's editor restriction before native
+							// navigation reuses the editor for the next file.
+							live.clearReadOnlyPresentation();
+							return old.call(this, { ...state, mode: previousMode }, result);
+						});
+					}
+					return old.call(this, state, result);
+				};
+			},
+		});
+	}
+
+	private get readOnly(): boolean {
+		return this.document.canWriteContent === false || this.reading;
+	}
+
+	private setMarkdownMode(view: MarkdownView, mode: "preview" | "source"): void {
+		void setMarkdownViewMode(view, mode).then(() => {
+			if (!this._released) this.applyEditableState(true);
+		}).catch((error) => {
+			this.warn("Unable to change note view mode", error);
+		});
+	}
+
+	private restoreMarkdownMode(): void {
+		const mode = this._previousMarkdownMode;
+		this._previousMarkdownMode = undefined;
+		if (mode !== undefined && this.view instanceof MarkdownView) {
+			this.debug("Restoring note view mode", { path: this.document.path, mode });
+			this.setMarkdownMode(this.view, mode);
+		}
+	}
+
+	private reconcileReadOnlyBanner(view: MarkdownView, readOnly: boolean): void {
+		if (!readOnly) {
+			this._readOnlyBanner?.destroy();
+			this._readOnlyBanner = undefined;
+		} else if (!this._readOnlyBanner) {
+			this._readOnlyBanner = new Banner(view, "Read-only", undefined, "relay-read-only");
+		}
+	}
+
+	private clearReadOnlyPresentation(): void {
+		if (this.view instanceof MarkdownView) {
+			const cm = (this.view.editor as { cm?: EditorView } | undefined)?.cm;
+			if (cm) configureAccessMode(cm, false);
+			this.view.containerEl.removeClass("relay-read-only");
+		}
+		this._readOnlyBanner?.destroy();
+		this._readOnlyBanner = undefined;
+	}
+
+	/**
+	 * Move a reading session to Obsidian's reading view. A source view stays
+	 * non-editable through the compartment. Runs in a microtask because a
+	 * state change can arrive inside a CM6 update, where dispatch is illegal.
+	 */
+	public applyEditableState(forceEditorConfiguration = false): void {
+		if (this._released || this._leavingMarkdownFile || !(this.view instanceof MarkdownView)) {
 			return;
 		}
-		const plugin = cm.plugin(HSMEditorPlugin);
-		plugin?.initializeIfReady();
+		const view = this.view;
+		const readOnly = this.readOnly;
+		const modeChanged = this._lastEditableReading !== readOnly;
+		if (!modeChanged && !forceEditorConfiguration) return;
+		const previousReading = this._lastEditableReading;
+		this._lastEditableReading = readOnly;
+		queueMicrotask(() => {
+			if (this._released || this._leavingMarkdownFile) return;
+			const currentReadOnly = this.readOnly;
+			if (this._lastEditableReading !== readOnly || currentReadOnly !== readOnly) {
+				return;
+			}
+			if (modeChanged) {
+				view.containerEl.toggleClass("relay-read-only", readOnly);
+			}
+			this.reconcileReadOnlyBanner(view, readOnly);
+
+			// Reading temporarily overrides this pane's existing view preference.
+			if (modeChanged && readOnly) {
+				// A view can report preview while Obsidian is still restoring
+				// its saved source state. Request reading view on every new
+				// read-only session, including that opening transition.
+				this._previousMarkdownMode ??= requestedMarkdownMode(view);
+				this.debug("Entering Reader view", { path: this.document.path, previousMode: this._previousMarkdownMode });
+				this.setMarkdownMode(view, "preview");
+			} else if (
+				modeChanged &&
+				previousReading === true &&
+				!readOnly
+			) {
+				this.restoreMarkdownMode();
+			}
+
+			const cm = (view.editor as { cm?: EditorView } | undefined)?.cm;
+			if (!cm) return;
+			configureAccessMode(cm, readOnly);
+		});
 	}
 
 	attach(): Promise<this> {
 		this._released = false;
+		this._offAccessStatus ??= this.document.subscribe(this, () => this.applyEditableState(true));
+		this._offPermissions ??= this.document.sharedFolder.subscribeToPermissionChanges(
+			() => this.applyEditableState(true),
+		);
 
 		// can be called multiple times, whereas release is only ever called once
 		// Acquire a lock synchronously. Subsequent attach calls for the same view
@@ -967,16 +1306,29 @@ export class LiveView<ViewType extends TextFileView>
 			return;
 		}
 		this._released = true;
+		this.restoreMarkdownMode();
+		this._offMarkdownState?.();
+		this._offMarkdownState = undefined;
+		this.clearReadOnlyPresentation();
 
-		// Remove the live editor class
+		// Remove the live editor classes
 		if (this.view instanceof MarkdownView) {
 			this.view.containerEl.removeClass("relay-live-editor");
 		}
+		this._lastEditableReading = null;
 
 		this._viewActions?.destroy();
 		this._viewActions = undefined;
+		this.clearOfflineBanner();
 		this._banner?.destroy();
 		this._banner = undefined;
+		this.closeConflictNote();
+		this._forkNotice?.destroy();
+		this._forkNotice = undefined;
+		this._offAccessStatus?.();
+		this._offAccessStatus = undefined;
+		this._offPermissions?.();
+		this._offPermissions = undefined;
 		if (this.offConnectionStatusSubscription) {
 			this.offConnectionStatusSubscription();
 			this.offConnectionStatusSubscription = undefined;
@@ -1080,7 +1432,6 @@ export class LiveViewManager {
 				void this.refresh("[LoginManager]");
 			}),
 		);
-
 		const folderSub = (folder: SharedFolder) => {
 			if (!folder.ready) {
 				void (async () => {
@@ -1492,6 +1843,11 @@ export class LiveViewManager {
 					});
 					views.push(view);
 				} else if (folder.ready) {
+					const notSynced = notSyncedPillState(folder, viewFile);
+					if (notSynced) {
+						views.push(new NotSyncedView(textFileView, notSynced, folder));
+						return;
+					}
 					try {
 						const doc = folder.getFile(viewFile);
 						if (isDocument(doc)) {
@@ -1533,6 +1889,11 @@ export class LiveViewManager {
 					});
 					views.push(view);
 				} else if (folder.ready) {
+					const notSynced = notSyncedPillState(folder, canvasView.file);
+					if (notSynced) {
+						views.push(new NotSyncedView(canvasView, notSynced, folder));
+						return;
+					}
 					const canvas = folder.getFile(canvasView.file);
 					if (isCanvas(canvas)) {
 						const view = new RelayCanvasView(this, canvasView, canvas);
@@ -1557,6 +1918,34 @@ export class LiveViewManager {
 			const cm = editor.cm;
 			return cm === cmEditor;
 		});
+	}
+
+	/**
+	 * The canvas node embed an editor belongs to, when it is one.
+	 *
+	 * A text card's editor carries its canvas node in its own CM6 state, which
+	 * is what findCanvas reads. A file embed's editor does not carry that
+	 * field at all, so it cannot name itself; the node that renders it is the
+	 * only thing that can, and it is identified by owning this exact editor.
+	 */
+	findCanvasEmbed(
+		cmEditor: EditorView,
+	): { view: RelayCanvasView; file: TFile } | undefined {
+		for (const view of this.views.filter(isRelayCanvasView)) {
+			const canvas = view.view.canvas;
+			if (!canvas?.nodes) continue;
+			for (const [, node] of canvas.nodes) {
+				const child = (
+					node as unknown as {
+						child?: { file?: TFile; editor?: { cm?: EditorView } };
+					}
+				).child;
+				if (child?.editor?.cm === cmEditor && child.file) {
+					return { view, file: child.file };
+				}
+			}
+		}
+		return undefined;
 	}
 
 	findCanvas(cmEditor: EditorView): RelayCanvasView | undefined {
@@ -1695,7 +2084,10 @@ export class LiveViewManager {
 				return;
 			}
 			const found = views.find((newView) => {
+				if (oldView instanceof NotSyncedView && newView instanceof NotSyncedView &&
+					oldView.status.reason !== newView.status.reason) return false;
 				if (
+					oldView.constructor === newView.constructor &&
 					oldView.document == newView.document &&
 					oldView.view == newView.view
 				) {
@@ -1845,6 +2237,8 @@ export class LiveViewManager {
 			userAttributionTheme,
 			userAttributionPlugin,
 			InvalidLinkPlugin,
+			accessModeCompartment.of([]),
+			conflictNoteExtension,
 		]);
 		this.workspace.updateOptions();
 	}
@@ -1862,7 +2256,7 @@ export class LiveViewManager {
 				label: `liveViews:refreshOpenLeaf:${view.file?.path ?? refreshed.size}`,
 				mode:
 					view instanceof MarkdownView
-						? view.getMode?.()
+						? requestedMarkdownMode(view)
 						: undefined,
 			});
 		});

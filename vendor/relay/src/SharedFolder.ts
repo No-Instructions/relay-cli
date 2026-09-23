@@ -1,5 +1,8 @@
 "use strict";
+import type { AttachmentTransfers } from "./AttachmentTransfers";
+import type { AttachmentVersion } from "./AttachmentIO";
 import { uuidv4 } from "lib0/random";
+import { matchRemoteFolder } from "./remoteFolderMatch";
 import {
 	FileManager,
 	type MetadataCache,
@@ -18,6 +21,7 @@ import {
 	IndexeddbPersistence,
 } from "./storage/y-indexeddb";
 import { dirname, join, sep } from "path-browserify";
+import { capabilitiesOf, type ClientToken } from "./client/types";
 import { HasProvider, type ConnectionIntent } from "./HasProvider";
 import type { EventMessage } from "./client/provider";
 import { Document } from "./Document";
@@ -40,10 +44,11 @@ import { LocalStorage } from "./LocalStorage";
 import type { MergeHSM } from "./merge-hsm/MergeHSM";
 import { SyncFolder, isSyncFolder } from "./SyncFolder";
 import { isDocument } from "./Document";
-import { SyncStore } from "./SyncStore";
+import { SyncStore, type FolderMapDelta } from "./SyncStore";
 import { FolderHSM } from "./folder-hsm/FolderHSM";
 import { MembershipSnapshot } from "./folder-hsm/MembershipSnapshot";
 import { ServerOps } from "./folder-hsm/ServerOps";
+import { withLinkUpdatesOn } from "./linkUpdates";
 import {
 	SyncType,
 	makeCanvasMeta,
@@ -113,7 +118,14 @@ export interface SharedFolderSettings {
 	 */
 	suspended?: boolean;
 	suspendedAt?: number;
+	/**
+	 * The folder's remote was forgotten on purpose. It binds to no Relay
+	 * Server copy, even one carrying its guid, until a command attaches it
+	 * again.
+	 */
+	detached?: boolean;
 }
+
 
 interface Operation {
 	op: "create" | "rename" | "delete" | "update" | "upgrade" | "noop";
@@ -237,8 +249,17 @@ export class SharedFolder extends HasProvider {
 	fset: Files;
 	relayId?: string;
 	_remote?: RemoteSharedFolder;
+	// The authorization of the last token the server issued for this folder,
+	// persisted in the folder store. Null means no grant is remembered, which
+	// answers as writable.
+	private _persistedAuthorization: string | null = null;
+	// Answers derived from roles. Null means the roles needed to answer have
+	// not synced; undefined means not derived yet.
+	private _canWriteContentAnswerCache: boolean | null | undefined = undefined;
+	private _canManageFilesAnswerCache: boolean | null | undefined = undefined;
 	_shouldConnect: boolean;
 	private _localOnly: boolean;
+	private _detached = false;
 	destroyed: boolean = false;
 	public vault: Vault;
 	syncStore: SyncStore;
@@ -268,6 +289,8 @@ export class SharedFolder extends HasProvider {
 	 * vanishes within the window is cancelled before it registers.
 	 */
 	private pendingCreates: Map<string, number> = new Map();
+	/** Vault rename echoes produced while restoring a Reader-rejected move. */
+	private readerRestoreRenameEchoes: Set<string> = new Set();
 	private enabledSyncTypes: Set<SyncType> = new Set();
 
 	private _persistence: IndexeddbPersistence;
@@ -328,6 +351,8 @@ export class SharedFolder extends HasProvider {
 	private bootSnapshot: MembershipSnapshot | null = null;
 	/** Server-decided operations whose disk effect is still in flight. */
 	private serverOps = new ServerOps();
+	/** Dispatched renames retain their echo until the disk operation settles. */
+	private serverRenamesInFlight = new Map<string, { deleted: boolean }>();
 	/** One parked publication re-entry per held path. */
 	private _parkedPublications: Map<string, Promise<void>> = new Map();
 	/** One publication decision executor per held path. */
@@ -339,6 +364,8 @@ export class SharedFolder extends HasProvider {
 	private readonly remoteActivitySubscribers = new Set<() => void>();
 	private connectionAttempt: Promise<boolean> | null = null;
 	private startupConnectRequested = false;
+	/** UI consumers watching the current user's folder permissions flip. */
+	private readonly folderPermissionSubscribers = new Set<() => void>();
 
 	constructor(
 		public appId: string,
@@ -358,6 +385,7 @@ export class SharedFolder extends HasProvider {
 		relayId?: string,
 		authoritative: boolean = false,
 		remote?: RemoteSharedFolder,
+		public attachmentTransfers?: AttachmentTransfers,
 	) {
 		const folderRelayId = remote?.relay.guid ?? relayId;
 		const s3rn = folderRelayId
@@ -400,6 +428,7 @@ export class SharedFolder extends HasProvider {
 		this._server = remote?.relay.providerId;
 		this._shouldConnect = this.settings.connect ?? true;
 		this._localOnly = this.settings.localOnly ?? false;
+		this._detached = this.settings.detached ?? false;
 		if (remote) {
 			this.subscribeToRemoteRelay(remote);
 		}
@@ -447,45 +476,22 @@ export class SharedFolder extends HasProvider {
 		// intent.
 		this.unsubscribes.push(
 			this.syncStore.subscribeMapDelta((delta, origin) => {
-				if (origin === this || origin === this._persistence) return;
-				for (const removal of delta.deletes) {
-					if (this.existsSync(removal.path)) {
-						this.serverOps.recordDelete(removal.path);
-					} else {
-						// Nothing on disk to adopt: the removal is already
-						// decided for this device.
-						this.bootSnapshot?.discard(removal.path);
-					}
-				}
-				for (const entry of delta.adds) {
-					this.serverOps.clearDelete(entry.path);
-				}
-				for (const entry of delta.updates) {
-					this.serverOps.clearDelete(entry.path);
-				}
-				for (const move of delta.moves) {
-					this.serverOps.clearDelete(move.to);
-					const moved = this.files.get(move.guid);
-					if (
-						this.existsSync(move.from) ||
-						moved?.path === move.from
-					) {
-						this.serverOps.recordMove(move);
-					} else {
-						// Disk already agrees with the moved membership (or no
-						// source exists to reconcile on this device). A prior
-						// edge for this identity is no longer in flight either.
-						this.serverOps.discardMove(move.guid);
-						this.bootSnapshot?.discard(move.from);
-					}
-				}
+				this.handleRemoteMembershipDelta(delta, origin);
 			}),
 		);
 
 		this.unsubscribes.push(
 			this.relayManager.remoteFolders.subscribe((folders) => {
-				this.remote = folders.find((folder) => folder.guid == this.guid);
+				this.remote = matchRemoteFolder(this, folders.values());
 			}),
+		);
+
+		const onRoleChange = () => this.refreshPermissionPolicy();
+		this.unsubscribes.push(
+			this.relayManager.folderRoles.subscribe(onRoleChange),
+		);
+		this.unsubscribes.push(
+			this.relayManager.relayRoles.subscribe(onRoleChange),
 		);
 
 		this.unsubscribes.push(
@@ -628,6 +634,8 @@ export class SharedFolder extends HasProvider {
 					// When a file is closed, ProviderIntegration is destroyed so no one
 					// listens for these effects. Handle them at the SharedFolder level.
 					await this.handleIdleSyncToRemote(guid, effect.update);
+				} else if (effect.type === "READER_EDIT_OVERWRITTEN") {
+					this.recordReaderEditOverwrite(guid, effect.path);
 				}
 			},
 			getPersistenceMetadata: (guid: string, path: string) => {
@@ -689,6 +697,8 @@ export class SharedFolder extends HasProvider {
 				// later edit can slip work between them.
 				const hasPersistedMembership =
 					this.hasLocalDB() || (await this.getServerSynced());
+				if (this.destroyed) return;
+				this.rememberAuthorization(await this.readPersistedAuthorization());
 				if (this.destroyed) return;
 				this.bootSnapshot = new MembershipSnapshot(
 					this.syncStore.membershipPaths(),
@@ -767,6 +777,61 @@ export class SharedFolder extends HasProvider {
 		})().catch((e) => this.warn("folder provider sync failed", e));
 
 		RelayInstances.set(this, this.path);
+	}
+
+	private handleRemoteMembershipDelta(delta: FolderMapDelta, origin: unknown): void {
+		if (origin === this || origin === this._persistence) return;
+		for (const removal of delta.deletes) {
+			const move = removal.oldValue?.id
+				? this.serverOps.moveFor(removal.oldValue.id)
+				: undefined;
+			if (move) {
+				const rename = this.serverRenamesInFlight?.get(move.guid);
+				if (rename) {
+					// Keep the move so its vault echo cannot become a local create.
+					// The dispatched operation will record its final disk location.
+					rename.deleted = true;
+					this.serverOps.recordDelete(move.to);
+					continue;
+				}
+				// A failed move may still occupy its source when the peer deletes
+				// the destination. Carry that witnessed removal to the disk path
+				// for Readers too, unless another local file has claimed it.
+				const removeSource = this.serverOps.coversPath(move.from) &&
+					!this.syncStore.has(move.from) && this.existsSync(move.from);
+				this.serverOps.discardMove(move.guid);
+				if (removeSource) this.serverOps.recordDelete(move.from);
+			}
+			if (this.existsSync(removal.path)) {
+				this.serverOps.recordDelete(removal.path);
+			} else {
+				// Nothing on disk to adopt: the removal is already
+				// decided for this device.
+				this.bootSnapshot?.discard(removal.path);
+			}
+		}
+		for (const entry of delta.adds) {
+			this.serverOps.clearDelete(entry.path);
+		}
+		for (const entry of delta.updates) {
+			this.serverOps.clearDelete(entry.path);
+		}
+		for (const move of delta.moves) {
+			this.serverOps.clearDelete(move.to);
+			const moved = this.files.get(move.guid);
+			if (
+				this.existsSync(move.from) ||
+				moved?.path === move.from
+			) {
+				this.serverOps.recordMove(move);
+			} else {
+				// Disk already agrees with the moved membership (or no
+				// source exists to reconcile on this device). A prior
+				// edge for this identity is no longer in flight either.
+				this.serverOps.discardMove(move.guid);
+				this.bootSnapshot?.discard(move.from);
+			}
+		}
 	}
 
 	private setupEventSubscriptions() {
@@ -1143,6 +1208,14 @@ export class SharedFolder extends HasProvider {
 			return;
 		}
 
+		// Read-only access publishes nothing.
+		if (!file.canWriteContent) {
+			this.debug?.(
+				`[handleIdleSyncToRemote] Document ${guid} has read-only access, skipping`,
+			);
+			return;
+		}
+
 		try {
 			// Apply update to the document's remoteDoc (which is file.ydoc).
 			// This intentionally triggers lazy creation (wake from hibernation).
@@ -1385,7 +1458,10 @@ export class SharedFolder extends HasProvider {
 		// rename/delete), rather than registered early by a scan.
 		let syncTFiles = this.getSyncFiles().filter((tfile) => {
 			const vpath = this.getVirtualPath(tfile.path);
-			return !this.pendingCreates.has(vpath);
+			return (
+				!this.pendingCreates.has(vpath) &&
+				(this.canManageFiles || this.syncStore.has(vpath))
+			);
 		});
 		if (types) {
 			syncTFiles = syncTFiles.filter((tfile) => {
@@ -1809,6 +1885,156 @@ export class SharedFolder extends HasProvider {
 		return this._remote;
 	}
 
+	/** Null until the role records needed to answer have synced. */
+	private deriveCanWriteContentAnswer(): boolean | null {
+		return this.deriveFolderPolicyAnswer("edit_content");
+	}
+
+	private deriveCanManageFilesAnswer(): boolean | null {
+		return this.deriveFolderPolicyAnswer("manage_files");
+	}
+
+	private deriveFolderPolicyAnswer(
+		action: "edit_content" | "manage_files",
+	): boolean | null {
+		const remote = this.remote;
+		if (!remote) {
+			return null;
+		}
+		const userId = this.relayManager?.user?.id;
+		const policyManager = this.relayManager?.policyManager;
+		if (!userId || !policyManager) {
+			return null;
+		}
+		const folderRolesSynced = this.relayManager.folderRoles
+			.values()
+			.some((r) => r.sharedFolderId === remote.id);
+		const relayRolesSynced = this.relayManager.relayRoles
+			.values()
+			.some((r) => r.relayId === remote.relayId);
+		// Relay roles cannot grant access to a private folder. Until its
+		// folder roles arrive, a denial would only reflect missing data.
+		if (!folderRolesSynced && (remote.private || !relayRolesSynced)) {
+			return null;
+		}
+		const result = policyManager.isAllowed({
+			principal: userId,
+			action,
+			resource: ["folder", remote.id],
+		});
+		return result.allowed;
+	}
+
+	public get canWriteContentAnswer(): boolean | null {
+		if (this._canWriteContentAnswerCache === undefined) {
+			this._canWriteContentAnswerCache =
+				this.deriveCanWriteContentAnswer();
+		}
+		return this._canWriteContentAnswerCache;
+	}
+
+	/** The role policy's answer, or the remembered grant's while roles are unknown. */
+	public get canWriteContent(): boolean {
+		return this.canWriteContentAnswer ?? this.persistedAccessAllows;
+	}
+
+	/** Peer editing presence is shown only when the synced role policy grants it. */
+	public canUserWriteContent(userId: string | undefined): boolean {
+		const remote = this.remote;
+		if (!userId || !remote) return false;
+		return this.relayManager.policyManager?.isAllowed({
+			principal: userId,
+			action: "edit_content",
+			resource: ["folder", remote.id],
+		}).allowed ?? false;
+	}
+
+	/** Role changes for any peer, including changes that leave our own access unchanged. */
+	public subscribeToPeerPermissionChanges(callback: () => void): () => void {
+		const off = [
+			this.relayManager.folderRoles.subscribe(callback),
+			this.relayManager.relayRoles.subscribe(callback),
+			this.relayManager.remoteFolders.subscribe(callback),
+		];
+		return () => off.forEach((unsubscribe) => unsubscribe());
+	}
+
+	public get canManageFilesAnswer(): boolean | null {
+		if (this._canManageFilesAnswerCache === undefined) {
+			this._canManageFilesAnswerCache = this.deriveCanManageFilesAnswer();
+		}
+		return this._canManageFilesAnswerCache;
+	}
+
+	/** Whether local create, rename, move, and delete may change membership. */
+	public get canManageFiles(): boolean {
+		return this.canManageFilesAnswer ?? this.persistedAccessAllows;
+	}
+
+	private rejectReaderFolderChange(paths: string[]): boolean {
+		if (this.canManageFiles) return false;
+		for (const path of paths) {
+			this.recordReaderEditOverwrite("", this.getPath(path));
+		}
+		return true;
+	}
+
+	/** Fires after canWriteContent or canManageFiles changes. */
+	public subscribeToPermissionChanges(callback: () => void): () => void {
+		if (this.destroyed) {
+			return () => {};
+		}
+		this.folderPermissionSubscribers.add(callback);
+		return () => {
+			this.folderPermissionSubscribers.delete(callback);
+		};
+	}
+
+	private notifyFolderPermissionSubscribers(): void {
+		if (this.destroyed) return;
+		for (const subscriber of [...this.folderPermissionSubscribers]) {
+			subscriber();
+		}
+	}
+
+	private refreshPermissionPolicy(before = this.answers): void {
+		this._canWriteContentAnswerCache = this.deriveCanWriteContentAnswer();
+		this._canManageFilesAnswerCache = this.deriveCanManageFilesAnswer();
+		this.announcePermissionChange(before);
+	}
+
+	/** The current answers, read from the caches without deriving. */
+	private get answers(): { write: boolean; manage: boolean } {
+		const assumed = this.persistedAccessAllows;
+		return {
+			write: this._canWriteContentAnswerCache ?? assumed,
+			manage: this._canManageFilesAnswerCache ?? assumed,
+		};
+	}
+
+	private announcePermissionChange(before: { write: boolean; manage: boolean }): void {
+		const after = this.answers;
+		if (before.write === after.write && before.manage === after.manage) return;
+		this.refreshDocumentTokensForPermissionChange();
+		this.notifyFolderPermissionSubscribers();
+	}
+
+	private refreshDocumentTokensForPermissionChange(): void {
+		this.debug(
+			`content-write permission changed; refreshing document tokens`,
+		);
+		this.tokenStore.forceRefresh(S3RN.encode(this.s3rn));
+		this.files.forEach((file) => {
+			const s3rn = (file as unknown as { s3rn?: HasProvider["s3rn"] }).s3rn;
+			if (s3rn) {
+				this.tokenStore.forceRefresh(S3RN.encode(s3rn));
+			}
+			if (isDocument(file) || isCanvas(file)) {
+				file.notifyAccessModeChanged();
+			}
+		});
+	}
+
 	private subscribeToRemoteRelay(remote: RemoteSharedFolder): void {
 		this.unsubscribes.push(
 			remote.relay.subscribe((relay) => {
@@ -1819,19 +2045,36 @@ export class SharedFolder extends HasProvider {
 		);
 	}
 
+	public get detached(): boolean {
+		return this._detached;
+	}
+
+	/**
+	 * Forget the remote on purpose. The server copy is untouched and the
+	 * folder stays off every Relay Server, even one holding a copy with its
+	 * guid, until a command attaches it again.
+	 */
+	public detachRemote(): void {
+		this._detached = true;
+		this.remote = undefined;
+		void this._settings.update((current) => ({ ...current, detached: true }));
+	}
+
 	public set remote(value: RemoteSharedFolder | undefined) {
 		if (this._remote === value) {
 			return;
 		}
 		const previousRelayId = this.relayId;
+		const answersBefore = this.answers;
 		this._remote = value;
 		this.relayId = value?.relay?.guid;
+		if (value) this._detached = false;
 		this.s3rn = this.relayId
 			? new S3RemoteFolder(this.relayId, this.guid)
 			: new S3Folder(this.guid);
 		void this._settings.update((current) => ({
 			...current,
-			...{ relay: this.relayId },
+			...{ relay: this.relayId, detached: this._detached || undefined },
 		}));
 
 		if (value) {
@@ -1854,6 +2097,7 @@ export class SharedFolder extends HasProvider {
 			trackAsyncCleanup(p);
 		}
 
+		this.refreshPermissionPolicy(answersBefore);
 		this.notifyListeners();
 	}
 
@@ -1893,6 +2137,44 @@ export class SharedFolder extends HasProvider {
 
 	async getServerSynced(): Promise<boolean> {
 		return this._persistence.getServerSynced();
+	}
+
+	private async readPersistedAuthorization(): Promise<string | null> {
+		try {
+			const value = await this._persistence.get("authorization");
+			return typeof value === "string" ? value : null;
+		} catch {
+			return null;
+		}
+	}
+
+	protected onClientToken(clientToken: ClientToken): void {
+		const authorization = clientToken.authorization ?? "full";
+		if (authorization === this._persistedAuthorization) return;
+		this.persistAuthorization(authorization);
+		this.rememberAuthorization(authorization);
+	}
+
+	private persistAuthorization(authorization: string): void {
+		const warn = (e: unknown) => this.warn("failed to remember authorization", e);
+		try {
+			this._persistence.set("authorization", authorization).catch(warn);
+			this._persistence
+				.set("authorizationObservedAt", this.timeProvider.now())
+				.catch(warn);
+		} catch (e) {
+			warn(e);
+		}
+	}
+
+	private rememberAuthorization(authorization: string | null): void {
+		const before = this.answers;
+		this._persistedAuthorization = authorization;
+		this.announcePermissionChange(before);
+	}
+
+	private get persistedAccessAllows(): boolean {
+		return capabilitiesOf(this._persistedAuthorization).writeContent;
 	}
 
 	private hasLocalDB(): boolean {
@@ -1969,20 +2251,57 @@ export class SharedFolder extends HasProvider {
 		// take a doc and it's new path.
 		const oldVPath = this.getVirtualPath(file.path);
 		this.serverOps.recordMove({ guid: doc.guid, from: oldVPath, to: path });
-		diffLog?.push(`${file.path} was renamed to ${this.getPath(path)}`);
-		if (file instanceof TFile) {
-			const dir = dirname(path);
-			if (!this.existsSync(dir)) {
-				await this.mkdir(dir);
-				diffLog?.push(`creating directory ${dir}`);
+		const inFlight = this.serverRenamesInFlight ??= new Map();
+		const rename = { deleted: false };
+		inFlight.set(doc.guid, rename);
+		try {
+			diffLog?.push(`${file.path} was renamed to ${this.getPath(path)}`);
+			if (file instanceof TFile) {
+				const dir = dirname(path);
+				if (!this.existsSync(dir)) {
+					await this.mkdir(dir);
+					diffLog?.push(`creating directory ${dir}`);
+				}
+			}
+			await this.renameForServerMove(file, normalizePath(this.getPath(path)));
+			this.serverOps.completeMove(oldVPath, path);
+			this.bootSnapshot?.discard(oldVPath);
+			if (!this.destroyed && doc.path !== path) {
+				doc.move(path, this);
+			}
+		} finally {
+			if (inFlight.get(doc.guid) === rename) inFlight.delete(doc.guid);
+			if (rename.deleted) {
+				const diskPath = this.getVirtualPath(file.path);
+				const move = this.serverOps.moveFor(doc.guid);
+				const recreatedSource = diskPath === oldVPath && move !== undefined &&
+					!this.serverOps.coversPath(oldVPath);
+				if (move?.from === oldVPath && move.to === path) {
+					this.serverOps.discardMove(doc.guid);
+				}
+				// Success leaves the file at the destination; a failed rename may
+				// leave it at the source. Preserve a separately recreated source.
+				if (!recreatedSource && !this.syncStore.has(diskPath)) {
+					this.serverOps.recordDelete(diskPath);
+				}
 			}
 		}
-		await this.fileManager.renameFile(file, normalizePath(this.getPath(path)));
-		this.serverOps.completeMove(oldVPath, path);
-		this.bootSnapshot?.discard(oldVPath);
-		if (!this.destroyed && doc.path !== path) {
-			doc.move(path, this);
-		}
+	}
+
+	/**
+	 * Move a file for a rename that arrived from the server. Obsidian's file
+	 * manager moves the file and then repairs links to it, asking first unless
+	 * the vault always updates them. A server move is not this user's action,
+	 * so it must never ask: for a vault that turned the preference off, the
+	 * link-update step reads it as on for this call only.
+	 */
+	private renameForServerMove(
+		file: TAbstractFile,
+		newPath: string,
+	): Promise<void> {
+		return withLinkUpdatesOn(this.vault, () =>
+			this.fileManager.renameFile(file, newPath),
+		);
 	}
 
 	trashFile(file: TAbstractFile): Promise<void> {
@@ -1993,7 +2312,25 @@ export class SharedFolder extends HasProvider {
 		vpath: string,
 		meta: Meta,
 		diffLog?: string[],
+		restoreDeleted = false,
 	): Promise<IFile | undefined> {
+		const live = restoreDeleted ? this.files.get(meta.id) : undefined;
+		if (isDocument(live)) {
+			// Restore the missing disk object from server content without
+			// enrolling over a live document's held fork or editor state.
+			const bytes = await this.backgroundSync.downloadByGuid(this, meta.id, vpath);
+			if (!bytes || this.destroyed || this.syncStore.get(vpath) !== meta.id) {
+				return undefined;
+			}
+			const remote = new Y.Doc();
+			try {
+				Y.applyUpdate(remote, bytes);
+				await live.restoreDeletedFile(remote.getText("contents").toString());
+				return live;
+			} finally {
+				remote.destroy();
+			}
+		}
 		// Create directories as needed
 		const dir = dirname(vpath);
 		if (!this.existsSync(dir)) {
@@ -2018,6 +2355,9 @@ export class SharedFolder extends HasProvider {
 			return canvas;
 		}
 		if (meta.type === SyncType.Folder) {
+			// A retained SyncFolder does not rerun its constructor after a
+			// local deletion. Materialize the directory before reusing it.
+			if (!this.existsSync(vpath)) await this.mkdir(vpath);
 			diffLog?.push(`created local folder for remotely added folder ${vpath}`);
 			return this.getSyncFolder(vpath);
 		}
@@ -2486,6 +2826,7 @@ export class SharedFolder extends HasProvider {
 				);
 				return;
 			}
+			localFile.checkSyncWork("converge");
 			const localHash = await localFile.caf.hash();
 			const diverged = localHash !== remoteMeta.hash;
 			if (diverged) {
@@ -2609,6 +2950,10 @@ export class SharedFolder extends HasProvider {
 		// Delete files that are no longer shared
 		const ffiles = this.getSyncFiles();
 		const deletes: Delete[] = [];
+		const reader = !this.canManageFiles;
+		const removedPaths = reader
+			? new Set(this.serverOps.pendingDeletePaths())
+			: null;
 		const folders = ffiles.filter((file) => file instanceof TFolder);
 		const files = ffiles.filter((file) => file instanceof TFile);
 		const sync = (file: TAbstractFile) => {
@@ -2617,10 +2962,28 @@ export class SharedFolder extends HasProvider {
 			const fileInFolder = this.checkPath(file.path);
 			const vpath = this.getVirtualPath(file.path);
 			const fileInMap = remotePaths.has(vpath);
+			// Only a removal witnessed in membership is adopted, and a nonempty
+			// directory is never trashed, since it may hold local-only children.
+			if (
+				reader && (
+					(!removedPaths?.has(vpath) && !this.bootSnapshot?.has(vpath)) ||
+					(file instanceof TFolder && file.children.length > 0)
+				)
+			) return;
 			const filePending =
 				this.pendingUpload.has(vpath) || this.pendingCreates.has(vpath);
+			// Membership already lists a moved identity at its new path, so its
+			// source path reads as absent from the map while the disk rename is
+			// still outstanding. That path belongs to the move, not to a removal.
+			const moveSource = this.serverOps.moveFrom(vpath) !== undefined;
 			const synced = this._provider?.synced && this._persistence?.synced;
-			if (fileInFolder && isSyncableFile && !fileInMap && !filePending) {
+			if (
+				fileInFolder &&
+				isSyncableFile &&
+				!fileInMap &&
+				!filePending &&
+				!moveSource
+			) {
 				if (synced) {
 					diffLog.push(`deleted local file ${vpath} for remotely deleted doc`);
 					this.markPendingDelete(vpath);
@@ -2811,6 +3174,7 @@ export class SharedFolder extends HasProvider {
 			if (this.isPendingDelete(vpath)) return;
 			const tfile = this.vault.getAbstractFileByPath(this.getPath(vpath));
 			if (!tfile) return;
+			if (this.rejectReaderFolderChange([vpath])) return;
 			const newDocs = this.placeHold([tfile]);
 			if (newDocs.includes(vpath)) {
 				this.uploadFile(tfile);
@@ -2828,8 +3192,69 @@ export class SharedFolder extends HasProvider {
 		}
 	}
 
+	private readerRestoreRenameKey(oldPath: string, newPath: string): string {
+		return `${oldPath}\0${newPath}`;
+	}
+
+	private consumeReaderRestoreRenameEcho(
+		file: TAbstractFile,
+		oldPath: string,
+	): boolean {
+		const echoes = this.readerRestoreRenameEchoes ??= new Set();
+		return echoes.delete(this.readerRestoreRenameKey(oldPath, file.path));
+	}
+
+	private restoreUntrackedReaderRename(
+		file: TAbstractFile,
+		oldPath: string,
+	): Promise<void> {
+		const echoes = this.readerRestoreRenameEchoes ??= new Set();
+		const key = this.readerRestoreRenameKey(file.path, oldPath);
+		echoes.add(key);
+		let restore: Promise<void>;
+		try {
+			restore = this.fileManager.renameFile(file, normalizePath(oldPath));
+		} catch (error) {
+			echoes.delete(key);
+			throw error;
+		}
+		return restore.catch((error) => {
+			echoes.delete(key);
+			throw error;
+		});
+	}
+
+	private readerFolderRestores = new Map<string, string>();
+
+	private isReaderFolderRestoreChild(file: TAbstractFile, oldPath: string): boolean {
+		for (const [from, to] of this.readerFolderRestores ?? []) {
+			if ((oldPath.startsWith(from + "/") && file.path.startsWith(to + "/")) ||
+				(oldPath.startsWith(to + "/") && file.path.startsWith(from + "/"))) return true;
+		}
+		return false;
+	}
+
+	private restoreReaderRename(
+		file: TAbstractFile,
+		oldPath: string,
+		oldVPath: string,
+		newVPath: string,
+	): Promise<void> {
+		const from = file.path;
+		const restores = this.readerFolderRestores ??= new Map();
+		if (file instanceof TFolder) restores.set(oldPath, from);
+		const guid = oldVPath ? this.syncStore.get(oldVPath) : undefined;
+		const sharedFile = guid ? this.files.get(guid) : undefined;
+		const restore = sharedFile && oldVPath && newVPath
+			? this._handleServerRename(sharedFile, oldVPath, file)
+			: this.restoreUntrackedReaderRename(file, oldPath);
+		return restore.finally(() => { restores.delete(oldPath); });
+	}
+
 	/** Route an in-folder vault rename. */
 	public notifyVaultRename(file: TAbstractFile, oldPath: string): void {
+		if (file.path === oldPath || this.isReaderFolderRestoreChild(file, oldPath)) return;
+		if (this.consumeReaderRestoreRenameEcho(file, oldPath)) return;
 		const oldVPath = this.getVirtualPath(oldPath);
 		const newVPath = this.getVirtualPath(file.path);
 		this.cancelPendingCreate(oldVPath);
@@ -2837,13 +3262,21 @@ export class SharedFolder extends HasProvider {
 		if (this.consumeMoveEcho(oldVPath, newVPath)) {
 			return;
 		}
-		if (this.syncStore.has(oldVPath)) {
+		const oldTracked = this.syncStore.has(oldVPath);
+		const newTracked = this.syncStore.has(newVPath);
+		const hasPendingClaim =
+			this.pendingUpload.has(oldVPath) || this.pendingUpload.has(newVPath);
+		if (!this.canManageFiles && !oldTracked && !hasPendingClaim) return;
+		if (this.rejectReaderFolderChange([oldVPath, newVPath])) {
+			const restore = this.restoreReaderRename(file, oldPath, oldVPath, newVPath);
+			void trackPromise(`restoreReaderRename:${this.guid}:${oldVPath}`, restore);
+			return;
+		}
+		if (oldTracked) {
 			this.renameFile(file, oldPath);
 			return;
 		}
-		if (this.syncStore.has(newVPath) || !this.isSyncableTFile(file)) {
-			return;
-		}
+		if (newTracked || !this.isSyncableTFile(file)) return;
 		// A distinct file renamed into the vacated source is a new disk
 		// occupant. It may claim the path without taking over the moved guid.
 		this.observeMoveSourceRecreation(newVPath);
@@ -2881,6 +3314,15 @@ export class SharedFolder extends HasProvider {
 		}
 	}
 
+	public recordReaderEditOverwrite(guid: string, path: string): void {
+		if (this.destroyed) return;
+		const file = this.files.get(guid);
+		const fullPath =
+			file && (isDocument(file) || isCanvas(file))
+				? join(this.path, file.path)
+				: path || guid;
+		this.log(`[read-only] reader edit overwritten: ${fullPath}`);
+	}
 	syncByType(
 		syncStore: SyncStore,
 		diffLog: string[],
@@ -3108,8 +3550,9 @@ export class SharedFolder extends HasProvider {
 			// Teardown can release the read; a canvas teardown took apart is
 			// not ours to enroll content into.
 			if (this.destroyed) return;
-			await file.enrollLocal(contents);
-			void file.markOrigin("local");
+			if (await file.enrollLocal(contents)) {
+				void file.markOrigin("local");
+			}
 		}
 	}
 
@@ -3259,6 +3702,19 @@ export class SharedFolder extends HasProvider {
 				if (diffLog.length > 0) {
 					this.log("syncFileTree diff:\n" + diffLog.join("\n"));
 				}
+				// A removal's trash must land before this sync resolves: a queued
+				// follow-up that starts while the file is still indexed would try
+				// to move a path that is about to vanish. A failed trash must not
+				// stop the other removals or strand that follow-up.
+				await Promise.all(
+					deletes.map((op) =>
+						withTimeoutWarning<void>(op.promise, this.timeProvider, op).catch(
+							(error) => {
+								this.warn("Failed to trash remotely deleted file", op.path, error);
+							},
+						),
+					),
+				);
 				// An op with nothing left on disk to adopt has no echo to wait
 				// for; confirm its absence so a later recreation is not refused
 				// as a re-mint.
@@ -3396,7 +3852,7 @@ export class SharedFolder extends HasProvider {
 		return null;
 	}
 
-	private getDoc(vpath: string): Document {
+	private getDoc(vpath: string): Document | null {
 		const id = this.syncStore.get(vpath);
 		if (id !== undefined) {
 			const doc = this.files.get(id);
@@ -3415,6 +3871,7 @@ export class SharedFolder extends HasProvider {
 				return this.createDoc(vpath);
 			}
 		} else {
+			if (!this.canManageFiles) return null;
 			// the File exists, but the ID doesn't
 			const tfile = this.vault.getAbstractFileByPath(this.getPath(vpath));
 			if (!(tfile instanceof TFile)) {
@@ -3430,7 +3887,7 @@ export class SharedFolder extends HasProvider {
 		}
 	}
 
-	private getCanvas(vpath: string): Canvas {
+	private getCanvas(vpath: string): Canvas | null {
 		const id = this.syncStore.get(vpath);
 		if (id !== undefined) {
 			const canvas = this.files.get(id);
@@ -3449,6 +3906,7 @@ export class SharedFolder extends HasProvider {
 				return this.createCanvas(vpath);
 			}
 		} else {
+			if (!this.canManageFiles) return null;
 			// the File exists, but the ID doesn't
 			const tfile = this.vault.getAbstractFileByPath(this.getPath(vpath));
 			if (!(tfile instanceof TFile)) {
@@ -3476,7 +3934,14 @@ export class SharedFolder extends HasProvider {
 	async markUploaded(
 		file: IFile,
 		outcome: SyncCompletionOutcome = "completed",
+		uploaded?: AttachmentVersion,
 	) {
+		if (isSyncFolder(file) && !this.canManageFiles) {
+			if (this.pendingUpload.get(file.path) === file.guid) {
+				this.recordReaderEditOverwrite("", this.getPath(file.path));
+			}
+			return;
+		}
 		// Claim-implies-fetchable: membership is never published for content
 		// whose transfer did not complete. A cancelled transfer must stand
 		// down even when the slot reads empty — the competing claim that
@@ -3591,7 +4056,11 @@ export class SharedFolder extends HasProvider {
 			if (!type) {
 				throw new Error("unexpected sync type");
 			}
-			const hash = await file.caf.hash();
+			if (uploaded) {
+				const current = await this.vault.adapter.stat(file.caf.path);
+				if (!current || current.size !== uploaded.size || current.mtime !== uploaded.mtime) throw new Error("Attachment changed during upload; metadata was not published");
+			}
+			const hash = uploaded?.hash ?? await file.caf.hash();
 			if (!hash) {
 				throw new Error("file hash not yet computed");
 			}
@@ -3600,7 +4069,8 @@ export class SharedFolder extends HasProvider {
 				file.guid,
 				file.mimetype,
 				hash,
-				file.stat.mtime,
+				uploaded?.mtime ?? file.stat.mtime,
+				uploaded?.size ?? file.stat.size,
 			);
 			mark(file, meta);
 			return;
@@ -3666,7 +4136,7 @@ export class SharedFolder extends HasProvider {
 		// Report it unresolved; reconciliation decides its fate.
 		if (
 			!guid &&
-			(!this.folderMachine.mayMint || !this.isNovelPath(vpath))
+			(!this.canManageFiles || !this.folderMachine.mayMint || !this.isNovelPath(vpath))
 		) {
 			return null;
 		}
@@ -4053,6 +4523,7 @@ export class SharedFolder extends HasProvider {
 		if (!this.downloadMayProceed(doc, vpath, "before enrolling")) {
 			return undefined;
 		}
+		const initialLCA = doc.hsm?.state.lca;
 		await doc.hsm?.initializeFromRemote(updateBytes);
 		const remoteDoc = doc.ensureRemoteDoc();
 		doc.hsm?.setRemoteDoc(remoteDoc);
@@ -4072,7 +4543,15 @@ export class SharedFolder extends HasProvider {
 		}
 
 		this.files.set(guid, doc);
-		const wrote = await this.flush(doc, contents);
+		// Enrollment can stand down because a live merge already settled a
+		// newer ancestor. Do not queue the older fetched text behind its write.
+		const settled = doc.hsm?.state;
+		const writeContents = settled?.statePath === "idle.synced" &&
+			settled.lca !== initialLCA && settled.lca?.contents != null &&
+			settled.lca.meta.hash !== initialLCA?.meta.hash
+			? settled.lca.contents
+			: contents;
+		const wrote = await this.flush(doc, writeContents);
 		if (!wrote) {
 			// The write is the one refusal downstream of the decision to call
 			// the download done, and it is the only one the download cannot
@@ -4598,6 +5077,25 @@ export class SharedFolder extends HasProvider {
 		if (paths.length === 0) {
 			return;
 		}
+		if (!this.canManageFiles) {
+			const readerOwnedPaths = paths.filter(
+				(vpath) => !!this.syncStore.getMeta(vpath) || this.pendingUpload.has(vpath),
+			);
+			if (readerOwnedPaths.length === 0) {
+				// A local-only path has no shared membership to protect.
+				return;
+			}
+			this.rejectReaderFolderChange(readerOwnedPaths);
+			for (const vpath of readerOwnedPaths) {
+				const meta = this.syncStore.getMeta(vpath);
+				if (!meta || this.existsSync(vpath)) continue;
+				void trackPromise(
+					`restoreReaderDelete:${this.guid}:${vpath}`,
+					this._handleServerCreate(vpath, meta, undefined, true).then(() => undefined),
+				);
+			}
+			return;
+		}
 		const cleanupGuids = new Map<string, string>();
 		this.folderDoc.transact(() => {
 			for (const vpath of paths) {
@@ -4656,6 +5154,8 @@ export class SharedFolder extends HasProvider {
 	}
 
 	renameFile(tfile: TAbstractFile, oldPath: string) {
+		if (tfile.path === oldPath || this.isReaderFolderRestoreChild(tfile, oldPath)) return;
+		if (this.consumeReaderRestoreRenameEcho(tfile, oldPath)) return;
 		const newPath = tfile.path;
 		let newVPath = "";
 		let oldVPath = "";
@@ -4672,6 +5172,19 @@ export class SharedFolder extends HasProvider {
 
 		if (!newVPath && !oldVPath) {
 			// not related to shared folders
+			return;
+		}
+		const oldTracked = oldVPath ? this.syncStore.has(oldVPath) : false;
+		const newTracked = newVPath ? this.syncStore.has(newVPath) : false;
+		const hasPendingClaim =
+			(oldVPath ? this.pendingUpload.has(oldVPath) : false) ||
+			(newVPath ? this.pendingUpload.has(newVPath) : false);
+		if (!this.canManageFiles && !oldTracked && !newTracked && !hasPendingClaim) {
+			return;
+		}
+		if (this.rejectReaderFolderChange([oldVPath, newVPath].filter(Boolean))) {
+			const restore = this.restoreReaderRename(tfile, oldPath, oldVPath, newVPath);
+			void trackPromise(`restoreReaderRename:${this.guid}:${oldVPath}`, restore);
 			return;
 		} else if (!oldVPath) {
 			// if this was moved from outside the shared folder context, we need to create a live doc
@@ -4850,7 +5363,7 @@ export class SharedFolders extends ObservableSet<SharedFolder> {
 				(remotes) => {
 					let updated = false;
 					this.items().forEach((folder) => {
-						const remote = remotes.find((remote) => remote.guid == folder.guid);
+						const remote = matchRemoteFolder(folder, remotes.values());
 						if (folder.remote != remote) {
 							updated = true;
 						}

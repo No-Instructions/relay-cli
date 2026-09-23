@@ -2,10 +2,10 @@
 
 Source: [No-Instructions/Relay](https://github.com/No-Instructions/Relay).
 The exact revision is recorded in [UPSTREAM_COMMIT](UPSTREAM_COMMIT):
-`cd427078bc236849710944aca3005d989b087cc9` (plugin version 0.7.12).
+`8c43b00a7e065942115884c1613343aebd0b2e3b` (plugin version 0.8.12).
 
 This snapshot contains the complete upstream `src/` tree, `manifest.json`,
-`styles.css`, and `tsconfig.json`. Those 242 files match the recorded revision
+`styles.css`, and `tsconfig.json`. Those 293 files match the recorded revision
 byte for byte. [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 are also copied verbatim from that revision. Preserve these notices and the
 licenses inside `src/client/`, `src/storage/`, and `src/y-codemirror.next/`.
