@@ -5,21 +5,24 @@ without opening Obsidian.
 
 ## Install
 
-On Linux or macOS (x86-64 or ARM64), run:
+On Linux (glibc) or macOS, on x86-64 or ARM64, run:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/No-Instructions/relay-cli/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/No-Instructions/relay-cli/main/install.sh | sh
 ```
 
-The installer downloads its own Node.js runtime and builds Relay CLI. You don't
-need Node.js, npm, or sudo beforehand. It installs `rmd` in `~/.local/bin`; if that
+The installer downloads a standalone executable containing the Bun runtime.
+You don't need Node.js, Bun, npm, or sudo. It installs `relay` in `~/.local/bin`; if that
 directory isn't on your `PATH`, follow the instruction printed by the installer.
 On Windows, use WSL or [build from source](#development).
+
+Installation requires a published stable release with executable assets. For an
+unreleased checkout, use the development instructions below.
 
 ## Sign in
 
 ```sh
-rmd login
+relay login
 ```
 
 Choose your sign-in provider and finish signing in through your browser.
@@ -27,63 +30,87 @@ Choose your sign-in provider and finish signing in through your browser.
 ## Sync an existing folder
 
 ```sh
-rmd clone
-rmd start
+relay clone
+relay start
 ```
 
 Choose your Relay and a shared folder. Relay CLI creates a local directory named
-after that folder in the current directory. `rmd start` starts background sync,
+after that folder in the current directory. `relay start` starts background sync,
 which keeps running after you close the terminal.
 
-To choose the local directory yourself, use `rmd clone ./notes`.
+To choose the local directory yourself, use `relay clone ./notes`.
 
 ## Share a local folder
 
 ```sh
-rmd init ./notes --name Notes
-rmd connect ./notes
-rmd start
+relay init ./notes --name Notes
+relay connect ./notes
+relay start
 ```
 
 Choose the Relay to share it with. Relay CLI creates a shared folder from the
-local files. If background sync is already running, you can omit `rmd start`.
+local files. If background sync is already running, you can omit `relay start`.
 
 ## Check and stop sync
 
 ```sh
-rmd status ./notes
-rmd sync-status ./notes
+relay status ./notes
+relay sync-status ./notes
 ```
 
-Run `rmd disconnect ./notes` to stop syncing one folder, or `rmd stop` to stop
-background sync for all folders. `rmd start` resumes sync for connected folders.
-Run `rmd --help` for the command list.
+Run `relay disconnect ./notes` to stop syncing one folder, or `relay stop` to stop
+background sync for all folders. `relay start` resumes sync for connected folders.
+Run `relay --help` for the command list.
 
 ## Update
 
-Run the install command again, then restart background sync:
+The installed CLI updates itself:
 
 ```sh
-rmd stop
-rmd start
+relay update --check
+relay update
 ```
 
-Updates preserve your login and synced folders. The installer keeps previous
-versions under `~/.local/share/relay-cli/versions` so running daemons can finish
-using them. Set `RMD_INSTALL_DIR` and `RMD_BIN_DIR` to absolute paths when running
-the installer to choose different locations; use the same locations for updates.
+The updater checks the download's SHA-256 checksum and runs a verification
+command before stopping sync. It waits for every daemon using this installation
+to close, switches versions, and restarts those daemons with their state
+directories and control endpoints. Login state and synced folders are preserved.
+If replacement startup fails, it attempts to restore the previous executable
+and daemons. It retains both executables if recovery needs manual attention.
+
+Automatic updates are off by default. Enable daily checks while background sync
+is running with:
+
+```sh
+relay update --auto on
+```
+
+Use `relay update --auto off` to disable them. `relay update --pin` keeps the current
+version until you run `relay update --unpin`. To select a specific published stable
+version, run `relay update --version 1.2.3`. `relay version` shows the installed version.
+
+Executables are kept under `~/.local/share/relay-cli/versions`. Set
+`RMD_INSTALL_DIR` and `RMD_BIN_DIR` to absolute paths during installation to choose
+different locations. Updates discover the installation from the executable.
 `XDG_DATA_HOME`, when set, changes the default data location to
 `$XDG_DATA_HOME/relay-cli`.
 
+Automatic update failures are recorded in `update.log` inside the installation
+directory and retried the next day. An interrupted install or update can leave
+`.install-lock` there; remove that empty directory only after confirming no
+installer or updater is running. Restart stopped daemons with `relay start`, using
+their original `--state-dir` and environment, including any `RMD_STORAGE_KEY_FILE`.
+See [release maintenance](docs/releases.md) for recovery and packaging details.
+
 ## Automation
 
-In non-interactive shells, pass `rmd login --provider <name>` or
-`rmd login --token-file <path>`. Use `rmd relays` and `rmd folders` to find IDs,
+In non-interactive shells, pass `relay login --provider <name>` or
+`relay login --token-file <path>`. Use `relay relays` and `relay folders` to find IDs,
 then pass them explicitly:
 
 ```sh
-rmd clone ./notes --relay <relay-guid> --folder <folder-guid>
-rmd start
+relay clone ./notes --relay <relay-guid> --folder <folder-guid>
+relay start
 ```
 
 Login and sync use the production or staging endpoints selected when the CLI
@@ -92,10 +119,10 @@ startup rejects mismatches before refreshing credentials.
 
 ## Headless Sync
 
-`rmd start` runs background sync for connected folders. `rmd connect` registers
-one local folder for sync. When a folder was created with `rmd init`, connect
+`relay start` runs background sync for connected folders. `relay connect` registers
+one local folder for sync. When a folder was created with `relay init`, connect
 creates the remote shared folder through Relay and treats local disk as the
-source of truth. `rmd clone` connects to an existing remote folder and treats
+source of truth. `relay clone` connects to an existing remote folder and treats
 the server as the source of truth during first materialization.
 
 Relay CLI stores local folder metadata in `.relay/` inside each connected
@@ -128,11 +155,6 @@ If an encrypted database already exists without `storage.key`, a missing or
 temporarily unavailable keychain causes startup to stop. Relay CLI will not
 silently create a replacement key that cannot decrypt existing data.
 
-Plaintext databases from builds that predate storage encryption are rejected
-rather than migrated. Remove `browser.db`, `browser.db-wal`, and
-`browser.db-shm` from the state directory and run `rmd login` again to create a
-fresh encrypted store.
-
 ## Local Data
 
 Each synced folder has a `.relay/` directory. It stores the folder identity,
@@ -144,7 +166,7 @@ store; `--token-file` is an input mechanism for automation and is not copied to
 
 ## Daemon
 
-`rmd start` runs a per-user background daemon. Connected folders are discovered
+`relay start` runs a per-user background daemon. Connected folders are discovered
 from daemon state, watched on disk, and synced through Relay until disconnected
 or until the daemon is stopped.
 
@@ -159,19 +181,19 @@ of at most 1 MiB; Unix sockets use owner-only permissions.
 
 Use Node 22.13 or newer within Node 22, or Node 24.17 or newer within Node 24.
 Install a current patch release from one of these supported branches. The CLI
-requires the built-in `node:sqlite` API. Linux is the validated runtime platform;
-the public CI build matrix also targets macOS and Windows, whose runtime behavior
-has not yet been validated.
+requires the built-in `node:sqlite` API. Node remains supported for source
+development. Standalone releases use the Bun version pinned in
+`.bun-version`; they include the sync runtime and native keychain addon.
 
 From a source checkout, install dependencies and build the headless runtime:
 
 ```sh
 npm ci
 npm run check
-node bin/rmd.js --help
+node bin/relay.js --help
 ```
 
-Run `npm link` to make the `rmd` command available on your machine.
+Run `npm link` to make the `relay` command available on your machine.
 
 The default build targets production (`auth.system3.md` and `api.system3.md`).
 For development against staging, run:
@@ -200,12 +222,14 @@ Build checks work with encrypted tests still locked. The private development
 overlay supplies integration tests and live staging tooling; these are not
 required to build or run the CLI.
 
-Public CI runs clean builds and a CLI help check with locked unit tests and no
-private harness, plus installer checks on Linux and macOS. Require the
+Public CI runs clean Node builds with locked unit tests and no private harness,
+plus standalone packaging, installation, local-folder and daemon smoke checks
+on Linux and macOS for both architectures. Require the
 `Public build` check before merging. Maintainers
 run the private unit and integration workflow against the same reviewed commit
 before release. Vendored source provenance and updates are documented in
 [vendor/relay/README.md](vendor/relay/README.md).
+See [release maintenance](docs/releases.md) for building and publishing executables.
 
 ## Contributing and security
 

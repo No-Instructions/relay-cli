@@ -6,12 +6,12 @@
   "description": "Headless Relay sync for local folders",
   "type": "module",
   "bin": {
-    "rmd": "./bin/rmd.js"
+    "relay": "./bin/relay.js"
   },
   "scripts": {
     "build:headless": "node scripts/build-headless.mjs",
     "build:staging": "node scripts/build-headless.mjs staging",
-    "check": "node --check bin/rmd.js && node --check src/cli.js && npm run build:headless",
+    "check": "node --check bin/relay.js && node --check src/cli.js && node --check src/updates.js && node --check scripts/build-release.mjs && npm run build:headless",
     "pretest": "npm run build:headless",
     "test": "node --no-warnings --import ./scripts/configure-test-key.mjs --test __tests__/*.test.js"
   },

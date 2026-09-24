@@ -8,10 +8,15 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { describeNetworkError, requestBinary } from "./network.js";
 import { isUnavailablePathError, openSafeFile, resolveSafePath, statSyncEntry } from "./safe-path.js";
 import { assertAuthServerMatches, normalizeAuthServer } from "./auth-server.js";
+import { embeddedRelease, cliInvocation } from "./release.js";
+import {
+  configureUpdates, findInstallation, registerDaemon, selectInstallation,
+  readRelease, registeredDaemons, scheduleAutomaticUpdates, updateInstallation, withInstallLock,
+} from "./updates.js";
 
 const RELAY_DIR = ".relay";
 const CONFIG_FILE = "config.toml";
@@ -19,6 +24,8 @@ const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const HEADLESS_BUNDLE = path.join(PROJECT_ROOT, "dist", "headless.js");
 
 const VALUE_OPTIONS = new Set([
+  "auto",
+  "version",
   "control",
   "folder",
   "format",
@@ -49,6 +56,13 @@ export async function main(argv) {
   }
 
   if (command === "init") return initCommand(rest);
+  if (command === "version" || command === "--version" || command === "-v") return versionCommand(rest);
+  if (command === "update") return updateCommand(rest);
+  if (command === "_activate-install") {
+    const [root, target] = rest.map((value) => path.resolve(value));
+    if (rest.length !== 2 || path.dirname(target) !== path.join(root, "versions")) throw new Error("Invalid installation paths.");
+    return selectInstallation(root, target);
+  }
   if (command === "clone") return cloneCommand(rest);
   if (command === "connect") return connectCommand(rest);
   if (command === "disconnect") return disconnectCommand(rest);
@@ -72,20 +86,135 @@ function printHelp() {
   console.log(`Relay CLI
 
 Usage:
-  rmd login [--provider <name>] [--no-open]
-  rmd start
-  rmd init [path]
-  rmd clone [path] --relay <relay> --folder <folder>
-  rmd connect [path] --relay <relay>
-  rmd disconnect [path]
-  rmd status [path]
-  rmd sync-status [path]
-  rmd deletions [status|send|restore] [path]
-  rmd logging [status|enable|disable] [--network]
-  rmd relays
-  rmd folders
-  rmd stop
+  relay login [--provider <name>] [--no-open]
+  relay start
+  relay init [path]
+  relay clone [path] --relay <relay> --folder <folder>
+  relay connect [path] --relay <relay>
+  relay disconnect [path]
+  relay status [path]
+  relay sync-status [path]
+  relay deletions [status|send|restore] [path]
+  relay logging [status|enable|disable] [--network]
+  relay relays
+  relay folders
+  relay stop
+  relay version
+  relay update [--check | --version <version>]
+  relay update --auto on|off
+  relay update --pin | --unpin
 `);
+}
+
+async function versionCommand(argv) {
+  const { options } = parseArgs(argv);
+  const release = embeddedRelease ?? { version: "source", runtime: process.versions.bun ? "bun" : "node" };
+  if (options.verify) {
+    const { buildConfig } = await loadHeadlessBundle();
+    if (embeddedRelease && (buildConfig.target !== embeddedRelease.target || process.platform !== embeddedRelease.platform || process.arch !== embeddedRelease.arch)) {
+      throw new Error("Release runtime or build target does not match its metadata.");
+    }
+    if (embeddedRelease && typeof (await import("@napi-rs/keyring")).AsyncEntry !== "function") {
+      throw new Error("The release keychain module could not load.");
+    }
+  }
+  console.log(options.json ? JSON.stringify(release) : `relay ${release.version}`);
+}
+
+async function updateCommand(argv) {
+  const { options, positional } = parseArgs(argv);
+  if (positional.length || Object.keys(options).some((key) => !["auto", "version", "check", "pin", "unpin", "scheduled"].includes(key))) {
+    throw new Error("Usage: relay update [--check | --version <version> | --auto on|off | --pin | --unpin]");
+  }
+  for (const option of ["auto", "version"]) {
+    if (Object.hasOwn(options, option) && !options[option]) throw new Error(`--${option} requires a value.`);
+  }
+  const actions = [options.auto !== undefined, options.version !== undefined, !!options.check, !!options.pin, !!options.unpin, !!options.scheduled].filter(Boolean).length;
+  if (actions > 1) throw new Error("Choose one update action at a time.");
+  const installation = embeddedRelease ? await findInstallation() : null;
+  if (!installation) throw new Error("Self-update requires an installer-managed release. Source checkouts are updated through Git.");
+  if (options.auto !== undefined || options.pin || options.unpin) {
+    if (options.auto !== undefined && !["on", "off"].includes(options.auto)) throw new Error("Use relay update --auto on or --auto off.");
+    const changes = options.auto !== undefined ? { automatic: options.auto === "on" }
+      : { pinnedVersion: options.pin ? installation.release.version : null };
+    const settings = await configureUpdates(installation, changes);
+    console.log(`Automatic updates: ${settings.automatic ? "on" : "off"}${settings.pinnedVersion ? ` (pinned to ${settings.pinnedVersion})` : ""}.`);
+    return;
+  }
+  try {
+    await updateInstallation(installation, { ...options, daemons: createUpdateDaemonLifecycle(installation) });
+  } catch (error) {
+    if (options.scheduled) {
+      await fs.appendFile(path.join(installation.root, "update.log"), `${new Date().toISOString()} ${error.message}\n`, { mode: 0o600 });
+    }
+    throw error;
+  }
+}
+
+export function createUpdateDaemonLifecycle(installation, { timeout = 30_000 } = {}) {
+  const inspect = async (registration) => {
+    const connection = await liveControlEndpoint({ stateDir: registration.stateDir });
+    if (!connection) {
+      if (isProcessRunning(registration.pid)) throw new Error(`Cannot reach daemon ${registration.pid}; refusing to update while it may be writing.`);
+      return null;
+    }
+    const response = await requestControl(connection, { type: "status" });
+    if (response.status?.pid !== registration.pid || response.status?.installationRoot !== installation.root) {
+      throw new Error(`Daemon ownership changed for ${registration.stateDir}; retry after it stops.`);
+    }
+    return { ...registration, connection };
+  };
+  return {
+    async list() {
+      const result = [];
+      for (const registration of await registeredDaemons(installation.root)) {
+        const daemon = await inspect(registration);
+        if (daemon) result.push(daemon);
+      }
+      return result;
+    },
+    async stop(daemon) {
+      const response = await requestControl(daemon.connection, { type: "shutdown" });
+      if (!response.ok) throw new Error(response.error ?? "Daemon refused shutdown.");
+      const deadline = Date.now() + timeout;
+      while (isProcessRunning(daemon.pid) && Date.now() < deadline) await sleep(50);
+      if (isProcessRunning(daemon.pid)) throw new Error(`Daemon ${daemon.pid} did not finish shutting down; installation unchanged.`);
+    },
+    async start(daemon, versionDir) {
+      const release = await readRelease(versionDir);
+      const args = ["start", "--foreground", "--update-restart", "--state-dir", daemon.stateDir];
+      if (daemon.control) args.push("--control", daemon.control);
+      const child = spawn(path.join(versionDir, "relay"), args, { detached: true, stdio: "ignore" });
+      let failure = null;
+      child.once("error", (error) => { failure = error; });
+      child.unref();
+      const deadline = Date.now() + timeout;
+      while (!failure && child.exitCode === null && Date.now() < deadline) {
+        try {
+          const connection = await liveControlEndpoint({ stateDir: daemon.stateDir });
+          if (connection) {
+            const response = await requestControl(connection, { type: "status" });
+            if (response.status?.pid === child.pid && response.status?.installationRoot === installation.root && response.status?.release?.version === release.version) {
+              return { ...daemon, pid: child.pid, connection };
+            }
+          }
+        } catch { /* The endpoint can disappear while startup replaces stale metadata. */ }
+        await sleep(50);
+      }
+      // A failed replacement must exit before recovery can reopen its state.
+      if (child.pid && isProcessRunning(child.pid)) {
+        child.kill("SIGTERM");
+        const stopDeadline = Date.now() + timeout;
+        while (isProcessRunning(child.pid) && Date.now() < stopDeadline) await sleep(50);
+        if (isProcessRunning(child.pid)) {
+          const error = new Error(`Replacement daemon ${child.pid} did not stop; recovery must wait for it to exit.`);
+          error.recoveryBlocked = true;
+          throw error;
+        }
+      }
+      throw new Error(`Replacement daemon did not become ready${failure ? `: ${failure.message}` : ""}.`);
+    },
+  };
 }
 
 async function initCommand(argv) {
@@ -230,7 +359,7 @@ async function statusCommand(argv) {
       console.log(
         `Deletion safety: ${gate.paths.length} deletion${gate.paths.length === 1 ? " is" : "s are"} paused for review.`,
       );
-      console.log(`Review with: rmd deletions status ${shellQuote(folder.path)}`);
+      console.log(`Review with: relay deletions status ${shellQuote(folder.path)}`);
     }
   }
 }
@@ -240,7 +369,7 @@ async function syncStatusCommand(argv) {
   const root = await findRelayFolderRoot(path.resolve(positional[0] ?? "."));
   const config = await readConfig(root);
   const control = await liveControlEndpoint(options);
-  if (!control) throw new Error("Background sync is not running. Start it with `rmd start`.");
+  if (!control) throw new Error("Background sync is not running. Start it with `relay start`.");
   const response = await requestControl(control, {
     type: "relay_debug",
     method: "getFolderSyncStatus",
@@ -265,12 +394,12 @@ async function syncStatusCommand(argv) {
 async function deletionsCommand(argv) {
   const [subcommand = "status", ...rest] = argv;
   if (!["status", "send", "restore"].includes(subcommand)) {
-    throw new Error("Usage: rmd deletions [status|send|restore] [path] [--token <token>]");
+    throw new Error("Usage: relay deletions [status|send|restore] [path] [--token <token>]");
   }
   const { options, positional } = parseArgs(rest);
   const root = await findRelayFolderRoot(path.resolve(positional[0] ?? "."));
   const control = await liveControlEndpoint(options);
-  if (!control) throw new Error("Background sync is not running. Start it with `rmd start`.");
+  if (!control) throw new Error("Background sync is not running. Start it with `relay start`.");
 
   if (subcommand === "status") {
     const response = await requestControl(control, {
@@ -288,7 +417,7 @@ async function deletionsCommand(argv) {
 
   if (!options.token) {
     throw new Error(
-      `rmd deletions ${subcommand} requires the token shown by \`rmd deletions status\`.`,
+      `relay deletions ${subcommand} requires the token shown by \`relay deletions status\`.`,
     );
   }
   const response = await requestControl(control, {
@@ -299,7 +428,7 @@ async function deletionsCommand(argv) {
   });
   if (!response.ok) throw new Error(response.error ?? "Failed to resolve paused deletions.");
   if (response.resolution.result === "stale") {
-    throw new Error("The deletion review changed. Run `rmd deletions status` and review the new token.");
+    throw new Error("The deletion review changed. Run `relay deletions status` and review the new token.");
   }
   if (wantsJsonOutput(options)) {
     console.log(JSON.stringify(response.resolution, null, 2));
@@ -323,8 +452,8 @@ function printDeletionGate(gate, root) {
   console.log(`${count} deletion${count === 1 ? " is" : "s are"} paused for review:`);
   for (const heldPath of gate.paths) console.log(`  ${heldPath}`);
   console.log(`Token: ${gate.token}`);
-  console.log(`Send to other devices: rmd deletions send ${shellQuote(root)} --token ${gate.token}`);
-  console.log(`Keep and restore files: rmd deletions restore ${shellQuote(root)} --token ${gate.token}`);
+  console.log(`Send to other devices: relay deletions send ${shellQuote(root)} --token ${gate.token}`);
+  console.log(`Keep and restore files: relay deletions restore ${shellQuote(root)} --token ${gate.token}`);
 }
 
 function daemonDeletionGate(daemon, root) {
@@ -337,11 +466,11 @@ async function loggingCommand(argv) {
   const [subcommand = "status", ...rest] = argv;
   const { options } = parseArgs(rest);
   if (!["status", "enable", "disable"].includes(subcommand)) {
-    throw new Error("Usage: rmd logging [status|enable|disable] [--network]");
+    throw new Error("Usage: relay logging [status|enable|disable] [--network]");
   }
 
   const control = await liveControlEndpoint(options);
-  if (!control) throw new Error("Background sync is not running. Start it with `rmd start`.");
+  if (!control) throw new Error("Background sync is not running. Start it with `relay start`.");
 
   const response = subcommand === "status"
     ? await requestControl(control, { type: "logging_status" })
@@ -393,7 +522,7 @@ async function startCommand(argv) {
     return;
   }
 
-  const args = [process.argv[1], "start", "--foreground"];
+  const args = cliInvocation(["start", "--foreground"]);
   if (options.stateDir) args.push("--state-dir", options.stateDir);
   if (options.control) args.push("--control", options.control);
   const child = spawn(process.execPath, args, {
@@ -458,7 +587,7 @@ async function logoutCommand(argv) {
 
 async function authCommand(argv) {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "status") throw new Error("Usage: rmd auth status");
+  if (subcommand !== "status") throw new Error("Usage: relay auth status");
   const { options } = parseArgs(rest);
   const paths = daemonPaths(options.stateDir);
   const storage = await openEncryptedAuthStorage(paths);
@@ -467,10 +596,10 @@ async function authCommand(argv) {
 }
 
 async function loadHeadlessBundle() {
-  if (!existsSync(HEADLESS_BUNDLE)) {
+  if (!embeddedRelease && !existsSync(HEADLESS_BUNDLE)) {
     throw new Error("Headless runtime is not built. Run `npm run build:headless`.");
   }
-  return import(pathToFileURL(HEADLESS_BUNDLE).href);
+  return import("../dist/headless.js");
 }
 
 async function openEncryptedAuthStorage(paths) {
@@ -718,7 +847,7 @@ async function invokeRelayCliForUserCommand(command, params, options) {
 }
 
 async function invokeRelayCliEphemeral(command, params, options) {
-  if (!existsSync(HEADLESS_BUNDLE)) {
+  if (!embeddedRelease && !existsSync(HEADLESS_BUNDLE)) {
     throw new Error("Headless runtime is not built. Run `npm run build:headless`.");
   }
   const paths = daemonPaths(options.stateDir);
@@ -730,11 +859,11 @@ async function invokeRelayCliEphemeral(command, params, options) {
       HeadlessRelay,
       installBrowserGlobals,
       readStoredLogin,
-    } = await import(pathToFileURL(HEADLESS_BUNDLE).href);
+    } = await loadHeadlessBundle();
     await installBrowserGlobals({ storageDbPath: path.join(paths.stateDir, "browser.db") });
     const login = readStoredLogin();
     if (!login?.token) {
-      throw new Error("Not logged in. Run `rmd login` first.");
+      throw new Error("Not logged in. Run `relay login` first.");
     }
     runtime = new HeadlessRelay({
       folderGuid: randomUUID(),
@@ -758,7 +887,7 @@ function wantsJsonOutput(options) {
 async function debugCommand(argv) {
   const [subcommand, method, ...rest] = argv;
   if (!method || (subcommand !== "relay-debug" && subcommand !== "relay-cli")) {
-    throw new Error("Usage: rmd debug relay-debug <method> --control <endpoint>\n       rmd debug relay-cli <command> --control <endpoint>");
+    throw new Error("Usage: relay debug relay-debug <method> --control <endpoint>\n       relay debug relay-cli <command> --control <endpoint>");
   }
   const { options } = parseArgs(rest);
   if (!options.control) throw new Error(`debug ${subcommand} requires --control.`);
@@ -848,7 +977,7 @@ async function connectFolder(root, options) {
   if (control) {
     await requestControlChecked(control, { type: "refresh" }, options.control);
   } else if (!(await daemonStatus(options.stateDir)).running) {
-    console.log("Background sync is not running. Start it with `rmd start`.");
+    console.log("Background sync is not running. Start it with `relay start`.");
   }
 }
 
@@ -956,16 +1085,18 @@ async function folderStatus(root, state) {
 }
 
 async function runForegroundDaemon(options) {
+  const installation = embeddedRelease ? await findInstallation() : null;
   const paths = daemonPaths(options.stateDir);
-  await ensureStateDirectory(paths.stateDir);
-  await fs.writeFile(paths.pidFile, `${process.pid}\n`, "utf8");
-  const runtime = await createDaemonRuntime(options.stateDir);
   const controlEndpoint = options.control ?? defaultControlEndpoint(paths) ?? "tcp://127.0.0.1:0";
-
+  let runtime = null;
   let server = null;
+  let unregister = null;
+  let stopUpdates = null;
   let shuttingDown = false;
   const cleanup = async () => {
-    await runtime.close();
+    stopUpdates?.();
+    await runtime?.close();
+    await unregister?.();
     await fs.rm(paths.pidFile, { force: true });
     await fs.rm(paths.controlFile, { force: true });
     server?.close();
@@ -977,14 +1108,30 @@ async function runForegroundDaemon(options) {
     process.exit(0);
   };
 
-  if (controlEndpoint) {
-    server = await startControlServer(controlEndpoint, runtime, shutdown);
-    await writeJson(paths.controlFile, { endpoint: server.endpoint, pid: process.pid, authToken: server.authToken });
-  }
+  const initialize = async () => {
+    if (await liveControlEndpoint({ stateDir: paths.stateDir })) throw new Error("Relay background sync is already running.");
+    await ensureStateDirectory(paths.stateDir);
+    await fs.writeFile(paths.pidFile, `${process.pid}\n`, "utf8");
+    try {
+      runtime = await createDaemonRuntime(options.stateDir);
+      if (controlEndpoint) {
+        server = await startControlServer(controlEndpoint, runtime, shutdown);
+        await writeJson(paths.controlFile, { endpoint: server.endpoint, pid: process.pid, authToken: server.authToken });
+      }
+      if (installation) {
+        unregister = await registerDaemon(installation, { stateDir: paths.stateDir, pid: process.pid, control: options.control });
+        stopUpdates = scheduleAutomaticUpdates(installation);
+      }
+    } catch (error) { await cleanup(); throw error; }
+  };
+  // Serialize normal starts with updates, so the updater cannot miss a daemon
+  // created between discovering registrations and changing the current link.
+  if (installation && !options.updateRestart) await withInstallLock(installation.root, initialize);
+  else await initialize();
 
   if (options.control) {
     console.log(JSON.stringify({
-      type: "rmd.daemon.ready",
+      type: "relay.daemon.ready",
       control: server.endpoint,
       stateDir: paths.stateDir,
     }));
@@ -1183,11 +1330,11 @@ function selectHeadlessRuntime(runtimes, repo) {
 }
 
 async function startHeadlessRelayRuntime(folder, stateDir) {
-  if (!existsSync(HEADLESS_BUNDLE)) {
+  if (!embeddedRelease && !existsSync(HEADLESS_BUNDLE)) {
     throw new Error("Headless runtime is not built. Run `npm run build:headless`.");
   }
   const paths = daemonPaths(stateDir);
-  const { HeadlessRelay, installBrowserGlobals } = await import(pathToFileURL(HEADLESS_BUNDLE).href);
+  const { HeadlessRelay, installBrowserGlobals } = await loadHeadlessBundle();
   await installBrowserGlobals({ storageDbPath: path.join(paths.stateDir, "browser.db") });
   const relayRuntime = new HeadlessRelay({
     folderGuid: folder.folderId,
@@ -1787,7 +1934,10 @@ async function daemonStatus(stateDir) {
   const paths = daemonPaths(stateDir);
   const state = await readDaemonState(stateDir);
   const pid = await readPid(paths.pidFile);
+  const installation = embeddedRelease ? await findInstallation() : null;
   return {
+    release: embeddedRelease,
+    installationRoot: installation?.root ?? null,
     stateDir: paths.stateDir,
     running: pid ? isProcessRunning(pid) : false,
     pid,
@@ -1939,8 +2089,8 @@ function applyLoggingPatch(settings, logging) {
 }
 
 function defaultStateDir() {
-  if (process.env.XDG_STATE_HOME) return path.join(process.env.XDG_STATE_HOME, "rmd");
-  return path.join(os.homedir(), ".local", "state", "rmd");
+  if (process.env.XDG_STATE_HOME) return path.join(process.env.XDG_STATE_HOME, "relay");
+  return path.join(os.homedir(), ".local", "state", "relay");
 }
 
 async function readPid(pidFile) {

@@ -115,7 +115,8 @@ function parseArgs(argv: string[]): { options: Record<string, string | true>; po
 
 export { HeadlessRelay, installBrowserGlobals };
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+declare const RMD_RELEASE_METADATA: unknown;
+if (typeof RMD_RELEASE_METADATA === "undefined" && process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2))
     .then(() => process.exit(0))
     .catch((error) => {

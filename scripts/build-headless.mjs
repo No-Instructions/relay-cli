@@ -36,7 +36,7 @@ await esbuild.build({
   outfile: path.join(outDir, "headless.js"),
   bundle: true,
   banner: {
-    js: "import { createRequire as __relayCreateRequire } from 'node:module'; const require = __relayCreateRequire(import.meta.url); globalThis.window ??= globalThis; globalThis.self ??= globalThis; globalThis.EventSource ??= require('eventsource'); Array.prototype.remove ??= function(item) { const index = this.indexOf(item); if (index >= 0) this.splice(index, 1); }; Array.prototype.contains ??= function(item) { return this.includes(item); };",
+    js: "import { createRequire as __relayCreateRequire } from 'node:module'; import __relayEventSource from 'eventsource'; const require = __relayCreateRequire(import.meta.url); globalThis.window ??= globalThis; globalThis.self ??= globalThis; globalThis.EventSource ??= __relayEventSource; Array.prototype.remove ??= function(item) { const index = this.indexOf(item); if (index >= 0) this.splice(index, 1); }; Array.prototype.contains ??= function(item) { return this.includes(item); };",
   },
   platform: "node",
   format: "esm",

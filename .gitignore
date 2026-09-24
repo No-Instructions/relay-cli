@@ -9,6 +9,7 @@ dist/
 !.env.example
 .relay/
 .rmd-state/
+.relay-state/
 storage.key
 storage.key.*
 *.key

@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { deserialize, serialize } from "node:v8";
+import { deserializeRecord, serializeRecord } from "./storage-codec";
 import {
   IDBCursor,
   IDBCursorWithValue,
@@ -56,8 +56,8 @@ export async function installDurableIndexedDB(
     IDBVersionChangeEvent: descriptor(IDBVersionChangeEvent),
   });
 
-  global.__relayDurableIndexedDBPath = storageDbPath;
   await installer.hydrate();
+  global.__relayDurableIndexedDBPath = storageDbPath;
 }
 
 function descriptor(value: unknown): PropertyDescriptor {
@@ -137,20 +137,22 @@ class DurableIndexedDB {
         const objectStore = tx.objectStore(store.name);
         const keyPath = JSON.parse(store.key_path_json);
         for (const record of records) {
-          const key = deserialize(this.storage.decryptRecord(
+          const keyBytes = this.storage.decryptRecord(
             database.name,
             store.name,
             record.key_hash,
             "key",
             record.key_blob,
-          ));
-          const value = deserialize(this.storage.decryptRecord(
+          );
+          const valueBytes = this.storage.decryptRecord(
             database.name,
             store.name,
             record.key_hash,
             "value",
             record.value_blob,
-          ));
+          );
+          const key = deserializeRecord(keyBytes) as IDBValidKey;
+          const value = deserializeRecord(valueBytes);
           if (keyPath === null) {
             objectStore.put(value, key);
           } else {
@@ -182,6 +184,9 @@ class DurableIndexedDB {
   }
 
   private patchTransaction(tx: IDBTransaction): void {
+    // Hydration transactions must never persist, even if hydration rejects
+    // before their completion event runs and the flag is reset.
+    if (this.hydrating) return;
     if (this.patchedTransactions.has(tx)) return;
     this.patchedTransactions.add(tx);
     if (tx.mode !== "readwrite" && tx.mode !== "versionchange") return;
@@ -320,7 +325,7 @@ class IndexedDBSqliteStorage {
           rawStore.keyGenerator?.num ?? null,
         );
         for (const record of rawStore.records.values()) {
-          const keyBlob = serialize(record.key);
+          const keyBlob = serializeRecord(record.key);
           const keyHash = this.cipher.index(keyBlob);
           insertRecord.run(
             db.name,
@@ -333,7 +338,7 @@ class IndexedDBSqliteStorage {
               keyHash,
               "key",
             ]),
-            this.cipher.encrypt(serialize(record.value), [
+            this.cipher.encrypt(serializeRecord(record.value), [
               "indexedDB",
               db.name,
               storeName,
@@ -368,6 +373,7 @@ function transactionToPromise(
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
-    fn(tx);
+    try { fn(tx); }
+    catch (error) { tx.abort(); reject(error); }
   });
 }

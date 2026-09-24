@@ -4,29 +4,29 @@ Relay CLI runs Relay in headless mode for local folders.
 
 The user-facing model is:
 
-- `rmd start` starts background sync.
-- `rmd stop` stops background sync.
-- `rmd init <folder>` prepares a local folder for Relay.
-- `rmd clone <folder>` copies an existing Relay folder to this machine.
-- `rmd connect <folder>` starts syncing a local folder.
-- `rmd disconnect <folder>` stops syncing a local folder without deleting files.
-- `rmd status [folder]` reports background sync and folder sync state.
-- `rmd sync-status [folder]` reports per-file sync status from the running
+- `relay start` starts background sync.
+- `relay stop` stops background sync.
+- `relay init <folder>` prepares a local folder for Relay.
+- `relay clone <folder>` copies an existing Relay folder to this machine.
+- `relay connect <folder>` starts syncing a local folder.
+- `relay disconnect <folder>` stops syncing a local folder without deleting files.
+- `relay status [folder]` reports background sync and folder sync state.
+- `relay sync-status [folder]` reports per-file sync status from the running
   headless runtime.
-- `rmd logging [status|enable|disable] [--network]` controls daemon-wide debug
+- `relay logging [status|enable|disable] [--network]` controls daemon-wide debug
   logging through the running daemon.
-- `rmd relays` lists relays available to the logged-in user.
-- `rmd folders` lists remote folders, and local folders when scoped to a running
+- `relay relays` lists relays available to the logged-in user.
+- `relay folders` lists remote folders, and local folders when scoped to a running
   headless runtime.
 
-`rmd connect` is the transition from a local initialized folder to a remote
-Relay folder. If the folder was created with `rmd init`, the daemon creates the
+`relay connect` is the transition from a local initialized folder to a remote
+Relay folder. If the folder was created with `relay init`, the daemon creates the
 remote shared folder through upstream Relay code and treats local disk as
-authoritative. `rmd clone` records an existing remote folder and auto-connects
+authoritative. `relay clone` records an existing remote folder and auto-connects
 it as server-authoritative.
 
-In interactive terminals, `rmd connect` may prompt for a Relay when `--relay` is
-omitted, and `rmd clone` may prompt for both a Relay and remote folder when
+In interactive terminals, `relay connect` may prompt for a Relay when `--relay` is
+omitted, and `relay clone` may prompt for both a Relay and remote folder when
 `--relay` or `--folder` are omitted. Non-interactive invocations must pass GUIDs
 explicitly.
 
@@ -46,13 +46,13 @@ records, PocketBase auth state, and Relay local storage survive daemon restarts.
 ## Background Sync
 
 The daemon is global and per-user. It manages any folders registered with
-`rmd connect` or `rmd clone`.
+`relay connect` or `relay clone`.
 
 The daemon owns file watching, scheduling, runtime lifecycle, remote sync, and
 headless Relay execution. CLI commands may update local metadata and request
 daemon actions, but they do not implement sync behavior themselves.
 
-`rmd logging` talks to the daemon control endpoint. Logging settings are stored
+`relay logging` talks to the daemon control endpoint. Logging settings are stored
 in daemon-wide plugin data, and the daemon applies changes to any active
 headless runtimes. `--network` controls the upstream Relay network logging flag;
 enabling network logging also enables debug logging.

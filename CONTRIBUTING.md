@@ -13,7 +13,7 @@ authentication, permissions, or data durability before starting work.
 
 Follow the source installation and build instructions in
 [README.md](README.md#development). Run `npm run check` and
-`node bin/rmd.js --help` before submitting a change.
+`node bin/relay.js --help` before submitting a change.
 
 The development harness and test suite are proprietary. Unit tests stored in
 this repository are encrypted; the private overlay holds integration tests

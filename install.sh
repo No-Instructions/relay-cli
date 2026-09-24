@@ -1,18 +1,31 @@
-#!/usr/bin/env bash
-# Install Relay CLI for the current user. No system Node.js or sudo required.
+#!/bin/sh
+# Install a prebuilt Relay CLI release for the current user.
 
 main() (
-  set -euo pipefail
+  set -eu
   umask 022
 
   fail() { printf 'Relay CLI: %s\n' "$*" >&2; exit 1; }
   download() { curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 "$1" -o "$2"; }
+  # Produce a POSIX shell literal, including embedded apostrophes and newlines.
+  quote() (
+    value=$1
+    printf "'"
+    while :; do
+      case "$value" in
+        *\'*)
+          printf '%s%s' "${value%%\'*}" "'\"'\"'"
+          value=${value#*\'} ;;
+        *) printf "%s'" "$value"; break ;;
+      esac
+    done
+  )
 
   case "${1:-}" in
     --help|-h)
-      printf '%s\n' 'Install Relay CLI: bash install.sh' \
-        'Optional: RMD_INSTALL_DIR, RMD_BIN_DIR, RMD_REVISION (full commit SHA).' \
-        'Default locations: ~/.local/share/relay-cli and ~/.local/bin/rmd.'
+      printf '%s\n' 'Install Relay CLI: sh install.sh' \
+        'Optional: RMD_INSTALL_DIR, RMD_BIN_DIR, RMD_VERSION, RMD_RELEASE_DIR (offline artifacts).' \
+        'Default locations: ~/.local/share/relay-cli and ~/.local/bin/relay.'
       exit 0 ;;
     '') ;;
     *) fail "Unknown option: $1" ;;
@@ -22,9 +35,9 @@ main() (
     command -v "$command" >/dev/null 2>&1 || fail "Install $command and try again."
   done
   if command -v sha256sum >/dev/null 2>&1; then
-    checksum() { sha256sum "$1" | awk '{print $1}'; }
+    checksum() { sha256sum < "$1"; }
   elif command -v shasum >/dev/null 2>&1; then
-    checksum() { shasum -a 256 "$1" | awk '{print $1}'; }
+    checksum() { shasum -a 256 < "$1"; }
   else
     fail 'Install sha256sum or shasum and try again.'
   fi
@@ -47,9 +60,9 @@ main() (
   mkdir -p "$install_dir/versions" "$bin_dir"
   install_dir=$(cd "$install_dir" && pwd -P)
   bin_dir=$(cd "$bin_dir" && pwd -P)
-  launcher=$bin_dir/rmd
+  launcher=$bin_dir/relay
   if [ -e "$launcher" ] || [ -L "$launcher" ]; then
-    [ -L "$launcher" ] && [ "$(readlink "$launcher")" = "$install_dir/current/rmd" ] ||
+    [ -L "$launcher" ] && [ "$(readlink "$launcher")" = "$install_dir/current/relay" ] ||
       fail "$launcher already exists and belongs to another install. Set RMD_BIN_DIR to choose another directory."
   fi
   if [ -e "$install_dir/current" ] && [ ! -L "$install_dir/current" ]; then
@@ -59,80 +72,61 @@ main() (
   mkdir "$install_dir/.install-lock" 2>/dev/null ||
     fail "Another installation may be running. If it was interrupted, remove $install_dir/.install-lock and retry."
   stage=''
-  link_temp=''
   cleanup() {
-    [ -z "$link_temp" ] || rm -f "$link_temp"
     [ -z "$stage" ] || rm -rf "$stage"
     rmdir "$install_dir/.install-lock"
   }
-  trap cleanup EXIT
+  trap cleanup 0
   trap 'exit 130' INT
   trap 'exit 143' TERM
   stage=$(mktemp -d "$install_dir/.install.XXXXXXXX")
 
-  node_version=24.17.0
-  node_archive=node-v$node_version-$platform-$architecture.tar.gz
-  node_url=https://nodejs.org/dist/v$node_version
-  printf 'Installing Relay CLI for %s/%s…\n' "$platform" "$architecture"
-  download "$node_url/SHASUMS256.txt" "$stage/SHASUMS256.txt"
-  expected=$(awk -v name="$node_archive" '$2 == name { print $1 }' "$stage/SHASUMS256.txt")
-  [ "${#expected}" -eq 64 ] || fail 'The Node.js download has no matching checksum.'
-  download "$node_url/$node_archive" "$stage/node.tar.gz"
-  [ "$(checksum "$stage/node.tar.gz")" = "$expected" ] || fail 'Node.js download checksum mismatch.'
-  mkdir "$stage/runtime" "$stage/app"
-  tar -xzf "$stage/node.tar.gz" -C "$stage/runtime" --strip-components=1
-  node=$stage/runtime/bin/node
-  [ "$("$node" --version)" = "v$node_version" ] || fail 'The downloaded Node.js runtime could not start.'
-
-  revision=${RMD_REVISION:-}
-  if [ -z "$revision" ]; then
-    download 'https://api.github.com/repos/No-Instructions/relay-cli/commits/main' "$stage/revision.json"
-    revision=$("$node" -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).sha)' "$stage/revision.json")
+  release_base=https://github.com/No-Instructions/relay-cli/releases
+  version=${RMD_VERSION:-}
+  release_dir=${RMD_RELEASE_DIR:-}
+  asset() {
+    if [ -n "$release_dir" ]; then
+      cp "$release_dir/$1" "$2"
+    else
+      download "$release_base/download/v$version/$1" "$2"
+    fi
+  }
+  if [ -z "$version" ]; then
+    if [ -n "$release_dir" ]; then
+      cp "$release_dir/version.txt" "$stage/version.txt"
+    else
+      download "$release_base/latest/download/version.txt" "$stage/version.txt"
+    fi
+    version=$(cat "$stage/version.txt")
   fi
-  [ "${#revision}" -eq 40 ] || fail 'RMD_REVISION must be a full Git commit SHA.'
-  case "$revision" in *[!0-9a-f]*) fail 'RMD_REVISION must be a full Git commit SHA.' ;; esac
-  download "https://codeload.github.com/No-Instructions/relay-cli/tar.gz/$revision" "$stage/source.tar.gz"
-  tar -xzf "$stage/source.tar.gz" -C "$stage/app" --strip-components=1
-  printf 'Building Relay CLI…\n'
-  (
-    cd "$stage/app"
-    export PATH="$stage/runtime/bin:$PATH"
-    "$stage/runtime/bin/npm" ci --include=dev --no-audit --no-fund
-    "$stage/runtime/bin/npm" run build:headless
-  )
-  "$node" --no-warnings "$stage/app/bin/rmd.js" --help >/dev/null
-  printf '%s\n' "$revision" > "$stage/revision"
-  rm -f "$stage/node.tar.gz" "$stage/source.tar.gz" "$stage/SHASUMS256.txt" "$stage/revision.json"
-  # The launcher stays on the selected installation. Existing daemons retain
-  # their old version directories, which are kept across updates.
-  {
-    printf '#!/usr/bin/env bash\n'
-    printf 'exec %q --no-warnings %q "$@"\n' \
-      "$install_dir/current/runtime/bin/node" "$install_dir/current/app/bin/rmd.js"
-  } > "$stage/rmd"
-  chmod 755 "$stage/rmd"
-
-  version_dir=$install_dir/versions/$revision-${stage##*.install.}
-  mv "$stage" "$version_dir"
-  stage=''
-  node=$version_dir/runtime/bin/node
-  # rename replaces the link itself on both Linux and macOS; mv may follow a
-  # destination directory symlink and put the new link inside its target.
-  link_temp=$install_dir/.current-$$
-  ln -s "$version_dir" "$link_temp"
-  "$node" -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$link_temp" "$install_dir/current"
-  link_temp=''
+  awk -v version="$version" 'BEGIN { exit !(version ~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) }' ||
+    fail 'Expected a release version such as 1.2.3.'
+  archive=relay-cli-$platform-$architecture.tar.gz
+  printf 'Installing Relay CLI %s for %s/%s…\n' "$version" "$platform" "$architecture"
+  asset "$archive.sha256" "$stage/checksum"
+  expected=$(awk '{print $1}' "$stage/checksum")
+  [ "${#expected}" -eq 64 ] || fail 'Invalid release checksum.'
+  asset "$archive" "$stage/release.tar.gz"
+  actual=$(checksum "$stage/release.tar.gz") || fail 'Could not checksum the release download.'
+  [ "${actual%% *}" = "$expected" ] || fail 'Release checksum mismatch.'
+  mkdir "$stage/unpacked"
+  tar -xzf "$stage/release.tar.gz" -C "$stage/unpacked"
+  [ "$("$stage/unpacked/relay" version --verify)" = "relay $version" ] || fail 'The downloaded CLI failed its version check.'
+  version_dir=$install_dir/versions/$version-${stage##*.install.}
+  mv "$stage/unpacked" "$version_dir"
+  "$version_dir/relay" _activate-install "$install_dir" "$version_dir"
   if [ ! -L "$launcher" ]; then
-    ln -s "$install_dir/current/rmd" "$launcher"
+    ln -s "$install_dir/current/relay" "$launcher"
   fi
 
   printf '\nInstalled Relay CLI at %s\n' "$launcher"
   case ":$PATH:" in
     *":$bin_dir:"*) ;;
-    *) printf '\nAdd this to your shell profile and run it in this terminal:\n  export PATH=%q:"$PATH"\n' "$bin_dir" ;;
+    *) printf '\nAdd this to your shell profile and run it in this terminal:\n  export PATH=%s:"$PATH"\n' "$(quote "$bin_dir")" ;;
   esac
-  printf '\nGet started:\n  %q login\n  %q clone\n  %q start\n' "$launcher" "$launcher" "$launcher"
-  printf '\nRun this installer again to update. Restart a running daemon with rmd stop, then rmd start.\n'
+  quoted_launcher=$(quote "$launcher")
+  printf '\nGet started:\n  %s login\n  %s clone\n  %s start\n' "$quoted_launcher" "$quoted_launcher" "$quoted_launcher"
+  printf '\nUpdate with relay update. Enable automatic updates with relay update --auto on.\n'
 )
 
 # Keeping execution at the end prevents a truncated piped download from

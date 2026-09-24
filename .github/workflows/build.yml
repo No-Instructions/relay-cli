@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_version:
+        type: string
+        default: '0.0.0'
 
 permissions:
   contents: read
@@ -28,31 +33,66 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
-      - run: node bin/rmd.js --help
+      - run: node bin/relay.js --help
       - run: npm run build:staging
-      - run: node bin/rmd.js --help
+      - run: node bin/relay.js --help
   install:
-    name: Install (${{ matrix.os }})
+    name: Standalone (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: macos-15-intel
+            platform: darwin-x64
+          - os: macos-15
+            platform: darwin-arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Install and run the reviewed revision
-        shell: bash
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24.17.0'
+          cache: npm
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: .bun-version
+      - run: npm ci
+      - name: Build standalone executable
         env:
-          RMD_REVISION: ${{ github.sha }}
+          RELEASE_VERSION: ${{ inputs.release_version || '0.0.0' }}
+        run: bun scripts/build-release.mjs "$RELEASE_VERSION" "$RUNNER_TEMP/releases"
+      - name: Install and exercise the standalone executable
+        shell: sh
+        env:
+          RMD_RELEASE_DIR: ${{ runner.temp }}/releases
           RMD_INSTALL_DIR: ${{ runner.temp }}/relay cli
           RMD_BIN_DIR: ${{ runner.temp }}/relay bin
+          RMD_STORAGE_KEY_FILE: ${{ runner.temp }}/storage.key
         run: |
-          bash -n install.sh
-          bash install.sh
-          "$RMD_BIN_DIR/rmd" --help
+          sh -n install.sh
+          sh install.sh
+          node --input-type=module -e 'import fs from "node:fs"; import crypto from "node:crypto"; fs.writeFileSync(process.env.RMD_STORAGE_KEY_FILE, crypto.randomBytes(32).toString("hex"), {mode: 0o600});'
+          "$RMD_BIN_DIR/relay" version --verify --json
+          "$RMD_BIN_DIR/relay" --help
+          "$RMD_BIN_DIR/relay" init "$RUNNER_TEMP/notes"
+          "$RMD_BIN_DIR/relay" status "$RUNNER_TEMP/notes" --state-dir "$RUNNER_TEMP/state"
+          trap '"$RMD_BIN_DIR/relay" stop --state-dir "$RUNNER_TEMP/state"' EXIT
+          "$RMD_BIN_DIR/relay" start --state-dir "$RUNNER_TEMP/state"
+          "$RMD_BIN_DIR/relay" update --auto off
+          "$RMD_BIN_DIR/relay" update --pin
+          "$RMD_BIN_DIR/relay" update --unpin
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: ${{ runner.temp }}/releases/
+          if-no-files-found: error
   required:
     name: Public build
     if: always()
