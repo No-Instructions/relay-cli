@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { App, TFile, TFolder, normalizePath, type TAbstractFile } from "./obsidian-shim";
 import { installLogRouting, runWithLogSink } from "./log-context";
 import { createHeadlessLoginManager } from "./HeadlessAuth";
@@ -88,34 +88,86 @@ const DEFAULT_SETTINGS: RelaySettings = {
   sharedFolders: [],
 };
 
-class JsonStorage<T> implements StorageAdapter<T> {
-  private saveCounter = 0;
-  private saveQueue = Promise.resolve();
+type StoredFolderSettings = SharedFolderSettings & { localPath?: string };
+type StoredRelaySettings = Omit<RelaySettings, "sharedFolders"> & {
+  sharedFolders: StoredFolderSettings[];
+};
 
-  constructor(private file: string) {}
+// Upstream paths are relative to one vault. Each headless runtime has its own
+// virtual vault, so its settings view must contain only that local registration.
+class HeadlessSettingsStorage implements StorageAdapter<RelaySettings> {
+  private static saveQueues = new Map<string, Promise<void>>();
 
-  async loadData(): Promise<T | null> {
+  constructor(
+    private file: string,
+    private folderGuid: string,
+    private localPath: string,
+  ) {
+    this.file = path.resolve(file);
+    this.localPath = path.resolve(localPath);
+  }
+
+  private owns(folder: StoredFolderSettings): boolean {
+    // A registration without localPath can be adopted by its matching GUID.
+    // Its vault-relative path is repaired from the connected root at startup.
+    return folder.guid === this.folderGuid &&
+      (folder.localPath === undefined || folder.localPath === this.localPath);
+  }
+
+  private async readStoredData(): Promise<StoredRelaySettings | null> {
     try {
       const text = await fs.readFile(this.file, "utf8");
       if (!text.trim()) return null;
-      return JSON.parse(text) as T;
+      return JSON.parse(text) as StoredRelaySettings;
     } catch (error: any) {
       if (error.code === "ENOENT") return null;
       throw error;
     }
   }
 
-  async saveData(data: T): Promise<void> {
-    const serialized = `${JSON.stringify(data, null, 2)}\n`;
-    this.saveQueue = this.saveQueue
+  async loadData(): Promise<RelaySettings | null> {
+    const stored = await this.readStoredData();
+    if (!stored) return null;
+    return {
+      ...stored,
+      sharedFolders: (stored.sharedFolders ?? [])
+        .filter((folder) => this.owns(folder))
+        .map(({ localPath: _localPath, ...folder }) => folder),
+    };
+  }
+
+  async saveData(data: RelaySettings): Promise<void> {
+    const snapshot = structuredClone(data);
+    // Every runtime in a daemon shares this file. Merge registrations inside
+    // the shared queue so an older runtime cannot erase a newer registration.
+    const save = (HeadlessSettingsStorage.saveQueues.get(this.file) ?? Promise.resolve())
       .catch(() => {})
-      .then(() => this.writeSerialized(serialized));
-    await this.saveQueue;
+      .then(async () => {
+        const stored = await this.readStoredData();
+        const merged: StoredRelaySettings = {
+          ...snapshot,
+          sharedFolders: [
+            ...(stored?.sharedFolders ?? []).filter((folder) => !this.owns(folder)),
+            ...snapshot.sharedFolders
+              .filter((folder) => folder.guid === this.folderGuid)
+              .map((folder) => ({ ...folder, localPath: this.localPath })),
+          ],
+        };
+        await this.writeSerialized(`${JSON.stringify(merged, null, 2)}\n`);
+      });
+    HeadlessSettingsStorage.saveQueues.set(this.file, save);
+    try {
+      await save;
+    } finally {
+      if (HeadlessSettingsStorage.saveQueues.get(this.file) === save) {
+        HeadlessSettingsStorage.saveQueues.delete(this.file);
+      }
+    }
   }
 
   private async writeSerialized(serialized: string): Promise<void> {
     await fs.mkdir(path.dirname(this.file), { recursive: true });
-    const tmp = `${this.file}.tmp-${process.pid}-${this.saveCounter++}`;
+    const tmp = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
     await fs.writeFile(tmp, serialized, { encoding: "utf8", mode: 0o600 });
     if (process.platform !== "win32") await fs.chmod(tmp, 0o600);
     await fs.rename(tmp, this.file);
@@ -232,7 +284,11 @@ export class HeadlessRelay {
     RelayInstances.set(this, "headless-plugin");
 
     this.settings = new Settings(
-      new JsonStorage<RelaySettings>(path.join(this.input.stateDir, "plugin-data.json")),
+      new HeadlessSettingsStorage(
+        path.join(this.input.stateDir, "plugin-data.json"),
+        this.input.folderGuid,
+        this.input.folderPath,
+      ),
       DEFAULT_SETTINGS,
     );
     await this.settings.load();

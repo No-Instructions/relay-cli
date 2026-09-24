@@ -802,6 +802,7 @@ async function createRelayFolder(root, input) {
     relayId: input.relayId,
     server: input.server,
     name: input.name,
+    authoritative: input.indexFiles,
   };
   await writeConfig(root, config);
   const files = input.indexFiles ? await scanMarkdownFiles(root) : [];
@@ -813,7 +814,6 @@ async function connectFolder(root, options) {
   const server = (await loadHeadlessBundle()).buildConfig.authUrl;
   assertAuthServerMatches(config.server, server);
   let nextConfig = config;
-  const authoritative = !config.relayId;
   if (!config.relayId) {
     const relayId = options.relay
       ?? (await selectRelay(
@@ -825,11 +825,16 @@ async function connectFolder(root, options) {
       relayId,
       server,
     };
-    await writeConfig(root, nextConfig);
-    updateDatabaseRelay(path.join(root, RELAY_DIR, "relay.db"), nextConfig);
   }
-
   const state = await readDaemonState(options.stateDir);
+  const previous = state.connected.find((entry) => entry.path === root && entry.folderId === config.folderId);
+  // Relay membership can be recorded before the daemon creates the remote.
+  // Preserve the folder's initialization policy across retries and disconnects.
+  const authoritative = config.authoritative ?? previous?.authoritative ?? !config.relayId;
+  nextConfig = { ...nextConfig, authoritative };
+  await writeConfig(root, nextConfig);
+  if (!config.relayId) updateDatabaseRelay(path.join(root, RELAY_DIR, "relay.db"), nextConfig);
+
   const entry = {
     path: root,
     relayId: nextConfig.relayId,
@@ -1971,6 +1976,7 @@ async function writeConfig(root, config) {
     `name = ${JSON.stringify(config.name)}`,
   ];
   if (config.relayId) lines.splice(2, 0, `relay_id = ${JSON.stringify(config.relayId)}`);
+  if (typeof config.authoritative === "boolean") lines.push(`authoritative = ${config.authoritative}`);
   await fs.writeFile(path.join(root, RELAY_DIR, CONFIG_FILE), `${lines.join("\n")}\n`, "utf8");
 }
 
@@ -1988,6 +1994,7 @@ async function readConfig(root) {
     relayId: values.relay_id ?? null,
     server: values.server,
     name: values.name,
+    authoritative: values.authoritative,
   };
 }
 
