@@ -1,4 +1,5 @@
 import http2 from "node:http2";
+import { bindRealtimeSession } from "../network.js";
 
 type Listener = (event: RelayMessageEvent) => void;
 
@@ -31,6 +32,7 @@ export class Http2EventSource {
   private listeners = new Map<string, Set<Listener>>();
   private request: any = null;
   private session: http2.ClientHttp2Session | null = null;
+  private unbindSession: (() => void) | null = null;
 
   constructor(public url: string | URL) {
     queueMicrotask(() => this.connect());
@@ -56,6 +58,8 @@ export class Http2EventSource {
   }
 
   private closeConnection(): void {
+    this.unbindSession?.();
+    this.unbindSession = null;
     this.request?.removeAllListeners?.();
     this.request?.on?.("error", ignoreStreamError);
     this.request?.close?.();
@@ -154,6 +158,10 @@ export class Http2EventSource {
     );
     this.currentData = [];
     this.currentEvent = "message";
+    if (event.type === "PB_CONNECT" && event.lastEventId && this.session) {
+      this.unbindSession?.();
+      this.unbindSession = bindRealtimeSession(this.url, event.lastEventId, this.session);
+    }
     this.emit(event.type, event);
     if (event.type === "message") this.onmessage?.(event);
   }

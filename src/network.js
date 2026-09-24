@@ -4,6 +4,7 @@ import http2 from "node:http2";
 import https from "node:https";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const realtimeSessions = new Map();
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -14,6 +15,22 @@ const HOP_BY_HOP_HEADERS = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
+
+// PocketBase binds a realtime client to the IP that opened its event stream.
+// Reuse that connection for subscription changes: a fresh connection can pick
+// a different IP family, even when both requests use the same hostname.
+export function bindRealtimeSession(input, clientId, session) {
+  const url = new URL(input);
+  const key = url.origin + url.pathname;
+  let clients = realtimeSessions.get(key);
+  if (!clients) realtimeSessions.set(key, clients = new Map());
+  clients.set(clientId, session);
+  return () => {
+    if (clients.get(clientId) !== session) return;
+    clients.delete(clientId);
+    if (!clients.size) realtimeSessions.delete(key);
+  };
+}
 
 export async function requestBinary(input, init = {}) {
   const url = input instanceof URL ? input : new URL(String(input));
@@ -26,6 +43,20 @@ export async function requestBinary(input, init = {}) {
   }
   if (body && !("content-length" in headers)) {
     headers["content-length"] = String(body.byteLength);
+  }
+
+  const clients = realtimeSessions.get(url.origin + url.pathname);
+  if (clients && method === "POST" && body) {
+    let clientId;
+    try {
+      clientId = JSON.parse(body.toString("utf8")).clientId;
+    } catch { /* Not a subscription body. */ }
+    const session = clients.get(clientId);
+    if (session) {
+      // Never retry a bound subscription on a new connection. The SDK must
+      // reconnect its event stream if this session has failed.
+      return await requestHttp2(url, { method, headers, body, timeoutMs }, session);
+    }
   }
 
   if (url.protocol === "https:") {
@@ -55,9 +86,9 @@ export function describeNetworkError(url, description, error) {
   return `${description} failed: unable to reach ${url}${suffix}. Check network connectivity and that you are using the intended production or staging build.`;
 }
 
-function requestHttp2(url, input) {
+function requestHttp2(url, input, sharedSession) {
   return new Promise((resolve, reject) => {
-    const session = http2.connect(url.origin);
+    const session = sharedSession ?? http2.connect(url.origin);
     const chunks = [];
     let settled = false;
     let request;
@@ -76,15 +107,18 @@ function requestHttp2(url, input) {
       request?.removeAllListeners();
       request?.on("error", ignoreSessionError);
       session.removeListener("error", fail);
-      session.on("error", ignoreSessionError);
-      if (!session.closed && !session.destroyed) session.close();
+      if (!sharedSession) {
+        session.on("error", ignoreSessionError);
+        if (!session.closed && !session.destroyed) session.close();
+      }
     };
 
     const fail = (error) => {
       if (settled) return;
       settled = true;
       cleanup();
-      if (!session.destroyed) session.destroy();
+      request?.destroy();
+      if (!sharedSession && !session.destroyed) session.destroy();
       reject(error);
     };
 
@@ -96,7 +130,12 @@ function requestHttp2(url, input) {
       ...filterHttp2Headers(input.headers),
     };
 
-    request = session.request(requestHeaders);
+    try {
+      request = session.request(requestHeaders);
+    } catch (error) {
+      fail(error);
+      return;
+    }
     request.once("response", (responseHeaders) => {
       status = Number(responseHeaders[":status"] ?? 0);
       headers = normalizeResponseHeaders(responseHeaders);
@@ -109,6 +148,9 @@ function requestHttp2(url, input) {
       resolve(makeResponse(url, status, "", headers, Buffer.concat(chunks)));
     });
     request.once("error", fail);
+    request.once("close", () => {
+      if (!settled) fail(Object.assign(new Error("HTTP2 request closed before completing."), { code: "ECONNRESET" }));
+    });
     request.end(input.body ?? undefined);
   });
 }
