@@ -15,6 +15,18 @@ Follow the source installation and build instructions in
 [README.md](README.md#development). Run `npm run check` and
 `node bin/relay.js --help` before submitting a change.
 
+Enable the repository's commit-message hook after cloning:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Use a lowercase type prefix in product commit titles, such as
+`fix: preserve realtime subscriptions` or `feat: add a command`.
+Describe changes without private ticket identifiers, internal tooling names,
+wikilinks, or agent session trailers. The commit-message hook enforces these
+rules.
+
 The development harness and test suite are proprietary. Unit tests stored in
 this repository are encrypted; the private overlay holds integration tests
 and development tooling. Maintainers run those suites for reviewed changes.
