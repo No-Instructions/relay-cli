@@ -71,14 +71,37 @@ the checksum, metadata, embedded version, and runtime before stopping daemons.
 HTTPS and publisher-controlled checksums provide transport and corruption
 checks; these are not independent publisher signatures.
 
-Installer, update, policy changes, and managed daemon starts share an installation
-lock. Every daemon registers its state directory, process ID, and chosen control
+Installer, update, update-policy commands, and managed daemon starts share an installation
+lock. User preference writes also share a config-file lock. Every daemon registers its state directory, process ID, and chosen control
 endpoint. The updater uses authenticated control requests and waits for process
 exit before switching the `current` symlink atomically. It attempts to restart
 the previous version if replacement startup fails. A replacement that cannot
 stop blocks recovery so two runtimes do not write the same state concurrently.
 
-Automatic updates default off. When enabled and unpinned, a running daemon
+Version checks run daily by default and only fetch `version.txt`. Results and
+failed attempts are cached in `update-check.json`, separately from installation
+policy. Interactive commands allow up to 1.5 seconds for a due check, then show
+an available-update notice on stderr. Notices use yellow when supported and
+respect `NO_COLOR`; redirected commands, JSON output, and MCP skip these checks
+and notices. Daemons check in the background and log each new notice once.
+Pinned installations still receive notices explaining how to unpin.
+
+Preferences live in `~/Library/Application Support/relay/config.toml` on macOS
+and `~/.config/relay/config.toml` on Linux and WSL. `XDG_CONFIG_HOME` overrides
+either default with `$XDG_CONFIG_HOME/relay/config.toml`.
+The `[updates]` table holds `automatic`, `notify`, and optional `pinned_version`;
+the `[logging]` table holds `debug` and `network`. They apply across the user's
+installations. `notify = false` disables incidental version checks and notices.
+CLI preference changes preserve unrelated TOML values and rewrite the document
+with normalized formatting; comments are not retained. Invalid configuration
+is reported without overwriting the file. Attempt timestamps stay in each
+installation's `update-state.json`; notification cache data stays in
+`update-check.json`. Neither file is a preference source.
+
+Automatic installation defaults off. We recommend opting in with
+`relay update --enable-automatic-updates`; use `--disable-automatic-updates` to
+turn it off. `relay upgrade` accepts all the same options as `relay update`.
+When enabled and unpinned, a running daemon
 launches a separate update worker at most daily, including after a failed check.
 It waits up to a minute after startup before the first check. Restarted daemons
 inherit the updater's environment. Custom key-file configurations must therefore

@@ -52,8 +52,11 @@ The daemon owns file watching, scheduling, runtime lifecycle, remote sync, and
 headless Relay execution. CLI commands may update local metadata and request
 daemon actions, but they do not implement sync behavior themselves.
 
-`relay logging` talks to the daemon control endpoint. Logging settings are stored
-in daemon-wide plugin data, and the daemon applies changes to any active
+`relay logging` talks to the daemon control endpoint. Logging preferences are stored
+alongside update preferences in `~/Library/Application Support/relay/config.toml`
+on macOS, or `~/.config/relay/config.toml` on Linux and WSL. `XDG_CONFIG_HOME`
+overrides either default with `$XDG_CONFIG_HOME/relay/config.toml`.
+The daemon applies changes to its active
 headless runtimes. `--network` controls the upstream Relay network logging flag;
 enabling network logging also enables debug logging.
 

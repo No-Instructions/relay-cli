@@ -78,18 +78,28 @@ directories and control endpoints. Login state and synced folders are preserved.
 If replacement startup fails, it attempts to restore the previous executable
 and daemons. It retains both executables if recovery needs manual attention.
 
-Automatic updates are off by default. Enable daily checks while background sync
-is running with:
+Relay checks for newer releases daily and shows an update notice in interactive
+terminals. These checks download only version information. Automatic installation
+is off by default; we recommend enabling it to keep Relay up to date:
 
 ```sh
-relay update --auto on
+relay update --enable-automatic-updates
 ```
 
-Use `relay update --auto off` to disable them. `relay update --pin` keeps the current
+Automatic updates run while background sync is running. Use
+`relay update --disable-automatic-updates` to turn them off.
+`relay upgrade` is an alias for `relay update`, with the same options.
+`relay update --pin` keeps the current
 version until you run `relay update --unpin`. To select a specific published stable
 version, run `relay update --version 1.2.3`. `relay version` shows the installed version.
 
-Executables are kept under `~/.local/share/relay-cli/versions`. Set
+Notices go to stderr, use yellow in supported terminals, and respect `NO_COLOR`.
+They are suppressed for redirected commands, JSON output, and MCP. Version checks
+are cached for a day, including failures, and have a short timeout so an offline
+machine can still use the CLI. Foreground daemons also log newly discovered updates.
+
+Executables are kept under `~/Library/Application Support/relay/versions` on
+macOS, or `~/.local/share/relay-cli/versions` on Linux and WSL. Set
 `RMD_INSTALL_DIR` and `RMD_BIN_DIR` to absolute paths during installation to choose
 different locations. Updates discover the installation from the executable.
 `XDG_DATA_HOME`, when set, changes the default data location to
@@ -101,6 +111,38 @@ directory and retried the next day. An interrupted install or update can leave
 installer or updater is running. Restart stopped daemons with `relay start`, using
 their original `--state-dir` and environment, including any `RMD_STORAGE_KEY_FILE`.
 See [release maintenance](docs/releases.md) for recovery and packaging details.
+
+## Preferences
+
+User preferences live in `~/Library/Application Support/relay/config.toml` on
+macOS, or `~/.config/relay/config.toml` on Linux and WSL.
+`XDG_CONFIG_HOME` overrides either default with `$XDG_CONFIG_HOME/relay/config.toml`.
+Defaults are:
+
+```toml
+[updates]
+automatic = false
+notify = true
+# pinned_version = "1.2.3"
+
+[logging]
+debug = false
+network = false
+```
+
+The update and logging commands create or update this file. You can also edit
+it directly. `updates.notify = false` disables incidental version checks and
+notices; automatic installation is controlled independently by `updates.automatic`.
+Preferences apply across this user's installations and daemon state directories.
+Update policy is reread during checks; restart running daemons after editing
+logging preferences by hand. `relay logging` applies changes immediately to the
+selected daemon and saves them for future starts.
+
+Folder identity stays in each synced folder's `.relay/config.toml`. Credentials,
+connected-folder records, update timestamps, and caches are stored separately.
+Daemon state lives in `~/Library/Application Support/relay/state` on macOS, or
+`~/.local/state/relay` on Linux and WSL. Set `XDG_STATE_HOME` to use
+`$XDG_STATE_HOME/relay`, or pass `--state-dir` to select a specific state directory.
 
 ## Automation
 

@@ -3,6 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// Tests and their child processes must never read or change real preferences.
+process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-test-config-"));
+
 if (!process.env.RMD_STORAGE_KEY_FILE) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-test-key-"));
   const keyFile = path.join(directory, "storage.key");

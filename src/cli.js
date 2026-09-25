@@ -13,9 +13,11 @@ import { describeNetworkError, requestBinary } from "./network.js";
 import { isUnavailablePathError, openSafeFile, resolveSafePath, statSyncEntry } from "./safe-path.js";
 import { assertAuthServerMatches, normalizeAuthServer } from "./auth-server.js";
 import { embeddedRelease, cliInvocation } from "./release.js";
+import { readUserPreferences, updateLoggingPreferences, userConfigPath } from "./preferences.js";
+import { defaultStateDir } from "./user-paths.js";
 import {
   configureUpdates, findInstallation, registerDaemon, selectInstallation,
-  readRelease, registeredDaemons, scheduleAutomaticUpdates, updateInstallation, withInstallLock,
+  notifyUpdateForCommand, readRelease, registeredDaemons, scheduleUpdateChecks, updateInstallation, withInstallLock,
 } from "./updates.js";
 
 const RELAY_DIR = ".relay";
@@ -55,9 +57,11 @@ export async function main(argv) {
     throw new Error("RELAY_SERVER_URL is unsupported. Endpoints are selected at build time; unset it and use the production or staging build.");
   }
 
+  if (embeddedRelease) await notifyUpdateForCommand(command, rest);
+
   if (command === "init") return initCommand(rest);
   if (command === "version" || command === "--version" || command === "-v") return versionCommand(rest);
-  if (command === "update") return updateCommand(rest);
+  if (command === "update" || command === "upgrade") return updateCommand(rest);
   if (command === "_activate-install") {
     const [root, target] = rest.map((value) => path.resolve(value));
     if (rest.length !== 2 || path.dirname(target) !== path.join(root, "versions")) throw new Error("Invalid installation paths.");
@@ -101,8 +105,11 @@ Usage:
   relay stop
   relay version
   relay update [--check | --version <version>]
-  relay update --auto on|off
+  relay update --enable-automatic-updates
+  relay update --disable-automatic-updates
   relay update --pin | --unpin
+
+relay upgrade is an alias for relay update.
 `);
 }
 
@@ -123,18 +130,20 @@ async function versionCommand(argv) {
 
 async function updateCommand(argv) {
   const { options, positional } = parseArgs(argv);
-  if (positional.length || Object.keys(options).some((key) => !["auto", "version", "check", "pin", "unpin", "scheduled"].includes(key))) {
-    throw new Error("Usage: relay update [--check | --version <version> | --auto on|off | --pin | --unpin]");
+  if (positional.length || Object.keys(options).some((key) => !["auto", "enableAutomaticUpdates", "disableAutomaticUpdates", "version", "check", "pin", "unpin", "scheduled"].includes(key))) {
+    throw new Error("Usage: relay update [--check | --version <version> | --enable-automatic-updates | --disable-automatic-updates | --pin | --unpin]");
   }
   for (const option of ["auto", "version"]) {
     if (Object.hasOwn(options, option) && !options[option]) throw new Error(`--${option} requires a value.`);
   }
-  const actions = [options.auto !== undefined, options.version !== undefined, !!options.check, !!options.pin, !!options.unpin, !!options.scheduled].filter(Boolean).length;
+  const actions = [options.auto !== undefined, !!options.enableAutomaticUpdates, !!options.disableAutomaticUpdates, options.version !== undefined, !!options.check, !!options.pin, !!options.unpin, !!options.scheduled].filter(Boolean).length;
   if (actions > 1) throw new Error("Choose one update action at a time.");
+  if (options.enableAutomaticUpdates) options.auto = "on";
+  if (options.disableAutomaticUpdates) options.auto = "off";
   const installation = embeddedRelease ? await findInstallation() : null;
   if (!installation) throw new Error("Self-update requires an installer-managed release. Source checkouts are updated through Git.");
   if (options.auto !== undefined || options.pin || options.unpin) {
-    if (options.auto !== undefined && !["on", "off"].includes(options.auto)) throw new Error("Use relay update --auto on or --auto off.");
+    if (options.auto !== undefined && !["on", "off"].includes(options.auto)) throw new Error("Use relay update --enable-automatic-updates or --disable-automatic-updates.");
     const changes = options.auto !== undefined ? { automatic: options.auto === "on" }
       : { pinnedVersion: options.pin ? installation.release.version : null };
     const settings = await configureUpdates(installation, changes);
@@ -1120,7 +1129,7 @@ async function runForegroundDaemon(options) {
       }
       if (installation) {
         unregister = await registerDaemon(installation, { stateDir: paths.stateDir, pid: process.pid, control: options.control });
-        stopUpdates = scheduleAutomaticUpdates(installation);
+        stopUpdates = scheduleUpdateChecks(installation);
       }
     } catch (error) { await cleanup(); throw error; }
   };
@@ -1279,16 +1288,16 @@ async function createDaemonRuntime(stateDir) {
       return relayRuntime.resolveDeletionGate(decision, token);
     },
     async loggingStatus() {
-      const settings = await readPluginSettings(stateDir);
+      const { logging } = await readUserPreferences();
       return {
-        debugging: settings.debugging === true,
-        network: settings.enableNetworkLogging === true,
-        settingsPath: daemonPluginDataPath(stateDir),
+        debugging: logging.debug,
+        network: logging.network,
+        settingsPath: userConfigPath(),
         logFiles: [...runtime.headless.values()].map((relayRuntime) => relayRuntime.loggingStatus().logPath),
       };
     },
     async configureLogging(logging) {
-      await updatePluginSettings(stateDir, (settings) => applyLoggingPatch(settings, logging));
+      await updateLoggingPreferences(logging);
       for (const relayRuntime of runtime.headless.values()) {
         await relayRuntime.configureLogging(logging);
       }
@@ -2062,35 +2071,6 @@ function daemonPaths(stateDir) {
     connectedFile: path.join(root, "connected.json"),
     tokensFile: path.join(root, "tokens.json"),
   };
-}
-
-function daemonPluginDataPath(stateDir) {
-  return path.join(daemonPaths(stateDir).stateDir, "plugin-data.json");
-}
-
-async function readPluginSettings(stateDir) {
-  return (await readJsonOrNull(daemonPluginDataPath(stateDir))) ?? {};
-}
-
-async function updatePluginSettings(stateDir, updater) {
-  const file = daemonPluginDataPath(stateDir);
-  const current = await readPluginSettings(stateDir);
-  await writeJson(file, updater(current));
-}
-
-function applyLoggingPatch(settings, logging) {
-  const next = { ...settings };
-  if (typeof logging.debugging === "boolean") next.debugging = logging.debugging;
-  if (typeof logging.network === "boolean") {
-    next.enableNetworkLogging = logging.network;
-    if (logging.network) next.debugging = true;
-  }
-  return next;
-}
-
-function defaultStateDir() {
-  if (process.env.XDG_STATE_HOME) return path.join(process.env.XDG_STATE_HOME, "relay");
-  return path.join(os.homedir(), ".local", "state", "relay");
 }
 
 async function readPid(pidFile) {

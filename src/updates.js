@@ -3,6 +3,7 @@ import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { readUserPreferences, updateUserPreferences, userConfigPath } from "./preferences.js";
 
 const exec = promisify(execFile);
 export const RELEASE_URL = "https://github.com/No-Instructions/relay-cli/releases";
@@ -64,7 +65,7 @@ export async function findInstallation(executable = process.execPath) {
   if (!release) return null;
   const current = await fs.realpath(path.join(root, "current"));
   if (path.dirname(current) !== path.join(root, "versions")) throw new Error("Invalid managed installation link.");
-  return { root, versionDir, release };
+  return { root, versionDir, release, configFile: userConfigPath() };
 }
 
 export async function withInstallLock(root, action) {
@@ -78,15 +79,20 @@ export async function withInstallLock(root, action) {
   finally { await fs.rmdir(lock); }
 }
 
-export async function readUpdateSettings(root) {
-  return { automatic: false, pinnedVersion: null, lastAttempt: 0, ...await readJson(path.join(root, "updates.json"), {}) };
+export async function readUpdateSettings(root, configFile) {
+  const { updates } = await readUserPreferences(configFile);
+  const state = await readJson(path.join(root, "update-state.json"), {});
+  return { automatic: updates.automatic, notify: updates.notify, pinnedVersion: updates.pinned_version ?? null, lastAttempt: state.lastAttempt ?? 0 };
 }
 
 export async function configureUpdates(installation, changes) {
   return withInstallLock(installation.root, async () => {
-    const settings = { ...await readUpdateSettings(installation.root), ...changes };
-    await writeJson(path.join(installation.root, "updates.json"), settings);
-    return settings;
+    const updates = {};
+    if (changes.automatic !== undefined) updates.automatic = changes.automatic;
+    if (changes.pinnedVersion !== undefined) updates.pinned_version = changes.pinnedVersion;
+    if (changes.notify !== undefined) updates.notify = changes.notify;
+    await updateUserPreferences({ updates }, installation.configFile);
+    return readUpdateSettings(installation.root, installation.configFile);
   });
 }
 
@@ -94,8 +100,8 @@ export function automaticUpdateDue(settings, now = Date.now()) {
   return settings.automatic === true && !settings.pinnedVersion && now - settings.lastAttempt >= UPDATE_INTERVAL;
 }
 
-async function responseFor(url, fetchImpl) {
-  const response = await fetchImpl(url, { signal: AbortSignal.timeout(120_000) });
+async function responseFor(url, fetchImpl, signal = AbortSignal.timeout(120_000)) {
+  const response = await fetchImpl(url, { signal });
   if (!response.ok) throw new Error(`Release download failed (HTTP ${response.status}). Check your connection and whether a release has been published.`);
   return response;
 }
@@ -116,14 +122,75 @@ async function download(url, file, fetchImpl) {
   return hash.digest("hex");
 }
 
-async function textAt(url, fetchImpl) {
-  const response = await responseFor(url, fetchImpl);
+async function textAt(url, fetchImpl, signal) {
+  const response = await responseFor(url, fetchImpl, signal);
   let result = "";
   for await (const chunk of response.body) {
     result += Buffer.from(chunk).toString("utf8");
     if (result.length > 16_384) throw new Error("Release metadata is too large.");
   }
   return result.trim();
+}
+
+// Notices only fetch the small version manifest. Cache failed attempts too, so
+// an offline machine does not delay every command or repeatedly hit GitHub.
+export async function checkForUpdates(installation, {
+  fetchImpl = globalThis.fetch, now = Date.now(), timeout = 1500,
+} = {}) {
+  const file = path.join(installation.root, "update-check.json");
+  let cached = {};
+  const due = () => !cached.lastAttempt || now - cached.lastAttempt >= UPDATE_INTERVAL;
+  try {
+    cached = await readJson(file, {}) ?? {};
+    if (due()) await withInstallLock(installation.root, async () => {
+      cached = await readJson(file, {}) ?? {};
+      if (!due()) return;
+      cached = { ...cached, lastAttempt: now };
+      await writeJson(file, cached);
+      const latestVersion = validateVersion(await textAt(
+        `${RELEASE_URL}/latest/download/version.txt`, fetchImpl, AbortSignal.timeout(timeout),
+      ));
+      cached = { ...cached, latestVersion };
+      await writeJson(file, cached);
+    });
+    return validateVersion(cached.latestVersion);
+  } catch {
+    // Network, permissions, and concurrent updates must not break ordinary CLI
+    // commands. A previously confirmed version is still useful while offline.
+    return VERSION.test(cached.latestVersion ?? "") ? cached.latestVersion : null;
+  }
+}
+
+export async function getUpdateNotice(installation, options) {
+  const settings = await readUpdateSettings(installation.root, installation.configFile);
+  if (!settings.notify) return null;
+  const latest = await checkForUpdates(installation, options);
+  if (!latest || compareVersions(latest, installation.release.version) <= 0) return null;
+  const action = settings.pinnedVersion
+    ? `Pinned to ${settings.pinnedVersion}. Run relay update --unpin, then relay update.`
+    : `Run relay update.${settings.automatic ? "" : " Enable automatic updates with relay update --enable-automatic-updates."}`;
+  return `Update available: relay ${installation.release.version} → ${latest}. ${action}`;
+}
+
+export function printUpdateNotice(message, { stream = process.stderr, env = process.env } = {}) {
+  const color = stream.isTTY && !Object.hasOwn(env, "NO_COLOR") && env.TERM !== "dumb";
+  stream.write(color ? `\u001b[33m${message}\u001b[0m\n` : `${message}\n`);
+}
+
+export async function notifyUpdateForCommand(command, args, {
+  installation, stdout = process.stdout, stderr = process.stderr, env = process.env, ...options
+} = {}) {
+  // Protocols, redirected output, verification, and the updater itself should
+  // never gain extra output or perform an incidental version check.
+  if (!stdout.isTTY || !stderr.isTTY || !command || command.startsWith("_") ||
+      ["mcp", "help", "--help", "-h", "version", "--version", "-v", "update", "upgrade"].includes(command) ||
+      args.some(arg => ["--json", "--format", "--foreground"].includes(arg) || arg.startsWith("--json=") || arg.startsWith("--format="))) return;
+  try {
+    installation ??= await findInstallation();
+    if (!installation) return;
+    const message = await getUpdateNotice(installation, options);
+    if (message) printUpdateNotice(message, { stream: stderr, env });
+  } catch { /* Update advice must not prevent the requested command. */ }
 }
 
 export async function selectInstallation(root, target) {
@@ -174,9 +241,9 @@ export async function updateInstallation(installation, {
     const previous = await fs.realpath(path.join(root, "current"));
     const installed = await readRelease(previous);
     if (!installed) throw new Error("This installation has no release metadata.");
-    const settings = await readUpdateSettings(root);
+    const settings = await readUpdateSettings(root, installation.configFile);
     if (scheduled && !automaticUpdateDue(settings)) return { skipped: true };
-    if (scheduled) await writeJson(path.join(root, "updates.json"), { ...settings, lastAttempt: Date.now() });
+    if (scheduled) await writeJson(path.join(root, "update-state.json"), { lastAttempt: Date.now() });
     const requested = version ?? settings.pinnedVersion ?? await textAt(`${RELEASE_URL}/latest/download/version.txt`, fetchImpl);
     validateVersion(requested);
     if (settings.pinnedVersion && requested !== settings.pinnedVersion) throw new Error("This installation is pinned. Run relay update --unpin first.");
@@ -246,14 +313,22 @@ export async function registeredDaemons(root) {
 }
 
 /** The updater runs outside the daemon so it can wait for that daemon to exit. */
-export function scheduleAutomaticUpdates(installation, { spawnWorker, onError = console.error, interval = 60_000 } = {}) {
+export function scheduleUpdateChecks(installation, {
+  spawnWorker, onError = console.error, onNotice = printUpdateNotice,
+  fetchImpl = globalThis.fetch, interval = 60_000,
+} = {}) {
   let worker = null;
   let checking = false;
+  let lastNotice = null;
   const tick = async () => {
     if (checking || worker) return;
     checking = true;
     try {
-      if (!automaticUpdateDue(await readUpdateSettings(installation.root))) return;
+      if (!automaticUpdateDue(await readUpdateSettings(installation.root, installation.configFile))) {
+        const message = await getUpdateNotice(installation, { fetchImpl });
+        if (message && message !== lastNotice) { onNotice(message); lastNotice = message; }
+        return;
+      }
       const run = spawnWorker ?? (() => spawn(path.join(installation.versionDir, "relay"), [
         "update", "--scheduled",
       ], { detached: true, stdio: "ignore" }));

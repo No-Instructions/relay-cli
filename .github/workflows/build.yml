@@ -75,6 +75,7 @@ jobs:
           RMD_INSTALL_DIR: ${{ runner.temp }}/relay cli
           RMD_BIN_DIR: ${{ runner.temp }}/relay bin
           RMD_STORAGE_KEY_FILE: ${{ runner.temp }}/storage.key
+          XDG_CONFIG_HOME: ${{ runner.temp }}/config
         run: |
           sh -n install.sh
           sh install.sh
@@ -85,9 +86,54 @@ jobs:
           "$RMD_BIN_DIR/relay" status "$RUNNER_TEMP/notes" --state-dir "$RUNNER_TEMP/state"
           trap '"$RMD_BIN_DIR/relay" stop --state-dir "$RUNNER_TEMP/state"' EXIT
           "$RMD_BIN_DIR/relay" start --state-dir "$RUNNER_TEMP/state"
-          "$RMD_BIN_DIR/relay" update --auto off
+          "$RMD_BIN_DIR/relay" upgrade --enable-automatic-updates
+          "$RMD_BIN_DIR/relay" update --disable-automatic-updates
           "$RMD_BIN_DIR/relay" update --pin
           "$RMD_BIN_DIR/relay" update --unpin
+      - name: Exercise native default directories
+        shell: sh
+        env:
+          RMD_RELEASE_DIR: ${{ runner.temp }}/releases
+          RMD_STORAGE_KEY_FILE: ${{ runner.temp }}/storage.key
+          RMD_INSTALL_DIR: ''
+          RMD_BIN_DIR: ''
+          XDG_CONFIG_HOME: ''
+          XDG_DATA_HOME: ''
+          XDG_STATE_HOME: ''
+        run: |
+          case "$(uname -s)" in
+            Darwin)
+              relay_install_dir="$HOME/Library/Application Support/relay"
+              relay_config="$relay_install_dir/config.toml"
+              relay_state="$relay_install_dir/state"
+              ;;
+            Linux)
+              relay_install_dir="$HOME/.local/share/relay-cli"
+              relay_config="$HOME/.config/relay/config.toml"
+              relay_state="$HOME/.local/state/relay"
+              ;;
+          esac
+          sh install.sh
+          test -L "$relay_install_dir/current"
+          test -L "$HOME/.local/bin/relay"
+          "$HOME/.local/bin/relay" version --verify --json
+          "$HOME/.local/bin/relay" upgrade --enable-automatic-updates
+          test -f "$relay_config"
+          "$HOME/.local/bin/relay" update --disable-automatic-updates
+          trap '"$HOME/.local/bin/relay" stop' EXIT
+          "$HOME/.local/bin/relay" start
+          "$HOME/.local/bin/relay" status --json > "$RUNNER_TEMP/native-status.json"
+          "$HOME/.local/bin/relay" logging status --json > "$RUNNER_TEMP/native-logging.json"
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import fs from "node:fs";
+            const [state, config] = process.argv.slice(1);
+            const status = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/native-status.json`));
+            const logging = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/native-logging.json`));
+            assert.equal(status.daemon.running, true);
+            assert.equal(status.daemon.stateDir, state);
+            assert.equal(logging.settingsPath, config);
+          ' "$relay_state" "$relay_config"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.platform }}

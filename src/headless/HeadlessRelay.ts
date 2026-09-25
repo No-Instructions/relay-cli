@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { readUserPreferences, updateLoggingPreferences, userConfigPath } from "../preferences.js";
 import { createHash } from "node:crypto";
 import { App, TFile, TFolder, normalizePath, type TAbstractFile } from "./obsidian-shim";
 import { installLogRouting, runWithLogSink } from "./log-context";
@@ -88,7 +89,7 @@ const DEFAULT_SETTINGS: RelaySettings = {
   sharedFolders: [],
 };
 
-class JsonStorage<T> implements StorageAdapter<T> {
+class JsonStorage<T extends RelaySettings> implements StorageAdapter<T> {
   private saveCounter = 0;
   private saveQueue = Promise.resolve();
 
@@ -98,7 +99,8 @@ class JsonStorage<T> implements StorageAdapter<T> {
     try {
       const text = await fs.readFile(this.file, "utf8");
       if (!text.trim()) return null;
-      return JSON.parse(text) as T;
+      const { logging } = await readUserPreferences();
+      return { ...JSON.parse(text), debugging: logging.debug, enableNetworkLogging: logging.network } as T;
     } catch (error: any) {
       if (error.code === "ENOENT") return null;
       throw error;
@@ -106,7 +108,8 @@ class JsonStorage<T> implements StorageAdapter<T> {
   }
 
   async saveData(data: T): Promise<void> {
-    const serialized = `${JSON.stringify(data, null, 2)}\n`;
+    const { debugging: _debugging, enableNetworkLogging: _network, ...state } = data;
+    const serialized = `${JSON.stringify(state, null, 2)}\n`;
     this.saveQueue = this.saveQueue
       .catch(() => {})
       .then(() => this.writeSerialized(serialized));
@@ -683,16 +686,7 @@ export class HeadlessRelay {
   }
 
   private async configureLoggingRouted(input: { debugging?: boolean; network?: boolean }): Promise<LoggingStatus> {
-    await this.settings.load();
-    await this.settings.update((settings) => {
-      const next: RelaySettings = { ...settings };
-      if (input.debugging !== undefined) next.debugging = input.debugging;
-      if (input.network !== undefined) {
-        next.enableNetworkLogging = input.network;
-        if (input.network) next.debugging = true;
-      }
-      return next;
-    });
+    await updateLoggingPreferences(input);
     await this.settings.load();
     const settings = this.settings.get();
     setDebugging(settings.debugging === true);
@@ -711,7 +705,7 @@ export class HeadlessRelay {
       debugging: settings.debugging === true,
       network: settings.enableNetworkLogging === true,
       logPath: path.join(this.input.folderPath, ".relay", "relay.log"),
-      settingsPath: path.join(this.input.stateDir, "plugin-data.json"),
+      settingsPath: userConfigPath(),
     };
   }
 
@@ -1088,7 +1082,8 @@ export class HeadlessRelay {
   private async applyHeadlessRuntimeSettings(): Promise<void> {
     // Endpoint selection belongs to the build. Ignore saved plugin enterprise
     // tenant settings so they cannot redirect this headless runtime.
-    await this.settings.update((settings) => ({ ...settings, endpoints: {} }));
+    const { logging } = await readUserPreferences();
+    await this.settings.update((settings) => ({ ...settings, endpoints: {}, debugging: logging.debug, enableNetworkLogging: logging.network }));
     const env = (globalThis as any).process?.env as Record<string, string | undefined> | undefined;
     const enableDebug = env?.RELAY_HEADLESS_DEBUG === "1";
     const enableNetworkLogging = env?.RELAY_HEADLESS_NETWORK_LOGGING === "1";

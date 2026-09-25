@@ -25,7 +25,10 @@ main() (
     --help|-h)
       printf '%s\n' 'Install Relay CLI: sh install.sh' \
         'Optional: RMD_INSTALL_DIR, RMD_BIN_DIR, RMD_VERSION, RMD_RELEASE_DIR (offline artifacts).' \
-        'Default locations: ~/.local/share/relay-cli and ~/.local/bin/relay.'
+        'Command: ~/.local/bin/relay.' \
+        'macOS installation: ~/Library/Application Support/relay.' \
+        'Linux/WSL installation: ~/.local/share/relay-cli.' \
+        'XDG_DATA_HOME overrides the default installation with $XDG_DATA_HOME/relay-cli.'
       exit 0 ;;
     '') ;;
     *) fail "Unknown option: $1" ;;
@@ -53,7 +56,15 @@ main() (
     *) fail 'This installer supports x86-64 and ARM64 machines.' ;;
   esac
 
-  install_dir=${RMD_INSTALL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/relay-cli}
+  if [ -n "${RMD_INSTALL_DIR:-}" ]; then
+    install_dir=$RMD_INSTALL_DIR
+  elif [ -n "${XDG_DATA_HOME:-}" ]; then
+    install_dir=$XDG_DATA_HOME/relay-cli
+  elif [ "$platform" = darwin ]; then
+    install_dir="$HOME/Library/Application Support/relay"
+  else
+    install_dir=$HOME/.local/share/relay-cli
+  fi
   bin_dir=${RMD_BIN_DIR:-$HOME/.local/bin}
   case "$install_dir" in /*) ;; *) fail 'RMD_INSTALL_DIR must be an absolute path.' ;; esac
   case "$bin_dir" in /*) ;; *) fail 'RMD_BIN_DIR must be an absolute path.' ;; esac
@@ -126,7 +137,8 @@ main() (
   esac
   quoted_launcher=$(quote "$launcher")
   printf '\nGet started:\n  %s login\n  %s clone\n  %s start\n' "$quoted_launcher" "$quoted_launcher" "$quoted_launcher"
-  printf '\nUpdate with relay update. Enable automatic updates with relay update --auto on.\n'
+  printf '\nKeep Relay up to date (recommended):\n  %s update --enable-automatic-updates\n' "$quoted_launcher"
+  printf '\nRelay shows update notices by default. Update manually with relay update (or relay upgrade).\n'
 )
 
 # Keeping execution at the end prevents a truncated piped download from
