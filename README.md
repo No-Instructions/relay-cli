@@ -235,6 +235,13 @@ browser-like storage. Login tokens are stored inside the encrypted browser
 store; `--token-file` is an input mechanism for automation and is not copied to
 `tokens.json`.
 
+`relay logout` stops the daemon for the selected state directory and waits for
+it to exit before clearing the local login and cached authentication records.
+If the live daemon cannot be reached or stopped, logout fails without clearing
+those records. Other state directories are unaffected. Logout does not revoke
+server-side tokens, erase earlier backups, or remove a token supplied in your
+own `--token-file`.
+
 ## Daemon
 
 `relay start` runs a per-user background daemon. Connected folders are discovered

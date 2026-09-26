@@ -6,6 +6,8 @@ The user-facing model is:
 
 - `relay start` starts background sync.
 - `relay stop` stops background sync.
+- `relay logout` stops the selected daemon, waits for shutdown, and clears local
+  login records. It does not revoke server-side tokens.
 - `relay auth status` reports login state and the storage-key backend.
 - `relay init <folder>` prepares a local folder for Relay.
 - `relay clone <folder>` copies an existing Relay folder to this machine.

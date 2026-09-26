@@ -588,10 +588,49 @@ async function loginCommand(argv) {
 async function logoutCommand(argv) {
   const { options } = parseArgs(argv);
   const paths = daemonPaths(options.stateDir);
-  const storage = await openEncryptedAuthStorage(paths);
-  storage.clearStoredLogin();
-  await fs.rm(paths.tokensFile, { force: true });
-  console.log("Logged out.");
+  await withDaemonStateLock(paths, async () => {
+    await stopDaemonForLogout(paths);
+    const storage = await openEncryptedAuthStorage(paths);
+    storage.clearStoredLogin();
+    await fs.rm(paths.tokensFile, { force: true });
+  });
+  console.log("Logged out. Local credentials cleared; server-side tokens have not been revoked.");
+}
+
+async function withDaemonStateLock(paths, operation) {
+  await ensureStateDirectory(paths.stateDir);
+  const lock = path.join(paths.stateDir, "daemon-lifecycle.lock");
+  const deadline = Date.now() + 45_000;
+  while (true) {
+    try { await fs.mkdir(lock, { mode: 0o700 }); break; }
+    catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new Error(`Daemon state is locked at ${lock}. If no Relay start or logout command is running, remove this stale lock directory and retry.`);
+      await sleep(50);
+    }
+  }
+  try { return await operation(); }
+  finally { await fs.rmdir(lock); }
+}
+
+async function stopDaemonForLogout(paths) {
+  const control = await liveControlEndpoint({ stateDir: paths.stateDir });
+  if (!control) {
+    const pid = await readPid(paths.pidFile);
+    if (pid && isProcessRunning(pid)) throw new Error(`Cannot reach daemon ${pid}. Stop it before logging out; local credentials were not cleared.`);
+    return;
+  }
+  const response = await requestControl(control, { type: "status" });
+  const status = response.status;
+  if (!response.ok || !Number.isInteger(status?.pid) || status.pid <= 0 ||
+      typeof status.stateDir !== "string" || await fs.realpath(status.stateDir) !== await fs.realpath(paths.stateDir)) {
+    throw new Error("Daemon ownership does not match this state directory; local credentials were not cleared.");
+  }
+  const shutdown = await requestControl(control, { type: "shutdown" });
+  if (!shutdown.ok) throw new Error("Daemon refused shutdown; local credentials were not cleared.");
+  const deadline = Date.now() + 30_000;
+  while (isProcessRunning(status.pid) && Date.now() < deadline) await sleep(50);
+  if (isProcessRunning(status.pid)) throw new Error("Daemon did not finish shutting down; local credentials were not cleared.");
 }
 
 async function authCommand(argv) {
@@ -1142,8 +1181,9 @@ async function runForegroundDaemon(options) {
   };
   // Serialize normal starts with updates, so the updater cannot miss a daemon
   // created between discovering registrations and changing the current link.
-  if (installation && !options.updateRestart) await withInstallLock(installation.root, initialize);
-  else await initialize();
+  const startWithStateLock = () => withDaemonStateLock(paths, initialize);
+  if (installation && !options.updateRestart) await withInstallLock(installation.root, startWithStateLock);
+  else await startWithStateLock();
 
   if (options.control) {
     console.log(JSON.stringify({
