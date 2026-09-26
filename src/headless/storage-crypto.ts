@@ -3,16 +3,18 @@ import {
   createDecipheriv,
   createHmac,
   randomBytes,
+  randomUUID,
 } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { readUserPreferences } from "../preferences.js";
+import { systemKeychain } from "./system-keychain";
 
 const KEY_BYTES = 32;
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;
 const ENVELOPE_MAGIC = Buffer.from("RMDENC01", "ascii");
-const KEYRING_SERVICE = "dev.system3.relay-cli";
-const KEYRING_ACCOUNT = "browser-storage-v1";
 
 export type StorageKeyInput = Uint8Array | Buffer;
 export type StorageKeychain = {
@@ -33,89 +35,101 @@ export async function resolveStorageKey(
     return validateKey(Buffer.from(input.explicitKey), "explicit storage key");
   }
 
-  const keyFile = process.env.RMD_STORAGE_KEY_FILE;
-  if (keyFile) {
-    return readKeyFile(keyFile);
+  const explicitKeyFile = process.env.RMD_STORAGE_KEY_FILE;
+  if (explicitKeyFile) {
+    return readKeyFile(explicitKeyFile);
   }
 
-  const automaticKeyFile = path.join(path.dirname(input.storageDbPath), "storage.key");
-  if (await fileExists(automaticKeyFile)) return readKeyFile(automaticKeyFile);
-
-  let entry: StorageKeychain;
-  try {
-    entry = input.keychain ?? await systemKeychain();
-  } catch (error) {
-    return createFallbackKey(input.storageDbPath, automaticKeyFile, error);
-  }
-
-  let stored: string | undefined;
-  try {
-    stored = await entry.getPassword();
-  } catch (error) {
-    return createFallbackKey(input.storageDbPath, automaticKeyFile, error);
-  }
-  if (stored) return decodeKey(stored, "system keychain storage key");
-
-  const racedFallback = await readKeyFileIfExists(automaticKeyFile);
-  if (racedFallback) return racedFallback;
-  if (await databaseExists(input.storageDbPath)) {
-    const fallbackAfterDatabase = await readKeyFileIfExists(automaticKeyFile);
-    if (fallbackAfterDatabase) return fallbackAfterDatabase;
-    throw missingExistingDatabaseKey(input.storageDbPath);
-  }
-
-  const generated = randomBytes(KEY_BYTES);
-  try {
-    await entry.setPassword(generated.toString("hex"));
-    return generated;
-  } catch (error) {
-    return createFallbackKey(input.storageDbPath, automaticKeyFile, error);
-  }
-}
-
-async function systemKeychain(): Promise<StorageKeychain> {
-  const { AsyncEntry } = await import("@napi-rs/keyring");
-  return new AsyncEntry(KEYRING_SERVICE, KEYRING_ACCOUNT);
-}
-
-async function createFallbackKey(
-  storageDbPath: string,
-  keyFile: string,
-  cause: unknown,
-): Promise<Buffer> {
-  const existingFallback = await readKeyFileIfExists(keyFile);
-  if (existingFallback) return existingFallback;
-  if (await databaseExists(storageDbPath)) {
-    const fallbackAfterDatabase = await readKeyFileIfExists(keyFile);
-    if (fallbackAfterDatabase) return fallbackAfterDatabase;
-    throw new Error(
-      `Unable to access the system keychain, and Relay storage already exists at ${storageDbPath}. ` +
-      "Refusing to create a different key because that could make existing data inaccessible. " +
-      "Restore keychain access or set RMD_STORAGE_KEY_FILE to the original storage key.",
-      { cause },
-    );
-  }
-
-  const generated = randomBytes(KEY_BYTES);
-  await fs.mkdir(path.dirname(keyFile), { recursive: true, mode: 0o700 });
-  const temporary = `${keyFile}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
-  try {
-    await fs.writeFile(temporary, `${generated.toString("hex")}\n`, {
-      encoding: "utf8",
-      flag: "wx",
-      mode: 0o600,
-    });
-    if (process.platform !== "win32") await fs.chmod(temporary, 0o600);
-    try {
-      await fs.link(temporary, keyFile);
-      console.warn(
-        `System keychain unavailable; created an owner-only Relay storage key at ${keyFile}. ` +
-        "Back up this file with the state directory.",
-      );
-      return generated;
-    } catch (error: any) {
+  const mode = (await readUserPreferences()).security.key_storage;
+  const stateDir = path.dirname(input.storageDbPath);
+  const keyFile = path.join(stateDir, "storage.key");
+  const keychainFile = path.join(stateDir, "storage.keychain");
+  await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
+  // Serialize first use across processes so they cannot persist different keys.
+  const lock = path.join(stateDir, "storage-key.lock");
+  const deadline = Date.now() + 35_000;
+  while (true) {
+    try { await fs.mkdir(lock, { mode: 0o700 }); break; }
+    catch (error: any) {
       if (error.code !== "EEXIST") throw error;
-      return readKeyFile(keyFile);
+      if (Date.now() >= deadline) throw new Error(`Storage key is locked at ${lock}. If no Relay command is running, remove this stale lock directory and retry.`);
+      await sleep(50);
+    }
+  }
+  try {
+    if (mode === "file") {
+      if (await fileExists(keychainFile)) {
+        throw new Error('This state directory uses keychain storage. Set security.key_storage = "keychain" in config.toml, or use a new --state-dir for file storage.');
+      }
+      return await createFileKey(input.storageDbPath, keyFile);
+    }
+    if (await fileExists(keyFile)) {
+      throw new Error('This state directory already has a storage.key file. To use keychain storage, stop Relay and select a new --state-dir, then log in and reconnect your folders. Keep the original state and key together until no longer needed.');
+    }
+    let account: string;
+    try {
+      account = (await fs.readFile(keychainFile, "utf8")).trim();
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(account)) {
+        throw new Error(`Invalid keychain entry identifier at ${keychainFile}.`);
+      }
+    } catch (error: any) {
+      if (error.code !== "ENOENT") throw error;
+      if (await databaseExists(input.storageDbPath)) throw missingExistingDatabaseKey(input.storageDbPath);
+      account = randomUUID();
+      await writeDurableFile(keychainFile, `${account}\n`);
+    }
+    let entry: StorageKeychain;
+    let stored: string | undefined;
+    try {
+      entry = input.keychain ?? await systemKeychain(`browser-storage-${account}`);
+      stored = await entry.getPassword();
+    } catch (error) {
+      throw keychainUnavailable(error);
+    }
+    if (stored !== undefined) return decodeKey(stored, "system keychain storage key");
+    if (await databaseExists(input.storageDbPath)) throw missingExistingDatabaseKey(input.storageDbPath);
+    const generated = randomBytes(KEY_BYTES);
+    try {
+      await entry.setPassword(generated.toString("hex"));
+      if (await entry.getPassword() !== generated.toString("hex")) throw new Error("Keychain did not retain the storage key.");
+    } catch (error) {
+      throw keychainUnavailable(error);
+    }
+    return generated;
+  } finally {
+    await fs.rmdir(lock);
+  }
+}
+
+function keychainUnavailable(cause: unknown): Error {
+  return new Error(
+    "Cannot access the selected system keychain. Unlock or restore keychain access and retry. " +
+    "Relay will not fall back to a key file. On Linux/WSL, install secret-tool and run a persistent Secret Service keyring.",
+    { cause },
+  );
+}
+
+async function createFileKey(storageDbPath: string, keyFile: string): Promise<Buffer> {
+  if (await fileExists(keyFile)) return readKeyFile(keyFile);
+  if (await databaseExists(storageDbPath)) throw missingExistingDatabaseKey(storageDbPath);
+  const generated = randomBytes(KEY_BYTES);
+  await writeDurableFile(keyFile, `${generated.toString("hex")}\n`);
+  return generated;
+}
+
+async function writeDurableFile(file: string, value: string): Promise<void> {
+  const temporary = `${file}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  try {
+    const handle = await fs.open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(value, "utf8");
+      await handle.sync();
+    } finally { await handle.close(); }
+    await fs.rename(temporary, file);
+    if (process.platform !== "win32") {
+      const directory = await fs.open(path.dirname(file), "r");
+      try { await directory.sync(); }
+      finally { await directory.close(); }
     }
   } finally {
     await fs.rm(temporary, { force: true });
@@ -155,16 +169,11 @@ async function fileExists(file: string): Promise<boolean> {
   }
 }
 
-async function readKeyFileIfExists(keyFile: string): Promise<Buffer | null> {
-  if (!await fileExists(keyFile)) return null;
-  return readKeyFile(keyFile);
-}
-
 function missingExistingDatabaseKey(dbPath: string): Error {
   return new Error(
-    `The system keychain has no Relay storage key, but Relay storage already exists at ${dbPath}. ` +
-    "Refusing to replace the missing key. Restore the keychain entry or set " +
-    "RMD_STORAGE_KEY_FILE to the original storage key.",
+    `The selected storage backend has no Relay storage key, but Relay storage already exists at ${dbPath}. ` +
+    "Refusing to replace the missing key. Restore the original storage.key or keychain entry and storage.keychain identifier, " +
+    "select the original backend in config.toml, or set RMD_STORAGE_KEY_FILE to the original storage key.",
   );
 }
 

@@ -602,6 +602,13 @@ async function authCommand(argv) {
   const storage = await openEncryptedAuthStorage(paths);
   const login = storage.readStoredLogin();
   console.log(login ? `Logged in to ${login.server}.` : "Not logged in.");
+  const keyFile = process.env.RMD_STORAGE_KEY_FILE;
+  const preferences = await readUserPreferences();
+  console.log(keyFile
+    ? `Storage key: file (${keyFile}, from RMD_STORAGE_KEY_FILE).`
+    : preferences.security.key_storage === "keychain"
+      ? "Storage key: system keychain."
+      : `Storage key: file (${path.join(paths.stateDir, "storage.key")}).`);
 }
 
 async function loadHeadlessBundle() {

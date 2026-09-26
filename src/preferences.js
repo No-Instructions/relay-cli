@@ -7,13 +7,17 @@ import { userConfigPath } from "./user-paths.js";
 export { userConfigPath } from "./user-paths.js";
 
 function validate(config, file) {
-  for (const [section, keys] of Object.entries({ updates: ["automatic", "notify"], logging: ["debug", "network"] })) {
+  for (const [section, keys] of Object.entries({ updates: ["automatic", "notify"], logging: ["debug", "network"], security: [] })) {
     const values = config[section];
     if (values === undefined) continue;
     if (!values || typeof values !== "object" || Array.isArray(values)) throw new Error(`${file}: [${section}] must be a table.`);
     for (const key of keys) {
       if (values[key] !== undefined && typeof values[key] !== "boolean") throw new Error(`${file}: ${section}.${key} must be true or false.`);
     }
+  }
+  const keyStorage = config.security?.key_storage;
+  if (keyStorage !== undefined && !["file", "keychain"].includes(keyStorage)) {
+    throw new Error(`${file}: security.key_storage must be "file" or "keychain".`);
   }
   const pin = config.updates?.pinned_version;
   if (pin !== undefined && (typeof pin !== "string" || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(pin))) {
@@ -35,7 +39,7 @@ async function readDocument(file) {
 function withDefaults(config) {
   const logging = { debug: false, network: false, ...config.logging };
   if (logging.network) logging.debug = true;
-  return { ...config, updates: { automatic: false, notify: true, ...config.updates }, logging };
+  return { ...config, updates: { automatic: false, notify: true, ...config.updates }, logging, security: { key_storage: "file", ...config.security } };
 }
 
 export async function readUserPreferences(file = userConfigPath()) {

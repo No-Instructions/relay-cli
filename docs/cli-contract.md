@@ -6,6 +6,7 @@ The user-facing model is:
 
 - `relay start` starts background sync.
 - `relay stop` stops background sync.
+- `relay auth status` reports login state and the storage-key backend.
 - `relay init <folder>` prepares a local folder for Relay.
 - `relay clone <folder>` copies an existing Relay folder to this machine.
 - `relay connect <folder>` starts syncing a local folder.
@@ -37,6 +38,14 @@ identity and control-plane state for that folder.
 
 User login state and daemon state do not belong in `.relay/`. They live in the
 user's state directory.
+
+The storage key defaults to an owner-only `storage.key` file in that directory.
+User preferences can opt in to OS keychain storage with
+`[security] key_storage = "keychain"`. Linux/WSL keychain mode requires
+`secret-tool` and a persistent Secret Service collection. Explicit
+`RMD_STORAGE_KEY_FILE` overrides this preference. Keychain failures never trigger
+a fallback to a disk key. Backend changes require a fresh state directory;
+see the [storage and backup guidance](../README.md#headless-sync).
 
 The headless runtime exposes browser-like `localStorage` and `indexedDB`
 capabilities to the copied Relay plugin code. Both are backed by SQLite so

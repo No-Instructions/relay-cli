@@ -128,6 +128,9 @@ notify = true
 [logging]
 debug = false
 network = false
+
+[security]
+key_storage = "file" # opt in with "keychain"
 ```
 
 The update and logging commands create or update this file. You can also edit
@@ -181,21 +184,47 @@ The headless runtime gives Relay browser-like storage APIs backed by SQLite, so
 local storage and IndexedDB state survive daemon restarts.
 
 SQLite record values, including IndexedDB keys and values, are encrypted with
-authenticated AES-256-GCM before they reach the database. Interactive installs
-keep the random storage master key in the operating system keychain. If the
-keychain is unavailable when a fresh store is created, Relay CLI automatically
-creates `storage.key` in the state directory with mode `0600`. Back up this file
-with the state directory; losing it makes the encrypted store unreadable.
+authenticated AES-256-GCM before they reach the database. By default, Relay
+creates a random master key in `storage.key` in the state directory with Unix
+mode `0600`. Keep that file with the database when restoring file-backed state;
+losing it makes the encrypted store unreadable. Someone who obtains both files
+can decrypt the stored credentials and other encrypted records.
 
-Headless servers can instead provide a managed key through
-`RMD_STORAGE_KEY_FILE`; the file must be owner-only and contain exactly 64
-hexadecimal characters. An explicit key file takes precedence over both the
-automatic file and the system keychain. Relay CLI never falls back to plaintext
-storage.
+To keep the key outside Relay's state directory, set this in your user
+`config.toml` before first login:
 
-If an encrypted database already exists without `storage.key`, a missing or
-temporarily unavailable keychain causes startup to stop. Relay CLI will not
-silently create a replacement key that cannot decrypt existing data.
+```toml
+[security]
+key_storage = "keychain"
+```
+
+On macOS, this uses Keychain. On Linux and WSL, it requires `secret-tool`
+(`libsecret-tools` on Debian/Ubuntu) and a running Secret Service with a persistent
+default collection. Relay does not use the Linux kernel's volatile keyring.
+Keychain mode stops with an error if access fails; it never falls back to a key
+file. The state directory contains a non-secret `storage.keychain` identifier,
+which must be preserved with the database. Restoring that state also requires
+the corresponding OS keychain entry.
+
+Choose the backend before creating state. Changing the setting does not convert
+existing state: stop Relay, select a fresh state directory using `XDG_STATE_HOME`
+or `--state-dir`, then log in and reconnect your folders. Preserve the original
+state and its key until no longer needed. Restart daemons after changing the
+setting. `relay auth status` reports the selected key backend.
+
+Automation can provide a managed key through `RMD_STORAGE_KEY_FILE`. That file
+must be owner-only and contain exactly 64 hexadecimal characters. This explicit
+override takes precedence over `security.key_storage`, including keychain mode.
+Relay never falls back to plaintext or generates a replacement key for an
+existing database whose original key is missing.
+
+Keychain mode protects a backup containing only Relay's encrypted state from
+being decrypted on its own. It does not guarantee that credentials are absent
+from a full-machine backup: OS keychains can also be backed up, and macOS
+[keychain files can be copied](https://support.apple.com/en-lb/guide/keychain-access/kyca1121/mac).
+Review your backup scope, protect backups with encryption, and remember that
+older backups may already contain `storage.key`. Keychain storage does not
+protect against a process running as your logged-in user.
 
 ## Local Data
 
