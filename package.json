@@ -6,7 +6,8 @@
   "description": "Headless Relay sync for local folders",
   "type": "module",
   "bin": {
-    "rmd": "./bin/rmd.js"
+    "rmd": "./bin/rmd.js",
+    "relay": "./bin/relay.js"
   },
   "scripts": {
     "build:headless": "node scripts/build-headless.mjs",

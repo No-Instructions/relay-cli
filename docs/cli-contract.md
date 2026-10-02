@@ -90,3 +90,20 @@ The primary proof is Dropbox-like staging sync:
 The broader staging suite keeps the same black-box contract and extends it with
 nested folders, binary assets, raw filesystem moves, delete propagation, daemon
 restart, and offline changes created while the daemon is stopped.
+
+## Account commands
+
+`relay servers` lists Relay Servers. `relay server <name|guid>` or
+`relay server --relay <name|guid>` selects one. The `server` subtree includes
+creation, self-hosted URL registration, rename, membership, leave, and delete.
+`relay remote` contains server folder inspection, deletion, and access roles.
+These commands use account credentials without starting the sync daemon.
+
+Omitted collection filters include all accessible records. Mutations require
+explicit selectors. Tables print tab-separated rows; `--json` prints structured
+results, and failures exit nonzero. `--help` prints the selected command subtree
+without authentication. Run `relay server --help` or `relay remote --help` for
+the option reference. The `relay` executable also accepts existing `rmd` commands.
+
+Command metadata and handlers are shared with the Obsidian plugin. See
+[shared command maintenance](shared-commands.md) for vendoring instructions.

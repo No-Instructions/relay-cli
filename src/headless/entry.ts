@@ -3,6 +3,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { installBrowserGlobals } from "./browser-globals";
 import { HeadlessRelay } from "./HeadlessRelay";
+export { openServerAccount } from "./ServerAccount";
 export { buildConfig } from "./build-config";
 export {
   clearStoredLogin,

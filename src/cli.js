@@ -13,6 +13,8 @@ import { describeNetworkError, requestBinary } from "./network.js";
 import { isUnavailablePathError, openSafeFile, resolveSafePath, statSyncEntry } from "./safe-path.js";
 import { assertAuthServerMatches, normalizeAuthServer } from "./auth-server.js";
 
+import { serverCommand, serverCommandHelp, serverRoots } from "./server-command.js";
+
 const RELAY_DIR = ".relay";
 const CONFIG_FILE = "config.toml";
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -39,6 +41,15 @@ const VALUE_OPTIONS = new Set([
 
 export async function main(argv) {
   const [command, ...rest] = argv;
+  if (command === "help" && serverRoots.includes(rest[0])) {
+    console.log(serverCommandHelp(rest));
+    return;
+  }
+  if (serverRoots.includes(command)) return serverCommand(argv, async stateDir => {
+    if (process.env.RELAY_SERVER_URL) throw new Error("RELAY_SERVER_URL is unsupported. Endpoints are selected at build time.");
+    const account = await openEncryptedAuthStorage(daemonPaths(stateDir));
+    return account.openServerAccount();
+  });
   if (!command || command === "help" || command === "--help" || command === "-h") {
     printHelp();
     return;
@@ -72,6 +83,10 @@ function printHelp() {
   console.log(`Relay CLI
 
 Usage:
+  relay servers
+  relay server <name|guid>
+  relay server --help
+  relay remote --help
   rmd login [--provider <name>] [--no-open]
   rmd start
   rmd init [path]
