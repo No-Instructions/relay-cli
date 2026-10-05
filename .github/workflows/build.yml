@@ -33,6 +33,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - run: node --check scripts/release-ci.mjs
       - run: node bin/relay.js --help
       - run: npm run build:staging
       - run: node bin/relay.js --help

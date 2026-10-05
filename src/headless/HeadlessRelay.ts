@@ -1,7 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { readUserPreferences, updateLoggingPreferences, userConfigPath } from "../preferences.js";
-import { createHash } from "node:crypto";
+import { documentPath, MAX_DOCUMENT_CHARS } from "../mcp-editor-clients.js";
+import { mcpFiles, readMcpText } from "./McpFiles";
+import { reviewSnapshot, reviewFingerprint, editComment, type CommentEdit } from "./McpComments";
+import { bindMcpAgent } from "./McpAgentTokens";
+import { agentDirectoryForLogin } from "./AgentDirectory";
+import { createHash, randomUUID } from "node:crypto";
 import { App, TFile, TFolder, normalizePath, type TAbstractFile } from "./obsidian-shim";
 import { installLogRouting, runWithLogSink } from "./log-context";
 import { createHeadlessLoginManager } from "./HeadlessAuth";
@@ -46,6 +51,7 @@ import { SyncSettingsManager } from "../../vendor/relay/src/SyncSettings";
 import {
   ActiveEditorSession,
   type ActiveEditorApplyResult,
+  type ActiveEditorPresenceResult,
   type ActiveEditorFrame,
 } from "./ActiveEditorSession";
 import {
@@ -62,17 +68,6 @@ type LoggingStatus = {
   logPath: string;
   settingsPath: string;
 };
-export type DeletionGateStatus = {
-  gated: boolean;
-  token: string | null;
-  gatedAt: number | null;
-  paths: string[];
-};
-export type DeletionGateResolution = {
-  result: "resolved" | "not-gated" | "stale";
-  gate: DeletionGateStatus;
-};
-
 interface RelaySettings extends FeatureFlags {
   debugging: boolean;
   endpoints: EndpointSettings;
@@ -89,36 +84,90 @@ const DEFAULT_SETTINGS: RelaySettings = {
   sharedFolders: [],
 };
 
-class JsonStorage<T extends RelaySettings> implements StorageAdapter<T> {
-  private saveCounter = 0;
-  private saveQueue = Promise.resolve();
+type StoredFolderSettings = SharedFolderSettings & { localPath?: string };
+type StoredRelaySettings = Omit<RelaySettings, "sharedFolders"> & {
+  sharedFolders: StoredFolderSettings[];
+};
 
-  constructor(private file: string) {}
+// Upstream paths are relative to one vault. Each headless runtime has its own
+// virtual vault, so its settings view must contain only that local registration.
+class HeadlessSettingsStorage implements StorageAdapter<RelaySettings> {
+  private static saveQueues = new Map<string, Promise<void>>();
 
-  async loadData(): Promise<T | null> {
+  constructor(
+    private file: string,
+    private folderGuid: string,
+    private localPath: string,
+  ) {
+    this.file = path.resolve(file);
+    this.localPath = path.resolve(localPath);
+  }
+
+  private owns(folder: StoredFolderSettings): boolean {
+    // A registration without localPath can be adopted by its matching GUID.
+    // Its vault-relative path is repaired from the connected root at startup.
+    return folder.guid === this.folderGuid &&
+      (folder.localPath === undefined || folder.localPath === this.localPath);
+  }
+
+  private async readStoredData(): Promise<StoredRelaySettings | null> {
     try {
       const text = await fs.readFile(this.file, "utf8");
       if (!text.trim()) return null;
-      const { logging } = await readUserPreferences();
-      return { ...JSON.parse(text), debugging: logging.debug, enableNetworkLogging: logging.network } as T;
+      return JSON.parse(text) as StoredRelaySettings;
     } catch (error: any) {
       if (error.code === "ENOENT") return null;
       throw error;
     }
   }
 
-  async saveData(data: T): Promise<void> {
-    const { debugging: _debugging, enableNetworkLogging: _network, ...state } = data;
-    const serialized = `${JSON.stringify(state, null, 2)}\n`;
-    this.saveQueue = this.saveQueue
+  async loadData(): Promise<RelaySettings | null> {
+    const stored = await this.readStoredData();
+    if (!stored) return null;
+    const { logging } = await readUserPreferences();
+    return {
+      ...stored,
+      debugging: logging.debug,
+      enableNetworkLogging: logging.network,
+      sharedFolders: (stored.sharedFolders ?? [])
+        .filter((folder) => this.owns(folder))
+        .map(({ localPath: _localPath, ...folder }) => folder),
+    };
+  }
+
+  async saveData(data: RelaySettings): Promise<void> {
+    const snapshot = structuredClone(data);
+    // Every runtime in a daemon shares this file. Merge registrations inside
+    // the shared queue so an older runtime cannot erase a newer registration.
+    const save = (HeadlessSettingsStorage.saveQueues.get(this.file) ?? Promise.resolve())
       .catch(() => {})
-      .then(() => this.writeSerialized(serialized));
-    await this.saveQueue;
+      .then(async () => {
+        const stored = await this.readStoredData();
+        const merged: StoredRelaySettings = {
+          ...snapshot,
+          sharedFolders: [
+            ...(stored?.sharedFolders ?? []).filter((folder) => !this.owns(folder)),
+            ...snapshot.sharedFolders
+              .filter((folder) => folder.guid === this.folderGuid)
+              .map((folder) => ({ ...folder, localPath: this.localPath })),
+          ],
+        };
+        const { debugging: _debugging, enableNetworkLogging: _network, ...state } = merged;
+        await this.writeSerialized(`${JSON.stringify(state, null, 2)}\n`);
+      });
+    HeadlessSettingsStorage.saveQueues.set(this.file, save);
+    try {
+      await save;
+    } finally {
+      if (HeadlessSettingsStorage.saveQueues.get(this.file) === save) {
+        HeadlessSettingsStorage.saveQueues.delete(this.file);
+      }
+    }
   }
 
   private async writeSerialized(serialized: string): Promise<void> {
     await fs.mkdir(path.dirname(this.file), { recursive: true });
-    const tmp = `${this.file}.tmp-${process.pid}-${this.saveCounter++}`;
+    const tmp = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
     await fs.writeFile(tmp, serialized, { encoding: "utf8", mode: 0o600 });
     if (process.platform !== "win32") await fs.chmod(tmp, 0o600);
     await fs.rename(tmp, this.file);
@@ -146,8 +195,12 @@ export class HeadlessRelay {
 
   private cliHandlers = new Map<string, CliHandler>();
   private activeEditors = new Map<string, ActiveEditorSession>();
+  private agentTokenReleases = new Map<string, () => void>();
+  private tokenDeviceId = "";
   private activeEditorDocuments = new Map<string, string>();
+  private closingEditors = new Map<string, Promise<void>>();
   private openingEditorGuids = new Set<string>();
+  private mcpFileBusy = false;
   private hsmStore!: HSMStore;
   private logSinkId: string | null = null;
   private pendingVaultDeletes: Array<{ path: string; isFolder: boolean }> = [];
@@ -235,7 +288,11 @@ export class HeadlessRelay {
     RelayInstances.set(this, "headless-plugin");
 
     this.settings = new Settings(
-      new JsonStorage<RelaySettings>(path.join(this.input.stateDir, "plugin-data.json")),
+      new HeadlessSettingsStorage(
+        path.join(this.input.stateDir, "plugin-data.json"),
+        this.input.folderGuid,
+        this.input.folderPath,
+      ),
       DEFAULT_SETTINGS,
     );
     await this.settings.load();
@@ -276,6 +333,7 @@ export class HeadlessRelay {
     const deviceId = this.settings.get().enableDeviceManagement
       ? this.deviceManager.getDeviceId()
       : "";
+    this.tokenDeviceId = deviceId;
     if (deviceId) {
       setDeviceManagementConfig({
         vaultId: this.appId,
@@ -332,9 +390,9 @@ export class HeadlessRelay {
 
   private async stopRuntime(): Promise<void> {
     await Promise.all(
-      [...this.activeEditors.values()].map((session) =>
-        session.close().catch((error) => {
-          this.debug(`Failed to close active editor ${session.id}`, error);
+      [...this.activeEditors.keys()].map((sessionId) =>
+        this.closeActiveEditor(sessionId).catch((error) => {
+          this.debug(`Failed to close active editor ${sessionId}`, error);
         }),
       ),
     );
@@ -482,23 +540,6 @@ export class HeadlessRelay {
     return this.withLogSink(() => this.statusRouted());
   }
 
-  deletionGateStatus(): DeletionGateStatus {
-    return this.withLogSink(() => this.deletionGateStatusRouted());
-  }
-
-  resolveDeletionGate(
-    decision: "send" | "restore",
-    token: string,
-  ): DeletionGateResolution {
-    return this.withLogSink(() => {
-      const folder = this.primarySharedFolder() as any;
-      const result = decision === "send"
-        ? folder?.sendHeldDeletions?.(token) ?? "not-gated"
-        : folder?.restoreHeldDeletions?.(token) ?? "not-gated";
-      return { result, gate: this.deletionGateStatusRouted() };
-    });
-  }
-
   private statusRouted(): unknown {
     return {
       appId: this.appId,
@@ -525,7 +566,6 @@ export class HeadlessRelay {
             metas: this.describeFolderMetas(folder as any),
             pendingUpload: [...((folder as any).syncStore?.pendingUpload?.entries?.() ?? [])],
             folderSync: (folder as any).getFolderSyncSnapshot?.() ?? null,
-            deletionGate: this.projectDeletionGate((folder as any).deletionGate?.() ?? null),
           }))
         : [],
       queue: this.backgroundSync?.getQueueStatus(),
@@ -542,11 +582,153 @@ export class HeadlessRelay {
     };
   }
 
+  async readMcpDocument(relativePath: string): Promise<{ path: string; text: string; source: string }> {
+    return this.withLogSink(async () => {
+      const absolute = documentPath(this.input.folderPath, relativePath);
+      const { document } = this.resolveActiveEditorDocument(absolute);
+      const sessionId = this.activeEditorDocuments.get(document.guid);
+      if (sessionId) {
+        const closing = this.closingEditors.get(sessionId);
+        if (closing) {
+          await closing;
+          return this.readMcpDocument(relativePath);
+        }
+        const { text } = this.activeEditorFrame(sessionId);
+        if (text.length > MAX_DOCUMENT_CHARS) throw new Error("Document exceeds the MCP reading limit.");
+        return { path: relativePath, text, source: "active-editor" };
+      }
+      const { text } = await readMcpText(this.input.folderPath, relativePath);
+      return { path: relativePath, text, source: "disk" };
+    });
+  }
+
+  async manageMcpFiles(input: Parameters<typeof mcpFiles>[3]): Promise<unknown> {
+    return this.withLogSink(async () => {
+      const mutation = !["list", "read"].includes(input.action);
+      if (mutation) {
+        if (this.mcpFileBusy || this.activeEditors.size || this.openingEditorGuids.size) {
+          throw new Error("Close active editors and wait for other file operations before changing files in this folder.");
+        }
+        const folder = this.primarySharedFolder();
+        if (!folder?.canWriteContent || (input.action !== "write" || input.expectedHash === null) && !folder.canManageFiles) {
+          throw new Error("Your Relay access does not permit this file operation.");
+        }
+        this.mcpFileBusy = true;
+      }
+      try { return await mcpFiles(this.input.folderPath, this.sharedFolderVaultPath, this.vault, input); }
+      finally { if (mutation) this.mcpFileBusy = false; }
+    });
+  }
+
+  mcpResourceIdentity(): string {
+    return JSON.stringify([this.input.folderGuid, this.loginManager?.authStore?.model?.id ?? null]);
+  }
+
+  listMcpDocuments(input: { prefix?: string; offset?: number; limit?: number } = {}) {
+    const prefix = input.prefix ?? "";
+    if (prefix) documentPath(this.input.folderPath, prefix.replace(/\/$/, ""));
+    const offset = input.offset ?? 0, limit = input.limit ?? 100;
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error("Invalid document listing offset or limit.");
+    const documents = [...(this.primarySharedFolder()?.files.values() ?? [])]
+      .filter(isDocument)
+      .map(document => ({ path: document.path.replace(/^\/+/, ""), open: this.activeEditorDocuments.has(document.guid) }))
+      .filter(document => document.path.startsWith(prefix))
+      .sort((a, b) => a.path.localeCompare(b.path));
+    return { documents: documents.slice(offset, offset + limit), nextOffset: offset + limit < documents.length ? offset + limit : null };
+  }
+
+  async searchMcpDocuments(input: { query: string; prefix?: string; offset?: number; caseSensitive?: boolean }) {
+    if (typeof input.query !== "string" || !input.query.length || input.query.length > 256 || /[\r\n]/.test(input.query)) throw new Error("Search requires a single-line literal query within 256 characters.");
+    const page = this.listMcpDocuments({ ...input, limit: 50 });
+    // Escape every regexp operator: this is bounded literal search, not a
+    // remotely supplied regexp interpreter. RegExp preserves UTF-16 offsets
+    // even for case folds that would change length in a lowercased string.
+    const pattern = new RegExp(input.query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), input.caseSensitive ? "g" : "gi");
+    const results: Array<{ path: string; source: string; matches: Array<{ from: number; to: number; line: number; snippet: string }>; moreMatches: boolean }> = [];
+    const skipped: Array<{ path: string; error: string }> = [];
+    let scanned = 0, characters = 0;
+    for (const entry of page.documents) {
+      if (characters >= 2 * 1024 * 1024) break;
+      scanned++;
+      try {
+        const document = await this.readMcpDocument(entry.path);
+        characters += document.text.length;
+        const matches = [];
+        pattern.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while (matches.length < 5 && (match = pattern.exec(document.text))) {
+          matches.push({ from: match.index, to: match.index + match[0].length,
+            line: document.text.slice(0, match.index).split("\n").length,
+            snippet: document.text.slice(Math.max(0, match.index - 80), match.index + Math.min(match[0].length, 80) + 80) });
+        }
+        if (matches.length) results.push({ path: entry.path, source: document.source, matches, moreMatches: matches.length === 5 && pattern.exec(document.text) !== null });
+      } catch (error: any) { skipped.push({ path: entry.path, error: error.message }); }
+    }
+    return { results, skipped, scanned, nextOffset: scanned < page.documents.length ? (input.offset ?? 0) + scanned : page.nextOffset };
+  }
+
+  async readMcpComments(relativePath: string) {
+    if (!relativePath.toLowerCase().endsWith(".md")) throw new Error("Structured review currently supports Markdown documents.");
+    const document = await this.readMcpDocument(relativePath);
+    return { path: relativePath, source: document.source, ...reviewSnapshot(document.text) };
+  }
+
+  reviewActiveEditor(sessionId: string) {
+    const frame = this.activeEditorFrame(sessionId);
+    if (!frame.path.toLowerCase().endsWith(".md")) throw new Error("Structured review currently supports Markdown documents.");
+    return { sessionId, ...reviewSnapshot(frame.text) };
+  }
+
+  applyMcpComment(sessionId: string, input: CommentEdit, author: string | { id: string; name: string }) {
+    const frame = this.activeEditorFrame(sessionId);
+    if (!frame.path.toLowerCase().endsWith(".md")) throw new Error("Structured review currently supports Markdown documents.");
+    return this.applyActiveEditor(sessionId, { baseText: frame.text, desiredText: editComment(frame.text, input, author) });
+  }
+
+  async readMcpReviewFingerprint(relativePath: string) {
+    const { text } = await this.readMcpDocument(relativePath);
+    if (!relativePath.toLowerCase().endsWith(".md")) return { hash: createHash("sha256").update(text).digest("hex"), marks: [] };
+    return reviewFingerprint(text);
+  }
+
+  watchMcpDocument(relativePath: string, changed: () => void): () => void {
+    const { document, vaultPath } = this.resolveActiveEditorDocument(documentPath(this.input.folderPath, relativePath));
+    const onFile = (file: { path: string }, oldPath?: string) => {
+      if ([file.path, oldPath].some(value => value === vaultPath || value && vaultPath.startsWith(`${value}/`))) changed();
+    };
+    const localDoc = document.localDoc;
+    localDoc?.on("update", changed);
+    for (const event of ["create", "modify", "rename", "delete"]) this.vault.on(event, onFile);
+    return () => {
+      localDoc?.off("update", changed);
+      for (const event of ["create", "modify", "rename", "delete"]) this.vault.off(event, onFile);
+    };
+  }
+
+  async openMcpDocument(relativePath: string, user: { id?: string; name?: string; picture?: string; color?: string; colorLight?: string } = {}, { readOnly = false } = {}): Promise<ActiveEditorFrame> {
+    return this.openActiveEditor({
+      path: documentPath(this.input.folderPath, relativePath),
+      user: { name: "MCP editor", ...user },
+      boundedRead: true,
+      agentId: user.id,
+      readOnly,
+    });
+  }
+
+  resolveMcpIdentity(selection: { id?: string; name?: string }) {
+    return agentDirectoryForLogin(this.loginManager).resolve(selection);
+  }
+
   async openActiveEditor(input: {
     path: string;
+    boundedRead?: boolean;
+    agentId?: string;
+    // The caller never applies edits; the document need not be writable.
+    readOnly?: boolean;
     user?: {
       id?: string;
       name?: string;
+      picture?: string;
       color?: string;
       colorLight?: string;
     };
@@ -555,7 +737,9 @@ export class HeadlessRelay {
       if (!input || typeof input.path !== "string" || !input.path.trim()) {
         throw new Error("Active editor requires a document path.");
       }
+      if (this.mcpFileBusy) throw new Error("Wait for the current file operation before opening an editor.");
       const { document, vaultPath } = this.resolveActiveEditorDocument(input.path);
+      if (!input.readOnly && !document.canWriteContent) throw new Error("This document is read-only.");
       if (
         this.openingEditorGuids.has(document.guid) ||
         this.activeEditorDocuments.has(document.guid)
@@ -564,15 +748,26 @@ export class HeadlessRelay {
       }
 
       this.openingEditorGuids.add(document.guid);
+      let releaseAgent: (() => void) | undefined;
       try {
+        const initialText = input.boundedRead
+          ? (await readMcpText(this.input.folderPath, path.relative(this.input.folderPath, input.path).split(path.sep).join("/"))).text
+          : undefined;
+        if (input.agentId) releaseAgent = await bindMcpAgent(document, this.timeProvider, input.agentId, this.tokenDeviceId, input.readOnly === true);
+        if (!input.readOnly && !document.canWriteContent) throw new Error("This document is read-only.");
         const session = await ActiveEditorSession.open(
           document,
           `/${vaultPath}`,
           input.user,
+          initialText,
         );
         this.activeEditors.set(session.id, session);
         this.activeEditorDocuments.set(session.guid, session.id);
+        if (releaseAgent) this.agentTokenReleases.set(session.id, releaseAgent);
         return session.frame();
+      } catch (error) {
+        releaseAgent?.();
+        throw error;
       } finally {
         this.openingEditorGuids.delete(document.guid);
       }
@@ -604,12 +799,39 @@ export class HeadlessRelay {
     });
   }
 
+  presenceActiveEditor(
+    sessionId: string,
+    input: {
+      baseText?: string;
+      cursor?: number | null;
+      selection?: { anchor: number; head: number } | null;
+    },
+  ): ActiveEditorPresenceResult {
+    return this.withLogSink(() => this.requireActiveEditor(sessionId).presence(input ?? {}));
+  }
+
   async closeActiveEditor(sessionId: string): Promise<void> {
     return this.withLogSink(async () => {
+      const closing = this.closingEditors.get(sessionId);
+      if (closing) return closing;
       const session = this.requireActiveEditor(sessionId);
-      this.activeEditors.delete(sessionId);
-      this.activeEditorDocuments.delete(session.guid);
-      await session.close();
+      // Publish the closing barrier before close() can emit save events. Reads
+      // then wait for disk instead of observing a transient closed editor.
+      const cleanup = Promise.resolve().then(async () => {
+        try { await session.close(); }
+        finally {
+          const release = this.agentTokenReleases?.get(sessionId);
+          this.agentTokenReleases?.delete(sessionId);
+          try { release?.(); }
+          finally {
+            this.activeEditors.delete(sessionId);
+            this.activeEditorDocuments.delete(session.guid);
+          }
+        }
+      });
+      this.closingEditors.set(sessionId, cleanup);
+      try { await cleanup; }
+      finally { this.closingEditors.delete(sessionId); }
     });
   }
 
@@ -655,7 +877,11 @@ export class HeadlessRelay {
     if (!folder) {
       throw new Error(`Active editor path is not in a shared folder: ${requestedPath}`);
     }
-    const document = folder.proxy.getDoc(vaultPath);
+    // Document paths in Relay's membership map are folder-relative (/note.md),
+    // not vault-relative (notes/note.md). Only select an indexed document:
+    // getDoc() can mint a new shared identity as a side effect of a read.
+    const guid = folder.syncStore.get(folder.getVirtualPath(vaultPath));
+    const document = guid === undefined ? undefined : folder.files.get(guid);
     if (!isDocument(document)) {
       throw new Error(`Active editor path is not a text document: ${requestedPath}`);
     }
@@ -664,21 +890,6 @@ export class HeadlessRelay {
 
   private primarySharedFolder(): SharedFolder | null {
     return this.sharedFolders?.find((folder) => folder.guid === this.input.folderGuid) ?? null;
-  }
-
-  private deletionGateStatusRouted(): DeletionGateStatus {
-    return this.projectDeletionGate((this.primarySharedFolder() as any)?.deletionGate?.() ?? null);
-  }
-
-  private projectDeletionGate(
-    gate: { token: string; gatedAt: number; paths: string[] } | null,
-  ): DeletionGateStatus {
-    return {
-      gated: gate !== null,
-      token: gate?.token ?? null,
-      gatedAt: gate?.gatedAt ?? null,
-      paths: gate?.paths ?? [],
-    };
   }
 
   async configureLogging(input: { debugging?: boolean; network?: boolean }): Promise<LoggingStatus> {

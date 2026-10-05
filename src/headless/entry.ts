@@ -3,7 +3,10 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { installBrowserGlobals } from "./browser-globals";
 import { HeadlessRelay } from "./HeadlessRelay";
+export { openServerAccount } from "./ServerAccount";
 export { buildConfig } from "./build-config";
+export { reviewSnapshot, reviewFingerprint, editComment } from "./McpComments";
+export { assertAgentToken, McpAgentTokens, bindMcpAgent } from "./McpAgentTokens";
 export {
   clearStoredLogin,
   readStoredLogin,
@@ -19,6 +22,7 @@ export { createHeadlessLoginManager } from "./HeadlessAuth";
 export { FileSystemVault, FileSystemAdapter } from "./FileSystemVault";
 export {
   computePositionedChanges,
+  presenceRemapper,
   rebaseActiveEditorText,
 } from "./ActiveEditorSession";
 export { TAbstractFile, TFile, TFolder, parseYaml, stringifyYaml } from "./obsidian-shim";
@@ -114,6 +118,7 @@ function parseArgs(argv: string[]): { options: Record<string, string | true>; po
 }
 
 export { HeadlessRelay, installBrowserGlobals };
+export { AgentDirectory, agentDirectoryFromStoredLogin } from "./AgentDirectory";
 
 declare const RMD_RELEASE_METADATA: unknown;
 if (typeof RMD_RELEASE_METADATA === "undefined" && process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

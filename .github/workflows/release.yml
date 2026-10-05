@@ -1,44 +1,138 @@
-name: Prepare release draft
+name: Release
+run-name: ${{ inputs.operation }} v${{ inputs.release_version }} (${{ inputs.product_commit }})
 
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: Prepare a draft or publish its reviewed assets
+        type: choice
+        options: [prepare, publish]
+        default: prepare
+        required: true
       release_version:
         description: Stable version without v (for example 1.2.3)
         required: true
         type: string
+      product_commit:
+        description: Reviewed full product SHA to release
+        required: true
+        type: string
+
+# Serialize prepare/publish operations for a version; never interrupt an upload.
+concurrency:
+  group: release-${{ inputs.release_version }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
+env:
+  RELEASE_OPERATION: ${{ inputs.operation }}
+  RELEASE_VERSION: ${{ inputs.release_version }}
+  RELEASE_COMMIT: ${{ inputs.product_commit }}
+
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24.17.0'
+          package-manager-cache: false
+      - run: node scripts/release-ci.mjs preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
   build:
+    if: inputs.operation == 'prepare'
+    needs: preflight
     uses: ./.github/workflows/build.yml
     with:
       release_version: ${{ inputs.release_version }}
-  draft:
+  attest:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24.17.0'
+          package-manager-cache: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
-          merge-multiple: true
+          path: artifacts
+      - name: Validate all four production builds
+        run: node scripts/release-ci.mjs collect artifacts releases
+      - name: Attest the archives, checksums, and version manifest
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: releases/*
+      - name: Retain the signed provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+        run: cp "$BUNDLE_PATH" releases/release-provenance.sigstore.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: attested-release
+          path: releases/
+          if-no-files-found: error
+  draft:
+    needs: attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24.17.0'
+          package-manager-cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: attested-release
           path: releases
-      - name: Verify artifacts and create a draft for review
+      - name: Verify provenance, upload draft, and verify uploaded bytes
+        run: node scripts/release-ci.mjs draft releases
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_VERSION: ${{ inputs.release_version }}
-          RELEASE_COMMIT: ${{ github.sha }}
-        working-directory: releases
-        run: |
-          test "$(cat version.txt)" = "$RELEASE_VERSION"
-          for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-            sha256sum -c "relay-cli-$platform.tar.gz.sha256"
-          done
-          gh release create "v$RELEASE_VERSION" --target "$RELEASE_COMMIT" \
-            --draft --title "Relay CLI $RELEASE_VERSION" --generate-notes \
-            version.txt ./*.tar.gz ./*.sha256
+  publish:
+    if: inputs.operation == 'publish'
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24.17.0'
+          package-manager-cache: false
+      - name: Verify the draft, publish, and verify GitHub's release attestation
+        run: node scripts/release-ci.mjs publish releases
+        env:
+          GH_TOKEN: ${{ github.token }}

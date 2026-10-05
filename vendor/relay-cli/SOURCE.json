@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/No-Instructions/Relay",
+  "entry": "src/cli/server.ts",
+  "files": {
+    "src/cli/format.ts": "f1023dad7cd5661bb2f950defeda5487c015c5469a35e971626737495a94b91f",
+    "src/cli/params.ts": "d361a2be728ecdaed757c040124955cf9e23b9a7a012c57f093f05557cbe402f",
+    "src/cli/resolve.ts": "a445c75c208b09edbd130747a78c2c95273c9bb01b0d6f9eaf06a14a5c3b189c",
+    "src/cli/schema.ts": "b208daf7a267bb5f99b1b136533bd57dc08dfde2ef6bf7e4a51fc67ae6a70651",
+    "src/cli/server.ts": "6749f8fa2633be7c785acb64413e7a703d09a5b38b8cdc057cba2c48a491084e",
+    "src/cli/types.ts": "5914c92143a182c127d54355e377ff4000583a6f232ba4178f1ed60732b86da4"
+  },
+  "bundleSha256": "b1b3fb4c6c9768d30a8a3cff0adff5c159a6b4e5fccb0df915b9c5020898c2a1"
+}

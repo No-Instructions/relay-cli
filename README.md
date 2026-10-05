@@ -62,6 +62,22 @@ Run `relay disconnect ./notes` to stop syncing one folder, or `relay stop` to st
 background sync for all folders. `relay start` resumes sync for connected folders.
 Run `relay --help` for the command list.
 
+## Control Obsidian
+
+With Obsidian running and its native CLI enabled:
+
+```sh
+relay obsidian vaults verbose
+relay obsidian --vault Notes plugin:install id=system3-relay enable
+relay obsidian --vault Notes plugin:install id=relay-comments enable
+relay obsidian --vault Notes relay format=json
+relay obsidian --vault Notes dev:errors
+```
+
+Run `relay obsidian --help` for adapter options and `relay obsidian help` for
+commands from the running app and its plugins. The same commands are available
+through MCP's `relay_cli` tool. See [Obsidian access](docs/obsidian.md).
+
 ## Update
 
 The installed CLI updates itself:
@@ -148,6 +164,40 @@ Daemon state lives in `~/Library/Application Support/relay/state` on macOS, or
 `$XDG_STATE_HOME/relay`, or pass `--state-dir` to select a specific state directory.
 
 ## Automation
+
+### MCP
+
+Start sync and register an agent:
+
+```sh
+relay start
+relay agent create --name CommentTester
+```
+
+Start Codex with Relay for this run:
+
+```sh
+codex \
+  -c 'mcp_servers.relay_test.command="/absolute/path/to/relay"' \
+  -c 'mcp_servers.relay_test.args=["mcp","--repo","/absolute/path/to/notes","--agent-name","CommentTester"]'
+```
+
+Use the same `--state-dir` in the MCP arguments if the daemon uses custom state.
+`--repo` selects the connected folder for document calls. Omit it and pass
+`folder` on each call to work across connected roots.
+
+For persistent registration, use `relay mcp install codex --agent-name CommentTester`
+or `relay mcp install claude --agent-name CommentTester`.
+See [registration options](docs/mcp.md#client-registration).
+
+`relay mcp tools` prints the tool reference. `relay documents` lists and searches
+shared documents. `relay_cli` runs administrative commands, including
+`relay agent` and `relay obsidian`.
+
+See [MCP reference](docs/mcp.md), [agent registration and comment testing](docs/agents.md),
+and [Obsidian commands](docs/obsidian.md).
+
+### Shell commands
 
 In non-interactive shells, pass `relay login --provider <name>` or
 `relay login --token-file <path>`. Use `relay relays` and `relay folders` to find IDs,

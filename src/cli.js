@@ -14,11 +14,15 @@ import { isUnavailablePathError, openSafeFile, resolveSafePath, statSyncEntry } 
 import { assertAuthServerMatches, normalizeAuthServer } from "./auth-server.js";
 import { embeddedRelease, cliInvocation } from "./release.js";
 import { readUserPreferences, updateLoggingPreferences, userConfigPath } from "./preferences.js";
-import { defaultStateDir } from "./user-paths.js";
 import {
   configureUpdates, findInstallation, registerDaemon, selectInstallation,
   notifyUpdateForCommand, readRelease, registeredDaemons, scheduleUpdateChecks, updateInstallation, withInstallLock,
 } from "./updates.js";
+
+import { daemonPaths, defaultControlEndpoint, formatUnixEndpoint, parseControlEndpoint, requestControl } from "./control-client.js";
+import { McpEditorClients } from "./mcp-editor-clients.js";
+import { serverCommand, serverRoots } from "./server-command.js";
+import { helpText, requestedHelp } from "./command-help.js";
 
 const RELAY_DIR = ".relay";
 const CONFIG_FILE = "config.toml";
@@ -48,10 +52,17 @@ const VALUE_OPTIONS = new Set([
 
 export async function main(argv) {
   const [command, ...rest] = argv;
-  if (!command || command === "help" || command === "--help" || command === "-h") {
-    printHelp();
+  if (serverRoots.includes(command)) return serverCommand(argv, async stateDir => {
+    if (process.env.RELAY_SERVER_URL) throw new Error("RELAY_SERVER_URL is unsupported. Endpoints are selected at build time.");
+    const account = await openEncryptedAuthStorage(daemonPaths(stateDir));
+    return account.openServerAccount();
+  });
+  const help = requestedHelp(argv);
+  if (help !== null) {
+    console.log(helpText(help));
     return;
   }
+  if (command === "obsidian") return (await import("./obsidian-command.js")).obsidianCommand(rest);
 
   if (process.env.RELAY_SERVER_URL) {
     throw new Error("RELAY_SERVER_URL is unsupported. Endpoints are selected at build time; unset it and use the production or staging build.");
@@ -60,6 +71,16 @@ export async function main(argv) {
   if (embeddedRelease) await notifyUpdateForCommand(command, rest);
 
   if (command === "init") return initCommand(rest);
+  if (command === "documents") return (await import("./document-command.js")).documentsCommand(rest, () => findRelayFolderRoot(process.cwd()));
+  if (command === "agent") return (await import("./agent-command.js")).agentCommand(rest, async stateDir => {
+    const storage = await openEncryptedAuthStorage(daemonPaths(stateDir));
+    return storage.agentDirectoryFromStoredLogin();
+  });
+  if (command === "mcp") {
+    if (rest[0] === "install") return (await import("./mcp-install.js")).installMcpCommand(rest.slice(1));
+    if (rest[0] === "tools" && rest.length === 1) { console.log(helpText("mcp tools")); return; }
+    return (await import("./mcp.js")).mcpCommand(rest);
+  }
   if (command === "version" || command === "--version" || command === "-v") return versionCommand(rest);
   if (command === "update" || command === "upgrade") return updateCommand(rest);
   if (command === "_activate-install") {
@@ -72,7 +93,6 @@ export async function main(argv) {
   if (command === "disconnect") return disconnectCommand(rest);
   if (command === "status") return statusCommand(rest);
   if (command === "sync-status") return syncStatusCommand(rest);
-  if (command === "deletions") return deletionsCommand(rest);
   if (command === "logging") return loggingCommand(rest);
   if (command === "relays") return relaysCommand(rest);
   if (command === "folders") return foldersCommand(rest);
@@ -84,33 +104,6 @@ export async function main(argv) {
   if (command === "debug") return debugCommand(rest);
 
   throw new Error(`Unknown command: ${command}`);
-}
-
-function printHelp() {
-  console.log(`Relay CLI
-
-Usage:
-  relay login [--provider <name>] [--no-open]
-  relay start
-  relay init [path]
-  relay clone [path] --relay <relay> --folder <folder>
-  relay connect [path] --relay <relay>
-  relay disconnect [path]
-  relay status [path]
-  relay sync-status [path]
-  relay deletions [status|send|restore] [path]
-  relay logging [status|enable|disable] [--network]
-  relay relays
-  relay folders
-  relay stop
-  relay version
-  relay update [--check | --version <version>]
-  relay update --enable-automatic-updates
-  relay update --disable-automatic-updates
-  relay update --pin | --unpin
-
-relay upgrade is an alias for relay update.
-`);
 }
 
 async function versionCommand(argv) {
@@ -276,7 +269,7 @@ async function cloneCommand(argv) {
   });
   console.log(`Cloned Relay folder: ${root}`);
 
-  if (!options.noConnect) {
+  if (options.connect !== false) {
     await connectFolder(root, options);
   }
 }
@@ -363,13 +356,6 @@ async function statusCommand(argv) {
     console.log(`Folder: ${folder.path}`);
     console.log(`Relay: ${folder.relayId ?? "(not connected to a Relay)"}`);
     console.log(`Folder ID: ${folder.folderId}`);
-    const gate = daemonDeletionGate(daemon, folder.path);
-    if (gate?.gated) {
-      console.log(
-        `Deletion safety: ${gate.paths.length} deletion${gate.paths.length === 1 ? " is" : "s are"} paused for review.`,
-      );
-      console.log(`Review with: relay deletions status ${shellQuote(folder.path)}`);
-    }
   }
 }
 
@@ -398,77 +384,6 @@ async function syncStatusCommand(argv) {
   for (const row of rows) {
     console.log(`${row.status}\t${row.path}`);
   }
-}
-
-async function deletionsCommand(argv) {
-  const [subcommand = "status", ...rest] = argv;
-  if (!["status", "send", "restore"].includes(subcommand)) {
-    throw new Error("Usage: relay deletions [status|send|restore] [path] [--token <token>]");
-  }
-  const { options, positional } = parseArgs(rest);
-  const root = await findRelayFolderRoot(path.resolve(positional[0] ?? "."));
-  const control = await liveControlEndpoint(options);
-  if (!control) throw new Error("Background sync is not running. Start it with `relay start`.");
-
-  if (subcommand === "status") {
-    const response = await requestControl(control, {
-      type: "deletions_status",
-      repo: root,
-    });
-    if (!response.ok) throw new Error(response.error ?? "Failed to read deletion safety status.");
-    if (wantsJsonOutput(options)) {
-      console.log(JSON.stringify(response.gate, null, 2));
-      return;
-    }
-    printDeletionGate(response.gate, root);
-    return;
-  }
-
-  if (!options.token) {
-    throw new Error(
-      `relay deletions ${subcommand} requires the token shown by \`relay deletions status\`.`,
-    );
-  }
-  const response = await requestControl(control, {
-    type: "deletions_resolve",
-    repo: root,
-    decision: subcommand,
-    token: options.token,
-  });
-  if (!response.ok) throw new Error(response.error ?? "Failed to resolve paused deletions.");
-  if (response.resolution.result === "stale") {
-    throw new Error("The deletion review changed. Run `relay deletions status` and review the new token.");
-  }
-  if (wantsJsonOutput(options)) {
-    console.log(JSON.stringify(response.resolution, null, 2));
-    return;
-  }
-  if (response.resolution.result === "not-gated") {
-    console.log("No deletions are awaiting review.");
-  } else if (subcommand === "send") {
-    console.log("Sent the reviewed deletions to the shared folder.");
-  } else {
-    console.log("Kept the shared files and started restoring the local copies.");
-  }
-}
-
-function printDeletionGate(gate, root) {
-  if (!gate.gated) {
-    console.log("No deletions are awaiting review.");
-    return;
-  }
-  const count = gate.paths.length;
-  console.log(`${count} deletion${count === 1 ? " is" : "s are"} paused for review:`);
-  for (const heldPath of gate.paths) console.log(`  ${heldPath}`);
-  console.log(`Token: ${gate.token}`);
-  console.log(`Send to other devices: relay deletions send ${shellQuote(root)} --token ${gate.token}`);
-  console.log(`Keep and restore files: relay deletions restore ${shellQuote(root)} --token ${gate.token}`);
-}
-
-function daemonDeletionGate(daemon, root) {
-  return daemon.headless
-    ?.find((entry) => entry.folder === root)
-    ?.status?.folders?.[0]?.deletionGate ?? null;
 }
 
 async function loggingCommand(argv) {
@@ -986,6 +901,7 @@ async function createRelayFolder(root, input) {
     relayId: input.relayId,
     server: input.server,
     name: input.name,
+    authoritative: input.indexFiles,
   };
   await writeConfig(root, config);
   const files = input.indexFiles ? await scanMarkdownFiles(root) : [];
@@ -997,7 +913,6 @@ async function connectFolder(root, options) {
   const server = (await loadHeadlessBundle()).buildConfig.authUrl;
   assertAuthServerMatches(config.server, server);
   let nextConfig = config;
-  const authoritative = !config.relayId;
   if (!config.relayId) {
     const relayId = options.relay
       ?? (await selectRelay(
@@ -1009,11 +924,16 @@ async function connectFolder(root, options) {
       relayId,
       server,
     };
-    await writeConfig(root, nextConfig);
-    updateDatabaseRelay(path.join(root, RELAY_DIR, "relay.db"), nextConfig);
   }
-
   const state = await readDaemonState(options.stateDir);
+  const previous = state.connected.find((entry) => entry.path === root && entry.folderId === config.folderId);
+  // Relay membership can be recorded before the daemon creates the remote.
+  // Preserve the folder's initialization policy across retries and disconnects.
+  const authoritative = config.authoritative ?? previous?.authoritative ?? !config.relayId;
+  nextConfig = { ...nextConfig, authoritative };
+  await writeConfig(root, nextConfig);
+  if (!config.relayId) updateDatabaseRelay(path.join(root, RELAY_DIR, "relay.db"), nextConfig);
+
   const entry = {
     path: root,
     relayId: nextConfig.relayId,
@@ -1231,6 +1151,7 @@ async function createDaemonRuntime(stateDir) {
     recentEvents: [],
     refreshTimer: null,
     refreshRunner: null,
+    mcpEditors: null,
     async refreshOnce() {
       const state = await readDaemonState(stateDir);
       const connectedPaths = new Set(state.connected.map((entry) => entry.path));
@@ -1324,16 +1245,6 @@ async function createDaemonRuntime(stateDir) {
       if (!relayRuntime) throw new Error("No headless Relay runtime is running.");
       await relayRuntime.closeActiveEditor(sessionId);
     },
-    async deletionGateStatus(repo) {
-      const relayRuntime = selectHeadlessRuntime(runtime.headless, repo);
-      if (!relayRuntime) throw new Error("No headless Relay runtime is running.");
-      return relayRuntime.deletionGateStatus();
-    },
-    async resolveDeletionGate(repo, decision, token) {
-      const relayRuntime = selectHeadlessRuntime(runtime.headless, repo);
-      if (!relayRuntime) throw new Error("No headless Relay runtime is running.");
-      return relayRuntime.resolveDeletionGate(decision, token);
-    },
     async loggingStatus() {
       const { logging } = await readUserPreferences();
       return {
@@ -1353,6 +1264,7 @@ async function createDaemonRuntime(stateDir) {
     async close() {
       if (runtime.refreshTimer) clearInterval(runtime.refreshTimer);
       await runtime.refreshRunner.close();
+      await runtime.mcpEditors.close();
       for (const watcherSet of runtime.watchers.values()) {
         closeWatcherSet(watcherSet);
       }
@@ -1364,6 +1276,7 @@ async function createDaemonRuntime(stateDir) {
     },
   };
   runtime.refreshRunner = createSerializedTaskRunner(() => runtime.refreshOnce());
+  runtime.mcpEditors = new McpEditorClients(runtime.headless);
 
   await runtime.refresh();
   runtime.refreshTimer = setInterval(() => {
@@ -1778,7 +1691,7 @@ async function startControlServer(endpoint, runtime, shutdown) {
         reply({ ok: false, error: "Unauthorized control request." });
         return;
       }
-      socket.setTimeout(30_000);
+      socket.setTimeout(request.type === "mcp_editor" && request.action === "open" ? 40_000 : 30_000);
       Promise.resolve().then(() => handleControlRequest(request, runtime)).then((response) => {
         reply(response, () => {
           if (response.ok && request.type === "shutdown") void shutdown();
@@ -1818,6 +1731,16 @@ function validControlToken(provided, expected) {
 }
 
 async function handleControlRequest(request, runtime) {
+  if (request.type === "mcp_read" || request.type === "mcp_files") {
+    const root = typeof request.repo === "string" ? path.resolve(request.repo) : "";
+    const relayRuntime = runtime.headless.get(root);
+    if (!relayRuntime) throw new Error("No headless Relay runtime is running for this exact folder root.");
+    if (request.type === "mcp_files") return { ok: true, result: await relayRuntime.manageMcpFiles(request.input ?? {}) };
+    return { ok: true, document: await relayRuntime.readMcpDocument(request.path) };
+  }
+  if (request.type === "mcp_editor") {
+    return { ok: true, ...await runtime.mcpEditors.handle(request) };
+  }
   if (request.type === "status") {
     return { ok: true, status: await runtime.status() };
   }
@@ -1854,33 +1777,6 @@ async function handleControlRequest(request, runtime) {
         request.params,
       );
       return { ok: true, result };
-    } catch (error) {
-      return { ok: false, error: error.message };
-    }
-  }
-  if (request.type === "deletions_status") {
-    try {
-      return { ok: true, gate: await runtime.deletionGateStatus(request.repo) };
-    } catch (error) {
-      return { ok: false, error: error.message };
-    }
-  }
-  if (request.type === "deletions_resolve") {
-    try {
-      if (!["send", "restore"].includes(request.decision)) {
-        return { ok: false, error: "Deletion decision must be send or restore." };
-      }
-      if (typeof request.token !== "string" || !request.token) {
-        return { ok: false, error: "Deletion resolution requires a review token." };
-      }
-      return {
-        ok: true,
-        resolution: await runtime.resolveDeletionGate(
-          request.repo,
-          request.decision,
-          request.token,
-        ),
-      };
     } catch (error) {
       return { ok: false, error: error.message };
     }
@@ -2002,71 +1898,6 @@ async function daemonStatus(stateDir) {
   };
 }
 
-async function requestControl(connection, request) {
-  const { endpoint, authToken } = typeof connection === "string" ? { endpoint: connection } : connection;
-  const parsed = parseControlEndpoint(endpoint);
-  if (parsed.kind === "tcp" && !authToken) {
-    throw new Error("TCP control credentials unavailable. Pass --state-dir for the daemon that owns this endpoint.");
-  }
-  return await new Promise((resolve, reject) => {
-    let settled = false;
-    const socket = parsed.kind === "tcp"
-      ? net.createConnection({ host: parsed.host, port: parsed.port })
-      : net.createConnection(parsed.path);
-    let buffer = "";
-    const finish = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      fn(value);
-    };
-    socket.setTimeout(30_000, () => {
-      finish(reject, new Error(`Timed out waiting for ${endpoint}`));
-    });
-    socket.on("error", (error) => finish(reject, error));
-    socket.setEncoding("utf8");
-    socket.on("end", () => finish(reject, new Error("Daemon closed the control connection without a response.")));
-    socket.on("data", (chunk) => {
-      buffer += chunk;
-      if (Buffer.byteLength(buffer) > 16 * 1024 * 1024) {
-        finish(reject, new Error("Control response exceeds 16 MiB."));
-        return;
-      }
-      if (!buffer.includes("\n")) return;
-      try {
-        finish(resolve, JSON.parse(buffer.split("\n")[0]));
-      } catch {
-        finish(reject, new Error("Invalid daemon control response."));
-      }
-    });
-    socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ ...request, authToken })}\n`);
-    });
-  });
-}
-
-function parseControlEndpoint(value) {
-  const url = new URL(value);
-  if (url.protocol === "tcp:") {
-    if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") {
-      throw new Error("TCP control endpoint must be loopback.");
-    }
-    return {
-      kind: "tcp",
-      host: url.hostname,
-      port: Number(url.port || "0"),
-    };
-  }
-  if (url.protocol === "unix:") {
-    if (!url.pathname) throw new Error("Unix control endpoint requires a socket path.");
-    return {
-      kind: "unix",
-      path: decodeURIComponent(url.pathname),
-    };
-  }
-  throw new Error("Control endpoint must be tcp://host:port or unix:///path/to/socket.");
-}
-
 async function prepareUnixSocket(socketPath) {
   if (!existsSync(socketPath)) return;
   try {
@@ -2078,15 +1909,6 @@ async function prepareUnixSocket(socketPath) {
     if (!["ECONNREFUSED", "ENOENT"].includes(error.code)) throw error;
     await fs.rm(socketPath, { force: true });
   }
-}
-
-function defaultControlEndpoint(paths) {
-  if (process.platform === "win32") return null;
-  return formatUnixEndpoint(paths.socketFile);
-}
-
-function formatUnixEndpoint(socketPath) {
-  return `unix://${socketPath}`;
 }
 
 async function readDaemonState(stateDir) {
@@ -2106,18 +1928,6 @@ async function writeDaemonState(stateDir, state) {
 async function ensureStateDirectory(stateDir) {
   await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
   if (process.platform !== "win32") await fs.chmod(stateDir, 0o700);
-}
-
-function daemonPaths(stateDir) {
-  const root = path.resolve(stateDir ?? defaultStateDir());
-  return {
-    stateDir: root,
-    pidFile: path.join(root, "daemon.pid"),
-    socketFile: path.join(root, "daemon.sock"),
-    controlFile: path.join(root, "control.json"),
-    connectedFile: path.join(root, "connected.json"),
-    tokensFile: path.join(root, "tokens.json"),
-  };
 }
 
 async function readPid(pidFile) {
@@ -2148,6 +1958,7 @@ async function writeConfig(root, config) {
     `name = ${JSON.stringify(config.name)}`,
   ];
   if (config.relayId) lines.splice(2, 0, `relay_id = ${JSON.stringify(config.relayId)}`);
+  if (typeof config.authoritative === "boolean") lines.push(`authoritative = ${config.authoritative}`);
   await fs.writeFile(path.join(root, RELAY_DIR, CONFIG_FILE), `${lines.join("\n")}\n`, "utf8");
 }
 
@@ -2165,6 +1976,7 @@ async function readConfig(root) {
     relayId: values.relay_id ?? null,
     server: values.server,
     name: values.name,
+    authoritative: values.authoritative,
   };
 }
 

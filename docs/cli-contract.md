@@ -1,106 +1,146 @@
-# CLI Contract
+# relay(1)
 
-Relay CLI runs Relay in headless mode for local folders.
+## NAME
 
-The user-facing model is:
+relay — synchronize local folders with Relay
 
-- `relay start` starts background sync.
-- `relay stop` stops background sync.
-- `relay logout` stops the selected daemon, waits for shutdown, and clears local
-  login records. It does not revoke server-side tokens.
-- `relay auth status` reports login state and the storage-key backend.
-- `relay init <folder>` prepares a local folder for Relay.
-- `relay clone <folder>` copies an existing Relay folder to this machine.
-- `relay connect <folder>` starts syncing a local folder.
-- `relay disconnect <folder>` stops syncing a local folder without deleting files.
-- `relay status [folder]` reports background sync and folder sync state.
-- `relay sync-status [folder]` reports per-file sync status from the running
-  headless runtime.
-- `relay logging [status|enable|disable] [--network]` controls daemon-wide debug
-  logging through the running daemon.
-- `relay relays` lists relays available to the logged-in user.
-- `relay folders` lists remote folders, and local folders when scoped to a running
-  headless runtime.
+## SYNOPSIS
 
-`relay connect` is the transition from a local initialized folder to a remote
-Relay folder. If the folder was created with `relay init`, the daemon creates the
-remote shared folder through upstream Relay code and treats local disk as
-authoritative. `relay clone` records an existing remote folder and auto-connects
-it as server-authoritative.
+```text
+relay <command> [arguments] [options]
+relay help [command...]
+relay help --all
+```
 
-In interactive terminals, `relay connect` may prompt for a Relay when `--relay` is
-omitted, and `relay clone` may prompt for both a Relay and remote folder when
-`--relay` or `--folder` are omitted. Non-interactive invocations must pass GUIDs
-explicitly.
+## DESCRIPTION
 
-## Local Folder State
+Relay synchronizes selected local folders through a background daemon. `clone`
+downloads an existing shared folder. `init` prepares a local folder; `connect`
+registers it for synchronization. `start` runs the daemon and `stop` stops it.
 
-Each synced local folder has a `.relay/` directory. This stores local Relay
-identity and control-plane state for that folder.
+When connecting a newly initialized folder, local files supply its initial
+content. A clone takes its initial content from the remote folder.
 
-User login state and daemon state do not belong in `.relay/`. They live in the
-user's state directory.
+## COMMANDS
 
-The storage key defaults to an owner-only `storage.key` file in that directory.
-User preferences can opt in to OS keychain storage with
-`[security] key_storage = "keychain"`. Linux/WSL keychain mode requires
-`secret-tool` and a persistent Secret Service collection. Explicit
-`RMD_STORAGE_KEY_FILE` overrides this preference. Keychain failures never trigger
-a fallback to a disk key. Backend changes require a fresh state directory;
-see the [storage and backup guidance](../README.md#headless-sync).
+| Command | Description |
+| --- | --- |
+| `login` | Sign in through OAuth or store a supplied token. |
+| `logout` | Stop the selected daemon and clear its saved login. |
+| `auth status` | Show login status and credential-storage backend. |
+| `start`, `stop` | Start or stop background synchronization. |
+| `init [path]` | Prepare a local folder. |
+| `clone [path]` | Download and connect an existing shared folder. |
+| `connect [path]` | Connect a local folder to Relay. |
+| `disconnect [path]` | Stop syncing a folder and retain its files. |
+| `status [path]` | Show daemon and folder status. |
+| `sync-status [path]` | Show per-file synchronization status. |
+| `servers` | List Relay Servers; `--relay` optionally filters by name or GUID. |
+| `server [name-or-guid]` | Inspect one Relay Server. `--relay` also selects it. |
+| `server create`, `server register`, `server rename` | Create a server, register a self-hosted URL, or rename a server. |
+| `server roles`, `server role remove` | List or remove server members. |
+| `server leave`, `server delete` | Leave a server or delete an owned server. |
+| `remote folders`, `remote folder [name-or-guid]` | List or inspect server folders. |
+| `remote folder roles`, `remote folder role add`, `remote folder role remove` | List or change folder access. |
+| `remote folder delete` | Delete a server folder; local files remain. |
+| `relays`, `folders` | List remote membership and shared folders. |
+| `documents roots` | List connected local roots. |
+| `documents list` | List indexed shared documents. |
+| `documents search query` | Search shared text, including unsaved editor content. |
+| `documents read path` | Read active editor text or disk text. |
+| `agent create`, `agent list`, `agent show` | Register and inspect agent identities. |
+| `mcp` | Serve document editing tools over stdio. |
+| `mcp tools` | Print MCP tool arguments and results. |
+| `mcp install <claude|codex>` | Register MCP with a client. |
+| `obsidian command` | Run an Obsidian app or plugin command. |
+| `logging status`, `logging enable`, `logging disable` | Read or change logging settings. |
+| `version` | Print the installed version. Aliases: `--version`, `-v`. |
+| `update` | Manage installed releases. Alias: `upgrade`. |
+| `debug relay-cli command` | Run a registered command in the daemon. |
+| `debug relay-debug method` | Call a daemon diagnostic method. |
 
-The headless runtime exposes browser-like `localStorage` and `indexedDB`
-capabilities to the copied Relay plugin code. Both are backed by SQLite so
-upstream y-indexeddb document updates, HSM persistence, content-addressed hash
-records, PocketBase auth state, and Relay local storage survive daemon restarts.
+Run `relay <command> --help` for its arguments, options, defaults and limits.
+`relay help --all` prints the complete command reference.
 
-## Background Sync
+Account commands (`servers`, `server`, and `remote`) use saved login credentials
+without starting the sync daemon or selecting a local folder. Omitted collection
+filters include all accessible servers or folders. Mutations require explicit
+selectors. Collections print tab-separated rows; `--json` prints structured
+results. `server register --url https://host.example` registers a self-hosted URL;
+it does not generate host configuration or start a server.
 
-The daemon is global and per-user. It manages any folders registered with
-`relay connect` or `relay clone`.
+These commands share their definitions and server handlers with the Obsidian
+plugin. The standalone grammar uses spaces and accepts both `--relay value` and
+`--relay=value`. See [shared command maintenance](shared-commands.md).
 
-The daemon owns file watching, scheduling, runtime lifecycle, remote sync, and
-headless Relay execution. CLI commands may update local metadata and request
-daemon actions, but they do not implement sync behavior themselves.
+## OPTIONS
 
-`relay logging` talks to the daemon control endpoint. Logging preferences are stored
-alongside update preferences in `~/Library/Application Support/relay/config.toml`
-on macOS, or `~/.config/relay/config.toml` on Linux and WSL. `XDG_CONFIG_HOME`
-overrides either default with `$XDG_CONFIG_HOME/relay/config.toml`.
-The daemon applies changes to its active
-headless runtimes. `--network` controls the upstream Relay network logging flag;
-enabling network logging also enables debug logging.
+Options belong to individual commands. Common options, where supported:
 
-## Headless Boundary
+| Option | Description |
+| --- | --- |
+| `--state-dir directory` | Select daemon state and login credentials. |
+| `--control endpoint` | Select a Unix socket or authenticated loopback TCP endpoint. |
+| `--repo folder` | Select a connected local root. |
+| `--json` | Print structured output. |
+| `-h`, `--help` | Print usage and exit. |
 
-Relay CLI must run Relay sync logic in the headless runtime. The CLI and host
-substrate must not duplicate product behavior such as:
+## EXAMPLES
 
-- CRDT synthesis
-- remote folder hydration
-- conflict resolution
-- HSM state transitions
-- RelayDebugAPI method tables
+Download a folder interactively:
 
-RelayDebugAPI methods are opaque method names forwarded to the runtime.
-Registered upstream Relay CLI handlers are also forwarded as opaque command
-names; the host CLI does not keep a second table of handler methods.
+```sh
+relay login
+relay clone ./notes
+relay start
+```
 
-## Steel Thread
+Download a known folder from a script:
 
-The primary proof is Dropbox-like staging sync:
+```sh
+relay login --token-file /path/to/token
+relay clone ./notes --relay <relay-guid> --folder <folder-guid>
+relay start
+```
 
-1. Start the daemon.
-2. Log in against staging.
-3. Initialize and connect local folder A.
-4. Clone the same Relay folder into local folder B.
-5. Edit real Markdown files on disk in folder A.
-6. Wait for folder B to receive the same content through Relay.
-7. Edit the file in folder B.
-8. Wait for folder A to receive the change.
-9. Verify through CLI/control APIs, not direct database reads.
-10. Clean up the remote staging folder.
+Share local files:
 
-The broader staging suite keeps the same black-box contract and extends it with
-nested folders, binary assets, raw filesystem moves, delete propagation, daemon
-restart, and offline changes created while the daemon is stopped.
+```sh
+relay init ./notes
+relay connect ./notes --relay <relay-guid>
+relay start
+```
+
+Inspect synchronization and search text:
+
+```sh
+relay status ./notes
+relay sync-status ./notes
+relay documents search "open questions" --repo ./notes --json
+```
+
+`clone` and `connect` prompt for remote selections in interactive terminals.
+Scripts must supply the relevant GUIDs. Use `relays` and `folders` to find them.
+
+## FILES
+
+Each connected folder contains `.relay/config.toml` with its folder identity.
+Daemon state contains credentials, registrations, caches and synchronization data.
+User preferences are stored separately; see [preferences](../README.md#preferences).
+
+The default storage key is an owner-only file in the state directory. Set
+`[security] key_storage = "keychain"` in preferences to use the OS keychain.
+Linux keychain storage requires `secret-tool` and a persistent Secret Service.
+`RMD_STORAGE_KEY_FILE` selects an explicit key file. Keychain failures do not
+fall back to another key. See [storage and backup](../README.md#headless-sync).
+
+## EXIT STATUS
+
+Zero indicates success. Nonzero indicates invalid arguments or a command failure.
+JSON output does not change error handling. MCP results additionally report
+whether an edit was accepted or a local save completed; see [relay-mcp](mcp.md).
+
+## SEE ALSO
+
+[relay-mcp](mcp.md), [relay-agent](agents.md), [relay-obsidian](obsidian.md),
+[installation and releases](releases.md)

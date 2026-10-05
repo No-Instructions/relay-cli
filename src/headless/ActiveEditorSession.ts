@@ -16,6 +16,7 @@ export type ActiveEditorPeer = {
   user: {
     id?: string;
     name: string;
+    picture?: string;
     color?: string;
     colorLight?: string;
   };
@@ -28,7 +29,32 @@ export type ActiveEditorFrame = {
   revision: number;
   text: string;
   peers: ActiveEditorPeer[];
+  awarenessAvailable: boolean;
 };
+
+export type ActiveEditorPresenceResult = {
+  revision: number;
+  text: string;
+  peers: ActiveEditorPeer[];
+  awarenessAvailable: boolean;
+};
+
+// Presence offsets describe fromText. Rebase them over disjoint edits too, so a
+// collaborator's insertion before the cursor does not move it to an unrelated
+// character in the current document.
+export function presenceRemapper(fromText: string, toText: string): (index: number) => number {
+  const changes = computePositionedChanges(fromText, toText);
+  return (index) => {
+    const position = clamp(index, 0, fromText.length);
+    let delta = 0;
+    for (const change of changes) {
+      if (position < change.from) break;
+      if (position <= change.to) return change.from + delta + change.insert.length;
+      delta += change.insert.length - (change.to - change.from);
+    }
+    return position + delta;
+  };
+}
 
 export type ActiveEditorApplyResult =
   | {
@@ -67,6 +93,12 @@ export class ActiveEditorSession {
     removed: number[];
   }): void => {
     const localClientId = this.awareness?.doc.clientID;
+    if (localClientId !== undefined && event.updated.includes(localClientId)) {
+      const state = this.awareness?.getLocalState();
+      // The shared provider refreshes its human profile on login-token refresh.
+      // Keep the active editor's explicit agent profile until it releases.
+      if (state && state.user !== this.user) this.awareness?.setLocalStateField("user", this.user);
+    }
     if (
       [...event.added, ...event.updated, ...event.removed].some(
         (clientId) => clientId !== localClientId,
@@ -83,6 +115,7 @@ export class ActiveEditorSession {
     private readonly user: {
       id?: string;
       name: string;
+      picture?: string;
       color: string;
       colorLight: string;
     },
@@ -98,17 +131,20 @@ export class ActiveEditorSession {
     user: {
       id?: string;
       name?: string;
+      picture?: string;
       color?: string;
       colorLight?: string;
     } = {},
+    initialText?: string,
   ): Promise<ActiveEditorSession> {
     const tfile = document.tfile;
     if (!tfile) throw new Error(`Active editor file is not materialized: ${path}`);
-    const initialText = await document.vault.read(tfile);
+    initialText ??= await document.vault.read(tfile);
     const color = user.color ?? "#7456c8";
     const session = new ActiveEditorSession(document, path, initialText, {
       id: user.id,
       name: user.name?.trim() || "Editor agent",
+      picture: user.picture,
       color,
       colorLight: user.colorLight ?? `${color}33`,
     });
@@ -130,6 +166,7 @@ export class ActiveEditorSession {
       revision: this.revision,
       text: this.text,
       peers: this.readPeers(),
+      awarenessAvailable: this.awareness !== null && !this.hsm.hasFork(),
     };
   }
 
@@ -140,6 +177,7 @@ export class ActiveEditorSession {
     selection?: { anchor: number; head: number } | null;
   }): ActiveEditorApplyResult {
     this.assertOpen();
+    if (!this.document.canWriteContent) throw new Error("This document is read-only.");
     this.refreshFromLocalDoc();
 
     if (!this.hsm.matches("active.tracking")) {
@@ -180,7 +218,7 @@ export class ActiveEditorSession {
       });
       this.document.requestSave();
     }
-    this.publishSelection(input.selection, input.cursor);
+    this.publishPresenceFrom(input.desiredText, input.cursor, input.selection);
 
     return {
       applied: true,
@@ -272,6 +310,39 @@ export class ActiveEditorSession {
     }
   }
 
+  /**
+   * Move this editor's cursor or selection without editing. Offsets describe
+   * baseText (the text the caller last read), or the current text when
+   * omitted. Needs no write access, so read-only sessions can show presence.
+   */
+  presence(input: {
+    baseText?: string;
+    cursor?: number | null;
+    selection?: { anchor: number; head: number } | null;
+  }): ActiveEditorPresenceResult {
+    this.assertOpen();
+    this.refreshFromLocalDoc();
+    this.publishPresenceFrom(input.baseText ?? this.text, input.cursor, input.selection);
+    return {
+      revision: this.revision,
+      text: this.text,
+      peers: this.readPeers(),
+      awarenessAvailable: this.awareness !== null && !this.hsm.hasFork(),
+    };
+  }
+
+  private publishPresenceFrom(
+    fromText: string,
+    cursor?: number | null,
+    selection?: { anchor: number; head: number } | null,
+  ): void {
+    const remap = presenceRemapper(fromText, this.text);
+    this.publishSelection(
+      selection ? { anchor: remap(selection.anchor), head: remap(selection.head) } : selection,
+      typeof cursor === "number" ? remap(cursor) : cursor,
+    );
+  }
+
   private attachAwareness(): void {
     const awareness = this.document._provider?.awareness ?? null;
     if (!awareness) return;
@@ -340,6 +411,7 @@ export class ActiveEditorSession {
             typeof rawUser.name === "string" && rawUser.name
               ? rawUser.name
               : `Peer ${clientId}`,
+          ...(typeof rawUser.picture === "string" ? { picture: rawUser.picture } : {}),
           ...(typeof rawUser.color === "string"
             ? { color: rawUser.color }
             : {}),

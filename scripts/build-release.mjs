@@ -48,6 +48,7 @@ try {
   await fs.writeFile(path.join(temporary, "release.json"), `${JSON.stringify(release, null, 2)}\n`);
   await fs.copyFile(path.join(root, "LICENSE"), path.join(temporary, "LICENSE"));
   await fs.mkdir(path.join(temporary, "licenses"));
+  await fs.copyFile(path.join(root, "vendor/relay-comments/LICENSE"), path.join(temporary, "licenses/relay-comments-LICENSE"));
   for (const file of ["THIRD_PARTY_NOTICES.md", "LICENSE"]) {
     await fs.copyFile(path.join(root, "vendor/relay", file), path.join(temporary, "licenses", `relay-${file}`));
   }
